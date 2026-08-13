@@ -1,0 +1,5 @@
+{% extends "base.html" %}{% block content %}
+<div class="page-heading"><div><h1>Resultado da importação de DU-Es</h1><p class="muted">Processamento concluído com validação por linha.</p></div><a class="btn" href="{{ url_for('consulta_dues') }}">Voltar à Gestão de DU-Es</a></div>
+<div class="summary-cards"><div><span>Registros encontrados</span><strong>{{ resumo.encontrados }}</strong></div><div class="success-card"><span>Importados com sucesso</span><strong>{{ resumo.importados }}</strong></div><div class="error-card"><span>Rejeitados</span><strong>{{ resumo.rejeitados }}</strong></div></div>
+{% if resumo.erros %}<h2>Registros rejeitados</h2><div class="table-wrap"><table><thead><tr><th>Linha</th><th>Chave de Acesso</th><th>DU-E</th><th>Motivo</th></tr></thead><tbody>{% for erro in resumo.erros %}<tr><td>{{ erro.linha }}</td><td>{{ erro.chave }}</td><td>{{ erro.numero }}</td><td>{{ erro.motivo }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="flash success">Todas as linhas válidas foram importadas com sucesso.</div>{% endif %}
+{% endblock %}

@@ -1,11 +1,11 @@
 {% extends "base.html" %}{% block content %}
-<h1>Controle de DU-E e Contratos de Câmbio</h1>
-<div class="cards"><div>DU-Es<strong>{{ resumo.dues }}</strong></div><div>Contratos<strong>{{ resumo.contratos }}</strong></div>
+<h1>Dashboard</h1><p class="muted">Controle de DU-E e Contratos de Câmbio</p>
+<div class="cards"><div>DU-Es<strong>{{ resumo.dues }}</strong></div><div>Gestão de contratos<strong>{{ resumo.contratos }}</strong></div>
 <div>DU-Es sem vínculo<strong>{{ resumo.dues_sem_vinculo }}</strong></div><div>Contratos sem vínculo<strong>{{ resumo.contratos_sem_vinculo }}</strong></div></div>
-<div class="actions"><a class="btn" href="{{url_for('nova_due')}}">+ Nova DU-E</a><a class="btn secondary" href="{{url_for('modelo_contratos')}}">Baixar modelo Excel</a>
+<div class="actions"><a class="btn" href="{{url_for('nova_due')}}">+ Nova DU-E</a><a class="btn secondary" href="{{url_for('consulta_dues')}}">Gestão de DU-Es</a><a class="btn secondary" href="{{url_for('novo_contrato')}}">+ Novo contrato</a><a class="btn secondary" href="{{url_for('lista_contratos')}}">Gestão de contratos</a><a class="btn secondary" href="{{url_for('modelo_contratos')}}">Baixar modelo Excel</a>
 <form class="inline" action="{{url_for('importar_contratos')}}" method="post" enctype="multipart/form-data"><input type="file" name="arquivo" accept=".xlsx,.xls" required><button>Importar contratos</button></form></div>
-<h2>DU-Es</h2><table><tr><th>DU-E</th><th>Data</th><th>Cliente</th><th>Moeda</th><th>Valor</th><th>Utilizado</th><th>Saldo</th><th>Status</th></tr>
-{% for d in dues %}<tr><td><a href="{{url_for('due_detalhe',due_id=d.id)}}">{{d.numero_due}}</a></td><td>{{d.data_due or ''}}</td><td>{{d.cliente or ''}}</td><td>{{d.moeda}}</td><td>{{d.valor_original|money}}</td><td>{{d.utilizado|money}}</td><td>{{(d.valor_original-d.utilizado)|money}}</td><td>{{d.status}}</td></tr>{% else %}<tr><td colspan="8">Nenhuma DU-E cadastrada.</td></tr>{% endfor %}</table>
-<h2>Contratos de câmbio</h2><table><tr><th>Contrato</th><th>Data</th><th>Cliente</th><th>Moeda</th><th>Valor moeda</th><th>Vinculado</th><th>Saldo</th><th>Status</th></tr>
-{% for c in contratos %}<tr><td>{{c.numero_contrato}}</td><td>{{c.data_contrato or ''}}</td><td>{{c.cliente or ''}}</td><td>{{c.moeda}}</td><td>{{c.valor_moeda|money}}</td><td>{{c.vinculado|money}}</td><td>{{(c.valor_moeda-c.vinculado)|money}}</td><td>{{c.status}}</td></tr>{% else %}<tr><td colspan="8">Nenhum contrato cadastrado.</td></tr>{% endfor %}</table>
+<h2>DU-Es</h2><table><tr><th>Chave de Acesso</th><th>DU-E</th><th>Data</th><th>Cliente</th><th>Moeda</th><th>Valor</th><th>Utilizado</th><th>Saldo</th><th>Status</th></tr>
+{% for d in dues %}<tr><td><a href="{{url_for('due_detalhe',due_id=d.id)}}">{{d.chave_acesso or 'Sem chave'}}</a></td><td>{{d.numero_due}}</td><td>{{d.data_due|date_br}}</td><td>{{d.cliente or ''}}</td><td>{{d.moeda}}</td><td>{{d.valor_original|money}}</td><td>{{d.utilizado|money}}</td><td>{{(d.valor_original-d.utilizado)|money}}</td><td>{{d.status}}</td></tr>{% else %}<tr><td colspan="9">Nenhuma DU-E cadastrada.</td></tr>{% endfor %}</table>
+<h2>Gestão de contratos</h2><table><tr><th>Contrato</th><th>Data</th><th>Cliente</th><th>Moeda</th><th>Valor moeda</th><th>Vinculado</th><th>Saldo</th><th>Status</th></tr>
+{% for c in contratos %}<tr><td><a href="{{url_for('detalhe_contrato',contrato_id=c.id)}}">{{c.numero_contrato}}</a></td><td>{{c.data_contrato|date_br}}</td><td>{{c.cliente or ''}}</td><td>{{c.moeda}}</td><td>{{c.valor_moeda|money}}</td><td>{{c.vinculado|money}}</td><td>{{(c.valor_moeda-c.vinculado)|money}}</td><td>{{c.status}}</td></tr>{% else %}<tr><td colspan="8">Nenhum contrato cadastrado.</td></tr>{% endfor %}</table>
 {% endblock %}

@@ -1,5 +1,5 @@
-{% extends "base.html" %}{% block content %}<h1>Nova DU-E</h1>
-<form method="post" class="form"><label>Número DU-E*<input name="numero_due" required></label><label>Data<input type="date" name="data_due"></label>
-<label>CNPJ<input name="cnpj"></label><label>Cliente<input name="cliente"></label><label>Moeda<input name="moeda" value="BRL"></label>
-<label>Valor original<input name="valor_original" type="number" step="0.01" min="0" required></label><label>Observação<textarea name="observacao"></textarea></label>
-<button>Cadastrar DU-E</button><a class="btn secondary" href="{{url_for('index')}}">Cancelar</a></form>{% endblock %}
+{% extends "base.html" %}{% block content %}<h1>{{ 'Editar' if due else 'Nova' }} DU-E</h1>
+<form method="post" class="form"><label>Chave de Acesso*<input name="chave_acesso" data-chave-acesso maxlength="14" pattern="[A-Za-z0-9]{14}" title="Informe exatamente 14 caracteres alfanuméricos" value="{{ due.chave_acesso if due and due.chave_acesso else '' }}" required></label><label>Número DU-E*<input name="numero_due" value="{{ due.numero_due if due else '' }}" required></label><label>Data<input name="data_due" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ due.data_due|date_br if due else '' }}"></label>
+<label>CNPJ<input name="cnpj" value="{{ due.cnpj if due else '' }}"></label><label>Cliente<input name="cliente" value="{{ due.cliente if due else '' }}"></label><label>Moeda<input name="moeda" value="{{ due.moeda if due else 'USD' }}" maxlength="3"></label>
+<label>Valor original<input name="valor_original" data-money inputmode="decimal" value="{{ due.valor_original|money if due else '' }}" required></label><label>Observação<textarea name="observacao">{{ due.observacao if due else '' }}</textarea></label>
+<button>{{ 'Salvar alterações' if due else 'Cadastrar DU-E' }}</button><a class="btn secondary" href="{{url_for('due_detalhe',due_id=due.id) if due else url_for('index')}}">Cancelar</a></form>{% endblock %}

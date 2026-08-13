@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sistema DU-E</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head>
-<body><header><a href="{{ url_for('index') }}">DU-E + Câmbio</a></header><main>
+<body><header><div class="header-inner"><a href="{{ url_for('index') }}">DU-E + Câmbio</a><nav><a href="{{ url_for('index') }}">Dashboard</a><a href="{{ url_for('consulta_dues') }}">Gestão de DU-Es</a><a href="{{ url_for('lista_contratos') }}">Gestão de contratos</a></nav></div></header><main>
 {% with messages=get_flashed_messages(with_categories=true) %}{% for cat,msg in messages %}
 <div class="flash {{cat}}">{{ msg }}</div>{% endfor %}{% endwith %}
-{% block content %}{% endblock %}</main></body></html>
+{% block content %}{% endblock %}</main><script src="{{ url_for('static', filename='app.js') }}"></script></body></html>

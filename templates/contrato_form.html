@@ -1,0 +1,16 @@
+{% extends "base.html" %}{% block content %}
+<h1>{{ 'Editar' if contrato else 'Novo' }} contrato de câmbio</h1>
+<form method="post" class="form">
+  <label>Número do contrato*<input name="numero_contrato" value="{{ contrato.numero_contrato if contrato else '' }}" required></label>
+  <label>Data<input name="data_contrato" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ contrato.data_contrato|date_br if contrato else '' }}"></label>
+  <label>CNPJ<input name="cnpj" value="{{ contrato.cnpj if contrato else '' }}"></label>
+  <label>Cliente<input name="cliente" value="{{ contrato.cliente if contrato else '' }}"></label>
+  <label>Moeda<input name="moeda" maxlength="3" value="{{ contrato.moeda if contrato else 'USD' }}"></label>
+  <label>Valor na moeda<input name="valor_moeda" data-money inputmode="decimal" value="{{ contrato.valor_moeda|money if contrato else '' }}" required></label>
+  <label>Taxa de câmbio<input name="taxa_cambio" data-money inputmode="decimal" value="{{ contrato.taxa_cambio|money if contrato and contrato.taxa_cambio is not none else '' }}"></label>
+  <label>Valor em reais<input name="valor_reais" data-money inputmode="decimal" value="{{ contrato.valor_reais|money if contrato and contrato.valor_reais is not none else '' }}"></label>
+  <label>Status<select name="status">{% for status in ['Ativo','Encerrado','Cancelado'] %}<option value="{{ status }}" {{ 'selected' if contrato and contrato.status == status else '' }}>{{ status }}</option>{% endfor %}</select></label>
+  <label>Observação<textarea name="observacao">{{ contrato.observacao if contrato else '' }}</textarea></label>
+  <div class="form-actions"><button>{{ 'Salvar alterações' if contrato else 'Cadastrar contrato' }}</button><a class="btn secondary" href="{{ url_for('detalhe_contrato', contrato_id=contrato.id) if contrato else url_for('lista_contratos') }}">Cancelar</a></div>
+</form>
+{% endblock %}
