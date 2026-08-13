@@ -1,0 +1,5 @@
+{% extends "base.html" %}{% block content %}<h1>Nova DU-E</h1>
+<form method="post" class="form"><label>Número DU-E*<input name="numero_due" required></label><label>Data<input type="date" name="data_due"></label>
+<label>CNPJ<input name="cnpj"></label><label>Cliente<input name="cliente"></label><label>Moeda<input name="moeda" value="BRL"></label>
+<label>Valor original<input name="valor_original" type="number" step="0.01" min="0" required></label><label>Observação<textarea name="observacao"></textarea></label>
+<button>Cadastrar DU-E</button><a class="btn secondary" href="{{url_for('index')}}">Cancelar</a></form>{% endblock %}

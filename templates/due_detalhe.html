@@ -1,0 +1,12 @@
+{% extends "base.html" %}{% block content %}
+<h1>DU-E {{due.numero_due}}</h1><p><b>Cliente:</b> {{due.cliente or '-'}} &nbsp; <b>Valor:</b> {{due.valor_original|money}} {{due.moeda}}</p>
+<div class="cards"><div>Original<strong>{{due.valor_original|money}}</strong></div><div>Utilizado<strong>{{utilizado|money}}</strong></div><div>Saldo<strong>{{saldo|money}}</strong></div></div>
+<h2>Movimentações</h2><form method="post" action="{{url_for('movimentacao',due_id=due.id)}}" class="form inline-form">
+<input type="date" name="data_movimentacao" required><select name="tipo"><option>UTILIZACAO</option><option>DEVOLUCAO</option></select>
+<input name="documento" placeholder="Documento"><input name="valor" type="number" step="0.01" placeholder="Valor" required><input name="observacao" placeholder="Observação"><button>Registrar</button></form>
+<table><tr><th>Data</th><th>Tipo</th><th>Documento</th><th>Valor</th><th>Obs.</th></tr>{% for m in mov %}<tr><td>{{m.data_movimentacao}}</td><td>{{m.tipo}}</td><td>{{m.documento or ''}}</td><td>{{m.valor|money}}</td><td>{{m.observacao or ''}}</td></tr>{% else %}<tr><td colspan="5">Nenhuma movimentação.</td></tr>{% endfor %}</table>
+<h2>Vínculos com contratos</h2><form method="post" action="{{url_for('vincular',due_id=due.id)}}" class="form inline-form">
+<select name="contrato_id" required><option value="">Selecione o contrato</option>{% for c in contratos %}<option value="{{c.id}}">{{c.numero_contrato}} — {{c.cliente or ''}} — {{c.moeda}} {{c.valor_moeda|money}}</option>{% endfor %}</select>
+<input name="valor_vinculado" type="number" step="0.01" placeholder="Valor vinculado" required><input name="observacao" placeholder="Observação"><button>Vincular</button></form>
+<table><tr><th>Contrato</th><th>Moeda</th><th>Valor vinculado</th><th>Obs.</th></tr>{% for v in vinc %}<tr><td>{{v.numero_contrato}}</td><td>{{v.moeda}}</td><td>{{v.valor_vinculado|money}}</td><td>{{v.observacao or ''}}</td></tr>{% else %}<tr><td colspan="4">Nenhum vínculo.</td></tr>{% endfor %}</table>
+<a class="btn secondary" href="{{url_for('index')}}">Voltar</a>{% endblock %}

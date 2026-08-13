@@ -1,0 +1,11 @@
+{% extends "base.html" %}{% block content %}
+<h1>Controle de DU-E e Contratos de Câmbio</h1>
+<div class="cards"><div>DU-Es<strong>{{ resumo.dues }}</strong></div><div>Contratos<strong>{{ resumo.contratos }}</strong></div>
+<div>DU-Es sem vínculo<strong>{{ resumo.dues_sem_vinculo }}</strong></div><div>Contratos sem vínculo<strong>{{ resumo.contratos_sem_vinculo }}</strong></div></div>
+<div class="actions"><a class="btn" href="{{url_for('nova_due')}}">+ Nova DU-E</a><a class="btn secondary" href="{{url_for('modelo_contratos')}}">Baixar modelo Excel</a>
+<form class="inline" action="{{url_for('importar_contratos')}}" method="post" enctype="multipart/form-data"><input type="file" name="arquivo" accept=".xlsx,.xls" required><button>Importar contratos</button></form></div>
+<h2>DU-Es</h2><table><tr><th>DU-E</th><th>Data</th><th>Cliente</th><th>Moeda</th><th>Valor</th><th>Utilizado</th><th>Saldo</th><th>Status</th></tr>
+{% for d in dues %}<tr><td><a href="{{url_for('due_detalhe',due_id=d.id)}}">{{d.numero_due}}</a></td><td>{{d.data_due or ''}}</td><td>{{d.cliente or ''}}</td><td>{{d.moeda}}</td><td>{{d.valor_original|money}}</td><td>{{d.utilizado|money}}</td><td>{{(d.valor_original-d.utilizado)|money}}</td><td>{{d.status}}</td></tr>{% else %}<tr><td colspan="8">Nenhuma DU-E cadastrada.</td></tr>{% endfor %}</table>
+<h2>Contratos de câmbio</h2><table><tr><th>Contrato</th><th>Data</th><th>Cliente</th><th>Moeda</th><th>Valor moeda</th><th>Vinculado</th><th>Saldo</th><th>Status</th></tr>
+{% for c in contratos %}<tr><td>{{c.numero_contrato}}</td><td>{{c.data_contrato or ''}}</td><td>{{c.cliente or ''}}</td><td>{{c.moeda}}</td><td>{{c.valor_moeda|money}}</td><td>{{c.vinculado|money}}</td><td>{{(c.valor_moeda-c.vinculado)|money}}</td><td>{{c.status}}</td></tr>{% else %}<tr><td colspan="8">Nenhum contrato cadastrado.</td></tr>{% endfor %}</table>
+{% endblock %}
