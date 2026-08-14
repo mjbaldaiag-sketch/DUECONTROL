@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sistema DU-E</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head>
-<body><header><div class="header-inner"><a href="{{ url_for('index') }}">DU-E + Câmbio</a><nav><a href="{{ url_for('index') }}">Dashboard</a><a href="{{ url_for('consulta_dues') }}">Gestão de DU-Es</a><a href="{{ url_for('lista_contratos') }}">Gestão de contratos</a></nav></div></header><main>
+<body><header><div class="header-inner"><a class="brand" href="{{ url_for('index') }}" aria-label="DU-E Control"><img class="brand-logo" src="{{ url_for('static', filename='logo.png') }}" alt="DU-E Control"></a><nav><a href="{{ url_for('index') }}">Dashboard</a><a href="{{ url_for('consulta_dues') }}">Gestão de DU-Es</a><a href="{{ url_for('lista_contratos') }}">Gestão de contratos</a><a href="{{ url_for('configuracoes') }}">Configurações</a></nav></div></header><main><div id="copy-toast" class="copy-toast" data-copy-toast role="status" aria-live="polite">Dados copiados com sucesso!</div>
 {% with messages=get_flashed_messages(with_categories=true) %}{% for cat,msg in messages %}
 <div class="flash {{cat}}">{{ msg }}</div>{% endfor %}{% endwith %}
 {% block content %}{% endblock %}</main><script src="{{ url_for('static', filename='app.js') }}"></script></body></html>

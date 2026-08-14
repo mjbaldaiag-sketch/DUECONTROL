@@ -1,0 +1,13 @@
+{% extends "base.html" %}{% block content %}
+<div class="page-heading"><div><h1>Cadastrar minhas empresas</h1><p class="muted">Cadastre uma vez para reutilizar o CNPJ em DU-Es e contratos.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
+<form method="post" class="form company-form">
+  <label>Razão Social*<input name="razao_social" required></label>
+  <label>CNPJ*<input name="cnpj" data-cnpj maxlength="18" inputmode="numeric" placeholder="00.000.000/0000-00" required></label>
+  <label>Apelido<input name="apelido" placeholder="Como deseja identificar a empresa"></label>
+  <div class="form-actions"><button>Cadastrar empresa</button><a class="btn secondary" href="{{ url_for('configuracoes') }}">Cancelar</a></div>
+</form>
+<h2>Empresas cadastradas</h2>
+<div class="table-wrap"><table><tr><th>Razão Social</th><th>CNPJ</th><th>Apelido</th></tr>
+{% for empresa in empresas %}<tr><td>{{ empresa.razao_social }}</td><td>{{ empresa.cnpj|cnpj }}</td><td>{{ empresa.apelido or '-' }}</td></tr>{% else %}<tr><td colspan="3" class="empty">Nenhuma empresa cadastrada.</td></tr>{% endfor %}
+</table></div>
+{% endblock %}

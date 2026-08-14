@@ -2,24 +2,24 @@
 <div class="page-heading"><div><h1>Gestão de DU-Es</h1><p class="muted">{{ total }} registro(s) encontrado(s)</p></div><div class="actions"><a class="btn" href="{{ url_for('nova_due') }}">+ Nova DU-E</a><a class="btn secondary" href="{{ url_for('modelo_dues') }}">Baixar modelo Excel</a></div></div>
 <div class="import-box"><form class="inline" action="{{ url_for('importar_dues') }}" method="post" enctype="multipart/form-data"><input type="file" name="arquivo" accept=".xlsx,.xls" required><button>Importar Excel</button></form><span class="muted">Use as colunas do modelo para validar os registros corretamente.</span></div>
 <form method="get" class="filters">
-  <label>Chave de Acesso<input name="chave_acesso" maxlength="14" value="{{ request.args.get('chave_acesso','') }}" placeholder="14 caracteres"></label>
   <label>Número da DU-E<input name="numero_due" value="{{ request.args.get('numero_due','') }}" placeholder="Pesquisar número"></label>
+  <label>Chave de Acesso<input name="chave_acesso" maxlength="14" value="{{ request.args.get('chave_acesso','') }}" placeholder="14 caracteres"></label>
   <label>Cliente<input name="cliente" value="{{ request.args.get('cliente','') }}" placeholder="Nome do cliente"></label>
   <label>CNPJ<input name="cnpj" value="{{ request.args.get('cnpj','') }}"></label>
   <label>Moeda<select name="moeda"><option value="">Todas</option>{% for moeda in moedas %}<option value="{{ moeda }}" {{ 'selected' if request.args.get('moeda') == moeda else '' }}>{{ moeda }}</option>{% endfor %}</select></label>
-  <label>Status<select name="status"><option value="">Todos</option>{% for status in ['Ativa','Cancelada','Encerrada'] %}<option value="{{ status }}" {{ 'selected' if request.args.get('status') == status else '' }}>{{ status }}</option>{% endfor %}</select></label>
-  <label>Data inicial<input name="data_de" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ request.args.get('data_de','') }}"></label>
-  <label>Data final<input name="data_ate" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ request.args.get('data_ate','') }}"></label>
+  <label>Status<select name="status"><option value="">Todos</option>{% for status in ['PENDENTE','CONCLUÍDO'] %}<option value="{{ status }}" {{ 'selected' if request.args.get('status') == status else '' }}>{{ status }}</option>{% endfor %}</select></label>
+  <label>Data de Lançamento inicial<input name="data_de" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ request.args.get('data_de','') }}"></label>
+  <label>Data de Lançamento final<input name="data_ate" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ request.args.get('data_ate','') }}"></label>
   <label>Valor mínimo<input name="valor_min" data-money inputmode="decimal" value="{{ request.args.get('valor_min','') }}"></label>
   <label>Valor máximo<input name="valor_max" data-money inputmode="decimal" value="{{ request.args.get('valor_max','') }}"></label>
   <div class="filter-actions"><button type="submit">Filtrar</button><a class="btn secondary" href="{{ url_for('consulta_dues') }}">Limpar filtros</a></div>
 </form>
-<div class="table-wrap"><table><thead><tr>
-  {% for key, label in [('chave_acesso','Chave de Acesso'),('numero_due','DU-E'),('data_due','Data'),('cliente','Cliente'),('moeda','Moeda'),('valor_original','Valor'),('status','Status')] %}
-  <th><a href="{{ url_for('consulta_dues', **sort_links[key]) }}">{{ label }}{% if sort == key %} {{ '↑' if direction == 'ASC' else '↓' }}{% endif %}</a></th>
+<div class="table-wrap"><table class="compact-table" data-sortable-server><thead><tr>
+  {% for key, label in [('numero_due','DU-E'),('chave_acesso','Chave de Acesso'),('data_due','Data de Lançamento'),('cliente','Cliente'),('moeda','Moeda'),('valor_original','Valor'),('status','Status')] %}
+  <th class="sortable-server-header" aria-sort="{{ 'ascending' if sort == key and direction == 'ASC' else 'descending' if sort == key else 'none' }}" data-sort-direction="{{ 'ascending' if sort == key and direction == 'ASC' else 'descending' if sort == key else 'none' }}"><a href="{{ url_for('consulta_dues', **sort_links[key]) }}">{{ label }}</a></th>
   {% endfor %}<th>Saldo</th><th>Ações</th>
 </tr></thead><tbody>
-{% for d in dues %}<tr><td><a href="{{ url_for('due_detalhe', due_id=d.id) }}">{{ d.chave_acesso or 'Sem chave' }}</a></td><td>{{ d.numero_due }}</td><td>{{ d.data_due|date_br }}</td><td>{{ d.cliente or '-' }}</td><td>{{ d.moeda }}</td><td>{{ d.valor_original|money }}</td><td><span class="status">{{ d.status }}</span></td><td>{{ (d.valor_original - d.utilizado)|money }}</td><td><a href="{{ url_for('editar_due', due_id=d.id) }}">Editar</a></td></tr>
+{% for d in dues %}<tr><td data-sort-value="{{ d.numero_due }}"><a href="{{ url_for('due_detalhe', due_id=d.id) }}">{{ d.numero_due }}</a> <button type="button" class="copy-data-btn" data-copy-value="{{ d.numero_due }}" aria-label="Copiar DU-E"><span aria-hidden="true">⧉</span></button></td><td data-sort-value="{{ d.chave_acesso or '' }}">{{ d.chave_acesso or 'Sem chave' }}{% if d.chave_acesso %} <button type="button" class="copy-data-btn" data-copy-value="{{ d.chave_acesso }}" aria-label="Copiar Chave de Acesso"><span aria-hidden="true">⧉</span></button>{% endif %}</td><td>{{ d.created_at|date_br }}</td><td>{{ d.cliente or '-' }}</td><td>{{ d.moeda }}</td><td>{{ d.valor_original|money }}</td><td><span class="status {{ d.status|status_class }}">{{ d.status }}</span></td><td>{{ d.saldo|money }}</td><td><a href="{{ url_for('editar_due', due_id=d.id) }}">Editar</a></td></tr>
 {% else %}<tr><td colspan="9" class="empty">Nenhuma DU-E encontrada para os filtros informados.</td></tr>{% endfor %}
 </tbody></table></div>
 {% if pages > 1 %}<div class="pagination"><span>Página {{ page }} de {{ pages }}</span><div>{% if page > 1 %}<a class="btn secondary" href="{{ url_for('consulta_dues', **previous_args) }}">Anterior</a>{% endif %}{% if page < pages %}<a class="btn" href="{{ url_for('consulta_dues', **next_args) }}">Próxima</a>{% endif %}</div></div>{% endif %}

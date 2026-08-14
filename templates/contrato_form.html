@@ -2,14 +2,14 @@
 <h1>{{ 'Editar' if contrato else 'Novo' }} contrato de câmbio</h1>
 <form method="post" class="form">
   <label>Número do contrato*<input name="numero_contrato" value="{{ contrato.numero_contrato if contrato else '' }}" required></label>
+  <label>Banco<input name="banco" value="{{ contrato.banco if contrato else '' }}"></label>
   <label>Data<input name="data_contrato" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ contrato.data_contrato|date_br if contrato else '' }}"></label>
-  <label>CNPJ<input name="cnpj" value="{{ contrato.cnpj if contrato else '' }}"></label>
+  {% if empresas %}<label>Empresa{{ '*' if not contrato else '' }}<select name="empresa_id" data-company-select data-company-cnpj-target="contrato-cnpj" {{ 'required' if not contrato else '' }}><option value="" data-cnpj="{{ contrato.cnpj if contrato else '' }}">{{ 'Selecione uma empresa' if not contrato else 'Manter CNPJ atual' }}</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" data-cnpj="{{ empresa.cnpj }}" {{ 'selected' if empresa_id == empresa.id else '' }}>{{ empresa.apelido or empresa.razao_social }} — {{ empresa.cnpj|cnpj }}</option>{% endfor %}</select></label><label>CNPJ<input id="contrato-cnpj" data-company-cnpj value="{{ contrato.cnpj|cnpj if contrato else '' }}" readonly></label>{% else %}<div class="flash danger company-help">Nenhuma empresa cadastrada. Cadastre uma empresa em Configurações &gt; Cadastrar minhas empresas para informar o CNPJ.</div><a class="btn secondary" href="{{ url_for('cadastro_empresas') }}">Cadastrar minhas empresas</a>{% if contrato %}<label>CNPJ<input data-company-cnpj value="{{ contrato.cnpj|cnpj }}" readonly></label>{% endif %}{% endif %}
   <label>Cliente<input name="cliente" value="{{ contrato.cliente if contrato else '' }}"></label>
   <label>Moeda<input name="moeda" maxlength="3" value="{{ contrato.moeda if contrato else 'USD' }}"></label>
   <label>Valor na moeda<input name="valor_moeda" data-money inputmode="decimal" value="{{ contrato.valor_moeda|money if contrato else '' }}" required></label>
-  <label>Taxa de câmbio<input name="taxa_cambio" data-money inputmode="decimal" value="{{ contrato.taxa_cambio|money if contrato and contrato.taxa_cambio is not none else '' }}"></label>
+  <label>Taxa de câmbio<input name="taxa_cambio" data-rate inputmode="decimal" value="{{ contrato.taxa_cambio|rate if contrato and contrato.taxa_cambio is not none else '' }}"></label>
   <label>Valor em reais<input name="valor_reais" data-money inputmode="decimal" value="{{ contrato.valor_reais|money if contrato and contrato.valor_reais is not none else '' }}"></label>
-  <label>Status<select name="status">{% for status in ['Ativo','Encerrado','Cancelado'] %}<option value="{{ status }}" {{ 'selected' if contrato and contrato.status == status else '' }}>{{ status }}</option>{% endfor %}</select></label>
   <label>Observação<textarea name="observacao">{{ contrato.observacao if contrato else '' }}</textarea></label>
   <div class="form-actions"><button>{{ 'Salvar alterações' if contrato else 'Cadastrar contrato' }}</button><a class="btn secondary" href="{{ url_for('detalhe_contrato', contrato_id=contrato.id) if contrato else url_for('lista_contratos') }}">Cancelar</a></div>
 </form>
