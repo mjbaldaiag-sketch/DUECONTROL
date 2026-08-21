@@ -1,11 +1,16 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, send_file, jsonify
+import json
 import sqlite3
 import re
+import unicodedata
 from pathlib import Path
 from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, timedelta
 import io
 import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 BASE = Path(__file__).resolve().parent
 DB = BASE / "due.db"
@@ -15,6 +20,94 @@ app.secret_key = "troque-esta-chave-em-producao"
 SALDO_TOLERANCE = Decimal("0.005")
 STATUS_PENDENTE = "PENDENTE"
 STATUS_CONCLUIDO = "CONCLUÍDO"
+NDF_STATUS_ATIVA = "ATIVA"
+NDF_STATUS_LIQUIDADA = "LIQUIDADA"
+NDF_STATUS_CANCELADA = "CANCELADA"
+NDF_STATUS_VENCIDA = "VENCIDA"
+NDF_STATUSES = (NDF_STATUS_ATIVA, NDF_STATUS_LIQUIDADA, NDF_STATUS_CANCELADA)
+NDF_TIPOS = ("BANCO", "TRADING")
+NDF_POSICOES = ("COMPRA", "VENDA")
+PTAX_MOEDAS = ("USD", "EUR")
+PTAX_API_URL = "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoMoedaPeriodo"
+PTAX_API_TIMEOUT = 20
+CLIENTE_PAISES = (
+    ("AD", "Andorra"), ("AE", "Emirados Árabes Unidos"), ("AF", "Afeganistão"),
+    ("AG", "Antígua e Barbuda"), ("AI", "Anguilla"), ("AL", "Albânia"),
+    ("AM", "Armênia"), ("AO", "Angola"), ("AQ", "Antártida"), ("AR", "Argentina"),
+    ("AS", "Samoa Americana"), ("AT", "Áustria"), ("AU", "Austrália"), ("AW", "Aruba"),
+    ("AX", "Ilhas Åland"), ("AZ", "Azerbaijão"), ("BA", "Bósnia e Herzegovina"),
+    ("BB", "Barbados"), ("BD", "Bangladesh"), ("BE", "Bélgica"), ("BF", "Burkina Faso"),
+    ("BG", "Bulgária"), ("BH", "Bahrein"), ("BI", "Burundi"), ("BJ", "Benim"),
+    ("BL", "São Bartolomeu"), ("BM", "Bermudas"), ("BN", "Brunei"), ("BO", "Bolívia"),
+    ("BQ", "Bonaire, Santo Eustáquio e Saba"), ("BR", "Brasil"), ("BS", "Bahamas"),
+    ("BT", "Butão"), ("BV", "Ilha Bouvet"), ("BW", "Botsuana"), ("BY", "Belarus"),
+    ("BZ", "Belize"), ("CA", "Canadá"), ("CC", "Ilhas Cocos"),
+    ("CD", "República Democrática do Congo"), ("CF", "República Centro-Africana"),
+    ("CG", "República do Congo"), ("CH", "Suíça"), ("CI", "Costa do Marfim"),
+    ("CK", "Ilhas Cook"), ("CL", "Chile"), ("CM", "Camarões"), ("CN", "China"),
+    ("CO", "Colômbia"), ("CR", "Costa Rica"), ("CU", "Cuba"), ("CV", "Cabo Verde"),
+    ("CW", "Curaçau"), ("CX", "Ilha Christmas"), ("CY", "Chipre"), ("CZ", "Tchéquia"),
+    ("DE", "Alemanha"), ("DJ", "Djibuti"), ("DK", "Dinamarca"), ("DM", "Dominica"),
+    ("DO", "República Dominicana"), ("DZ", "Argélia"), ("EC", "Equador"), ("EE", "Estônia"),
+    ("EG", "Egito"), ("EH", "Saara Ocidental"), ("ER", "Eritreia"), ("ES", "Espanha"),
+    ("ET", "Etiópia"), ("FI", "Finlândia"), ("FJ", "Fiji"), ("FK", "Ilhas Malvinas"),
+    ("FM", "Micronésia"), ("FO", "Ilhas Faroé"), ("FR", "França"), ("GA", "Gabão"),
+    ("GB", "Reino Unido"), ("GD", "Granada"), ("GE", "Geórgia"), ("GF", "Guiana Francesa"),
+    ("GG", "Guernsey"), ("GH", "Gana"), ("GI", "Gibraltar"), ("GL", "Groenlândia"),
+    ("GM", "Gâmbia"), ("GN", "Guiné"), ("GP", "Guadalupe"), ("GQ", "Guiné Equatorial"),
+    ("GR", "Grécia"), ("GS", "Geórgia do Sul e Ilhas Sandwich do Sul"), ("GT", "Guatemala"),
+    ("GU", "Guam"), ("GW", "Guiné-Bissau"), ("GY", "Guiana"), ("HK", "Hong Kong"),
+    ("HM", "Ilhas Heard e McDonald"), ("HN", "Honduras"), ("HR", "Croácia"), ("HT", "Haiti"),
+    ("HU", "Hungria"), ("ID", "Indonésia"), ("IE", "Irlanda"), ("IL", "Israel"),
+    ("IM", "Ilha de Man"), ("IN", "Índia"), ("IO", "Território Britânico do Oceano Índico"),
+    ("IQ", "Iraque"), ("IR", "Irã"), ("IS", "Islândia"), ("IT", "Itália"),
+    ("JE", "Jersey"), ("JM", "Jamaica"), ("JO", "Jordânia"), ("JP", "Japão"),
+    ("KE", "Quênia"), ("KG", "Quirguistão"), ("KH", "Camboja"), ("KI", "Kiribati"),
+    ("KM", "Comores"), ("KN", "São Cristóvão e Névis"), ("KP", "Coreia do Norte"),
+    ("KR", "Coreia do Sul"), ("KW", "Kuwait"), ("KY", "Ilhas Cayman"), ("KZ", "Cazaquistão"),
+    ("LA", "Laos"), ("LB", "Líbano"), ("LC", "Santa Lúcia"), ("LI", "Liechtenstein"),
+    ("LK", "Sri Lanka"), ("LR", "Libéria"), ("LS", "Lesoto"), ("LT", "Lituânia"),
+    ("LU", "Luxemburgo"), ("LV", "Letônia"), ("LY", "Líbia"), ("MA", "Marrocos"),
+    ("MC", "Mônaco"), ("MD", "Moldávia"), ("ME", "Montenegro"), ("MF", "São Martinho"),
+    ("MG", "Madagascar"), ("MH", "Ilhas Marshall"), ("MK", "Macedônia do Norte"),
+    ("ML", "Mali"), ("MM", "Mianmar"), ("MN", "Mongólia"), ("MO", "Macau"),
+    ("MP", "Ilhas Marianas do Norte"), ("MQ", "Martinica"), ("MR", "Mauritânia"),
+    ("MS", "Montserrat"), ("MT", "Malta"), ("MU", "Maurício"), ("MV", "Maldivas"),
+    ("MW", "Malaui"), ("MX", "México"), ("MY", "Malásia"), ("MZ", "Moçambique"),
+    ("NA", "Namíbia"), ("NC", "Nova Caledônia"), ("NE", "Níger"), ("NF", "Ilha Norfolk"),
+    ("NG", "Nigéria"), ("NI", "Nicarágua"), ("NL", "Países Baixos"), ("NO", "Noruega"),
+    ("NP", "Nepal"), ("NR", "Nauru"), ("NU", "Niue"), ("NZ", "Nova Zelândia"),
+    ("OM", "Omã"), ("PA", "Panamá"), ("PE", "Peru"), ("PF", "Polinésia Francesa"),
+    ("PG", "Papua-Nova Guiné"), ("PH", "Filipinas"), ("PK", "Paquistão"), ("PL", "Polônia"),
+    ("PM", "São Pedro e Miquelão"), ("PN", "Pitcairn"), ("PR", "Porto Rico"),
+    ("PS", "Palestina"), ("PT", "Portugal"), ("PW", "Palau"), ("PY", "Paraguai"),
+    ("QA", "Catar"), ("RE", "Reunião"), ("RO", "Romênia"), ("RS", "Sérvia"),
+    ("RU", "Rússia"), ("RW", "Ruanda"), ("SA", "Arábia Saudita"), ("SB", "Ilhas Salomão"),
+    ("SC", "Seicheles"), ("SD", "Sudão"), ("SE", "Suécia"), ("SG", "Singapura"),
+    ("SH", "Santa Helena, Ascensão e Tristão da Cunha"), ("SI", "Eslovênia"),
+    ("SJ", "Svalbard e Jan Mayen"), ("SK", "Eslováquia"), ("SL", "Serra Leoa"),
+    ("SM", "San Marino"), ("SN", "Senegal"), ("SO", "Somália"), ("SR", "Suriname"),
+    ("SS", "Sudão do Sul"), ("ST", "São Tomé e Príncipe"), ("SV", "El Salvador"),
+    ("SX", "Sint Maarten"), ("SY", "Síria"), ("SZ", "Essuatíni"), ("TC", "Ilhas Turks e Caicos"),
+    ("TD", "Chade"), ("TF", "Terras Austrais e Antárticas Francesas"), ("TG", "Togo"),
+    ("TH", "Tailândia"), ("TJ", "Tajiquistão"), ("TK", "Tokelau"), ("TL", "Timor-Leste"),
+    ("TM", "Turcomenistão"), ("TN", "Tunísia"), ("TO", "Tonga"), ("TR", "Turquia"),
+    ("TT", "Trinidad e Tobago"), ("TV", "Tuvalu"), ("TW", "Taiwan"), ("TZ", "Tanzânia"),
+    ("UA", "Ucrânia"), ("UG", "Uganda"), ("UM", "Ilhas Menores Distantes dos Estados Unidos"),
+    ("US", "Estados Unidos"), ("UY", "Uruguai"), ("UZ", "Uzbequistão"), ("VA", "Santa Sé"),
+    ("VC", "São Vicente e Granadinas"), ("VE", "Venezuela"), ("VG", "Ilhas Virgens Britânicas"),
+    ("VI", "Ilhas Virgens Americanas"), ("VN", "Vietnã"), ("VU", "Vanuatu"),
+    ("WF", "Wallis e Futuna"), ("WS", "Samoa"), ("YE", "Iêmen"), ("YT", "Mayotte"),
+    ("ZA", "África do Sul"), ("ZM", "Zâmbia"), ("ZW", "Zimbábue"),
+)
+CLIENTE_PAISES_MAP = dict(CLIENTE_PAISES)
+
+def pais_sort_key(item):
+    nome = unicodedata.normalize("NFKD", item[1])
+    nome = "".join(caractere for caractere in nome if not unicodedata.combining(caractere))
+    return nome.casefold()
+
+CLIENTE_PAISES_ORDENADOS = tuple(sorted(CLIENTE_PAISES, key=pais_sort_key))
 
 def db():
     conn = sqlite3.connect(DB, timeout=30)
@@ -32,6 +125,20 @@ def init_db():
         razao_social TEXT NOT NULL,
         cnpj TEXT NOT NULL UNIQUE,
         apelido TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS clientes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome TEXT NOT NULL COLLATE NOCASE,
+        pais TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(nome, pais)
+    );
+
+    CREATE TABLE IF NOT EXISTS contrapartes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome TEXT NOT NULL COLLATE NOCASE UNIQUE,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -61,8 +168,37 @@ def init_db():
         taxa_cambio REAL,
         valor_reais REAL,
         status TEXT NOT NULL DEFAULT 'PENDENTE',
+        saldo_zerado_manual INTEGER NOT NULL DEFAULT 0,
         observacao TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS ndfs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero_operacao TEXT NOT NULL UNIQUE,
+        cnpj TEXT NOT NULL,
+        contraparte TEXT NOT NULL,
+        tipo TEXT NOT NULL,
+        moeda TEXT NOT NULL DEFAULT 'USD',
+        valor_contratado REAL NOT NULL DEFAULT 0,
+        taxa_contratada REAL NOT NULL,
+        data_contratacao TEXT NOT NULL,
+        data_vencimento TEXT NOT NULL,
+        posicao TEXT NOT NULL,
+        finalidade TEXT,
+        observacao TEXT,
+        status TEXT NOT NULL DEFAULT 'ATIVA',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS ptax_cotacoes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data_cotacao TEXT NOT NULL,
+        moeda TEXT NOT NULL,
+        ptax_compra REAL NOT NULL,
+        ptax_venda REAL NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(moeda, data_cotacao)
     );
 
     CREATE TABLE IF NOT EXISTS due_movimentacoes (
@@ -100,6 +236,17 @@ def init_db():
         contrato_columns = {row[1] for row in conn.execute("PRAGMA table_info(contratos)")}
         if "banco" not in contrato_columns:
             conn.execute("ALTER TABLE contratos ADD COLUMN banco TEXT")
+        if "banco_id" not in contrato_columns:
+            conn.execute("ALTER TABLE contratos ADD COLUMN banco_id INTEGER")
+        if "cliente_id" not in contrato_columns:
+            conn.execute("ALTER TABLE contratos ADD COLUMN cliente_id INTEGER")
+        if "saldo_zerado_manual" not in contrato_columns:
+            conn.execute("ALTER TABLE contratos ADD COLUMN saldo_zerado_manual INTEGER NOT NULL DEFAULT 0")
+        ndf_columns = {row[1] for row in conn.execute("PRAGMA table_info(ndfs)")}
+        if "cliente_id" not in ndf_columns:
+            conn.execute("ALTER TABLE ndfs ADD COLUMN cliente_id INTEGER")
+        if "contraparte_id" not in ndf_columns:
+            conn.execute("ALTER TABLE ndfs ADD COLUMN contraparte_id INTEGER")
         conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_dues_chave_acesso
                        ON dues(chave_acesso)
                        WHERE chave_acesso IS NOT NULL AND chave_acesso <> ''""")
@@ -265,6 +412,113 @@ def cnpj_da_empresa(conn, empresa_id, current_cnpj=None):
         return normalize_cnpj(current_cnpj)
     raise ValueError("Selecione uma empresa em Configurações > Cadastrar minhas empresas.")
 
+@app.template_filter("pais_nome")
+def pais_nome(value):
+    codigo = str(value or "").strip().upper()
+    return CLIENTE_PAISES_MAP.get(codigo, value or "-")
+
+def normalize_pais(value):
+    pais = (value or "").strip().upper()
+    if pais not in CLIENTE_PAISES_MAP:
+        raise ValueError("Selecione um país válido.")
+    return pais
+
+def clientes_for_form(conn):
+    return conn.execute("""
+        SELECT id, nome, pais
+        FROM clientes
+        ORDER BY nome, pais
+    """).fetchall()
+
+def contrapartes_for_form(conn):
+    return conn.execute("""
+        SELECT id, nome
+        FROM contrapartes
+        ORDER BY nome
+    """).fetchall()
+
+def form_record_id(value, fallback=None):
+    if value in (None, ""):
+        return fallback
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+def cliente_da_selecao(conn, raw_id, current_id=None, required=False):
+    if raw_id in (None, ""):
+        if current_id:
+            cliente = conn.execute("SELECT id, nome, pais FROM clientes WHERE id=?", (current_id,)).fetchone()
+            if cliente:
+                return cliente
+        if required:
+            raise ValueError("Selecione um cliente cadastrado em Configurações.")
+        return None
+    try:
+        cliente_id = int(raw_id)
+    except (TypeError, ValueError):
+        raise ValueError("Selecione um cliente cadastrado.")
+    cliente = conn.execute("SELECT id, nome, pais FROM clientes WHERE id=?", (cliente_id,)).fetchone()
+    if not cliente:
+        raise ValueError("O cliente selecionado não foi encontrado.")
+    return cliente
+
+def contraparte_da_selecao(conn, raw_id, current_id=None, required=False):
+    if raw_id in (None, ""):
+        if current_id:
+            contraparte = conn.execute("SELECT id, nome FROM contrapartes WHERE id=?", (current_id,)).fetchone()
+            if contraparte:
+                return contraparte
+        if required:
+            raise ValueError("Selecione um Banco / Contraparte cadastrado em Configurações.")
+        return None
+    try:
+        contraparte_id = int(raw_id)
+    except (TypeError, ValueError):
+        raise ValueError("Selecione um Banco / Contraparte cadastrado.")
+    contraparte = conn.execute("SELECT id, nome FROM contrapartes WHERE id=?", (contraparte_id,)).fetchone()
+    if not contraparte:
+        raise ValueError("O Banco / Contraparte selecionado não foi encontrado.")
+    return contraparte
+
+def banco_do_contrato(conn, raw_id, current=None):
+    current_id = current["banco_id"] if current and "banco_id" in current.keys() else None
+    contraparte = contraparte_da_selecao(conn, raw_id, current_id=current_id)
+    if contraparte:
+        return contraparte["id"], contraparte["nome"]
+    return current_id, (current["banco"] if current else None)
+
+def banco_id_for_form(conn, contrato=None, selected_id=None):
+    if selected_id not in (None, ""):
+        return form_record_id(selected_id)
+    if not contrato:
+        return None
+    if "banco_id" in contrato.keys() and contrato["banco_id"]:
+        return contrato["banco_id"]
+    if contrato["banco"]:
+        registro = conn.execute(
+            "SELECT id FROM contrapartes WHERE nome=? COLLATE NOCASE",
+            (contrato["banco"],),
+        ).fetchone()
+        return registro["id"] if registro else None
+    return None
+
+def cliente_do_contrato(conn, raw_id, current=None, legacy_name=None):
+    current_id = current["cliente_id"] if current and "cliente_id" in current.keys() else None
+    cliente = cliente_da_selecao(conn, raw_id, current_id=current_id)
+    if cliente:
+        return cliente["id"], cliente["nome"]
+    if legacy_name is not None:
+        return current_id, (legacy_name or "").strip() or None
+    return current_id, (current["cliente"] if current else None)
+
+def cliente_id_for_form(contrato=None, selected_id=None):
+    if selected_id not in (None, ""):
+        return form_record_id(selected_id)
+    if contrato and "cliente_id" in contrato.keys() and contrato["cliente_id"]:
+        return contrato["cliente_id"]
+    return None
+
 def decimal_value(value):
     """Converte valores monetários para Decimal sem perder a regra de tolerância."""
     if value is None or str(value).strip() in {"", "nan", "NaT"}:
@@ -318,7 +572,7 @@ def update_due_status(conn, due_id):
 
 def update_contract_status(conn, contrato_id):
     row = conn.execute("""
-        SELECT c.valor_moeda,
+        SELECT c.valor_moeda, c.saldo_zerado_manual,
                COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END), 0) AS vinculado
         FROM contratos c
         LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
@@ -327,8 +581,8 @@ def update_contract_status(conn, contrato_id):
     """, (contrato_id,)).fetchone()
     if not row:
         return None
-    saldo = contract_balance(row["valor_moeda"], row["vinculado"])
-    status = status_from_balance(saldo)
+    saldo = Decimal("0") if row["saldo_zerado_manual"] else contract_balance(row["valor_moeda"], row["vinculado"])
+    status = STATUS_CONCLUIDO if row["saldo_zerado_manual"] else status_from_balance(saldo)
     conn.execute("UPDATE contratos SET status=? WHERE id=?", (status, contrato_id))
     return status
 
@@ -354,13 +608,249 @@ def decorate_contract(row):
     data = dict(row)
     data["valor_moeda"] = decimal_value(data.get("valor_moeda"))
     data["vinculado"] = decimal_value(data.get("vinculado"))
-    data["saldo"] = contract_balance(data.get("valor_moeda"), data["vinculado"])
-    data["status"] = status_from_balance(data["saldo"])
+    data["saldo_zerado_manual"] = bool(data.get("saldo_zerado_manual"))
+    data["saldo"] = Decimal("0") if data["saldo_zerado_manual"] else contract_balance(data.get("valor_moeda"), data["vinculado"])
+    data["status"] = STATUS_CONCLUIDO if data["saldo_zerado_manual"] else status_from_balance(data["saldo"])
     return data
+
+@app.template_filter("ndf_status_class")
+def ndf_status_class(status):
+    return {
+        NDF_STATUS_ATIVA: "status-ndf-ativa",
+        NDF_STATUS_VENCIDA: "status-ndf-vencida",
+        NDF_STATUS_LIQUIDADA: "status-ndf-liquidada",
+        NDF_STATUS_CANCELADA: "status-ndf-cancelada",
+    }.get(status, "status-ndf-cancelada")
+
+def ndf_display_status(status, data_vencimento):
+    if status == NDF_STATUS_ATIVA and data_vencimento and data_vencimento < date.today().isoformat():
+        return NDF_STATUS_VENCIDA
+    return status
+
+def decorate_ndf(row):
+    data = dict(row)
+    data["valor_contratado"] = decimal_value(data.get("valor_contratado"))
+    data["taxa_contratada"] = decimal_value(data.get("taxa_contratada"))
+    data["status_exibicao"] = ndf_display_status(data.get("status"), data.get("data_vencimento"))
+    return data
+
+def parse_ndf_form(form, conn, current=None):
+    numero_operacao = (form.get("numero_operacao") or "").strip()
+    if not numero_operacao:
+        raise ValueError("O número/ID da operação é obrigatório.")
+
+    cnpj = cnpj_da_empresa(conn, form.get("empresa_id"), current["cnpj"] if current else None)
+    current_cliente_id = current["cliente_id"] if current and "cliente_id" in current.keys() else None
+    current_contraparte_id = current["contraparte_id"] if current and "contraparte_id" in current.keys() else None
+    cliente = cliente_da_selecao(
+        conn, form.get("cliente_id"), current_id=current_cliente_id, required=current is None
+    )
+    contraparte_registro = contraparte_da_selecao(
+        conn, form.get("contraparte_id"), current_id=current_contraparte_id, required=current is None
+    )
+    contraparte = contraparte_registro["nome"] if contraparte_registro else (current["contraparte"] if current else "")
+    if not contraparte:
+        raise ValueError("A contraparte é obrigatória.")
+
+    tipo = (form.get("tipo") or "").strip().upper()
+    if tipo not in NDF_TIPOS:
+        raise ValueError("Selecione um tipo válido: Banco ou Trading.")
+
+    moeda = (form.get("moeda") or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", moeda):
+        raise ValueError("A moeda deve conter exatamente 3 letras.")
+
+    valor_bruto = form.get("valor_contratado")
+    if not str(valor_bruto or "").strip():
+        raise ValueError("O valor contratado é obrigatório.")
+    valor_contratado = parse_number(valor_bruto)
+    ensure_non_negative_balance(valor_contratado, "O valor contratado não pode ser negativo.")
+
+    taxa_bruta = form.get("taxa_contratada")
+    if not str(taxa_bruta or "").strip():
+        raise ValueError("A taxa contratada é obrigatória.")
+    taxa_contratada = parse_number(taxa_bruta)
+    ensure_non_negative_balance(taxa_contratada, "A taxa contratada não pode ser negativa.")
+
+    data_contratacao = parse_date(form.get("data_contratacao"))
+    data_vencimento = parse_date(form.get("data_vencimento"))
+    if not data_contratacao or not data_vencimento:
+        raise ValueError("As datas de contratação e vencimento são obrigatórias.")
+    if data_vencimento < data_contratacao:
+        raise ValueError("A data de vencimento não pode ser anterior à data de contratação.")
+
+    posicao = (form.get("posicao") or "").strip().upper()
+    if posicao not in NDF_POSICOES:
+        raise ValueError("Selecione uma posição válida: Compra ou Venda.")
+
+    status = (form.get("status") or "").strip().upper()
+    if status not in NDF_STATUSES:
+        raise ValueError("Selecione um status válido.")
+
+    return {
+        "numero_operacao": numero_operacao,
+        "cnpj": cnpj,
+        "cliente_id": cliente["id"] if cliente else None,
+        "contraparte_id": contraparte_registro["id"] if contraparte_registro else None,
+        "contraparte": contraparte,
+        "tipo": tipo,
+        "moeda": moeda,
+        "valor_contratado": valor_contratado,
+        "taxa_contratada": taxa_contratada,
+        "data_contratacao": data_contratacao,
+        "data_vencimento": data_vencimento,
+        "posicao": posicao,
+        "finalidade": (form.get("finalidade") or "").strip() or None,
+        "observacao": (form.get("observacao") or "").strip() or None,
+        "status": status,
+    }
+
+def parse_ptax_period(form):
+    moeda = (form.get("moeda") or "").strip().upper()
+    if moeda not in PTAX_MOEDAS:
+        raise ValueError("Selecione uma moeda válida: USD ou EUR.")
+
+    data_inicial = parse_date(form.get("data_inicial"))
+    data_final = parse_date(form.get("data_final"))
+    if not data_inicial or not data_final:
+        raise ValueError("As datas inicial e final são obrigatórias.")
+    if data_inicial > data_final:
+        raise ValueError("A data inicial não pode ser posterior à data final.")
+    return moeda, data_inicial, data_final
+
+def ptax_api_url(moeda, data_inicial, data_final):
+    parametros = urlencode({
+        "@moeda": f"'{moeda}'",
+        "@dataInicial": f"'{datetime.strptime(data_inicial, '%Y-%m-%d').strftime('%m-%d-%Y')}'",
+        "@dataFinalCotacao": f"'{datetime.strptime(data_final, '%Y-%m-%d').strftime('%m-%d-%Y')}'",
+        "$format": "json",
+    })
+    return (
+        f"{PTAX_API_URL}(moeda=@moeda,dataInicial=@dataInicial,"
+        f"dataFinalCotacao=@dataFinalCotacao)?{parametros}"
+    )
+
+def ptax_rate_value(value):
+    if value is None or str(value).strip() in {"", "nan", "NaT", "None"}:
+        return None
+    try:
+        rate_value = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not rate_value.is_finite() or rate_value <= 0:
+        return None
+    return float(rate_value)
+
+def parse_ptax_rate(value, label):
+    if not str(value or "").strip():
+        raise ValueError(f"A {label} é obrigatória.")
+    rate_value = ptax_rate_value(parse_number(value))
+    if rate_value is None:
+        raise ValueError(f"A {label} retornada é inválida.")
+    return rate_value
+
+def consultar_ptax_api(moeda, data_inicial, data_final):
+    url = ptax_api_url(moeda, data_inicial, data_final)
+    requisicao = Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "DUE-Control PTAX",
+    })
+    try:
+        with urlopen(requisicao, timeout=PTAX_API_TIMEOUT) as resposta:
+            payload = json.loads(resposta.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise ValueError(f"O Banco Central respondeu com erro HTTP {exc.code}.")
+    except (URLError, TimeoutError, OSError):
+        raise ValueError("Não foi possível acessar a API PTAX do Banco Central.")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("A API PTAX retornou uma resposta inválida.")
+
+    registros_api = payload.get("value") if isinstance(payload, dict) else None
+    if not isinstance(registros_api, list):
+        raise ValueError("A API PTAX retornou um formato de dados inválido.")
+
+    fechamentos = {}
+    for registro in registros_api:
+        if not isinstance(registro, dict):
+            continue
+        tipo_boletim = str(registro.get("tipoBoletim") or "").strip().casefold()
+        if tipo_boletim != "fechamento":
+            continue
+        data_hora = str(registro.get("dataHoraCotacao") or "").strip()
+        if not data_hora:
+            continue
+        data_cotacao = data_hora[:10]
+        try:
+            data_cotacao = parse_date(data_cotacao)
+        except ValueError:
+            continue
+        ptax_compra = ptax_rate_value(registro.get("cotacaoCompra"))
+        ptax_venda = ptax_rate_value(registro.get("cotacaoVenda"))
+        if ptax_compra is None or ptax_venda is None:
+            continue
+        candidato = {
+            "data_cotacao": data_cotacao,
+            "moeda": moeda,
+            "ptax_compra": ptax_compra,
+            "ptax_venda": ptax_venda,
+            "_data_hora": data_hora,
+        }
+        anterior = fechamentos.get(data_cotacao)
+        if anterior is None or candidato["_data_hora"] > anterior["_data_hora"]:
+            fechamentos[data_cotacao] = candidato
+
+    resultado = []
+    for registro in sorted(fechamentos.values(), key=lambda item: item["data_cotacao"], reverse=True):
+        registro.pop("_data_hora", None)
+        resultado.append(registro)
+    return resultado
+
+def parse_ptax_importacao(form):
+    datas = form.getlist("cotacao_data")
+    moedas = form.getlist("cotacao_moeda")
+    compras = form.getlist("cotacao_compra")
+    vendas = form.getlist("cotacao_venda")
+    tamanhos = {len(datas), len(moedas), len(compras), len(vendas)}
+    if len(tamanhos) != 1 or not datas:
+        raise ValueError("A prévia de PTAX está incompleta e não pode ser importada.")
+
+    registros = []
+    for data, moeda, compra, venda in zip(datas, moedas, compras, vendas):
+        moeda = (moeda or "").strip().upper()
+        if moeda not in PTAX_MOEDAS:
+            raise ValueError("A prévia contém uma moeda inválida.")
+        data = parse_date(data)
+        if not data:
+            raise ValueError("A prévia contém uma data inválida.")
+        registros.append({
+            "data_cotacao": data,
+            "moeda": moeda,
+            "ptax_compra": parse_ptax_rate(compra, "PTAX Compra"),
+            "ptax_venda": parse_ptax_rate(venda, "PTAX Venda"),
+        })
+    return registros
+
+def render_ptax_page(previsao=None, consulta=None):
+    consulta = consulta or {}
+    form_values = {
+        "moeda": consulta.get("moeda") or "USD",
+        "data_inicial": consulta.get("data_inicial") or "",
+        "data_final": consulta.get("data_final") or "",
+    }
+    conn = db()
+    historico = conn.execute("""
+        SELECT data_cotacao, moeda, ptax_compra, ptax_venda
+        FROM ptax_cotacoes
+        ORDER BY data_cotacao DESC, moeda ASC
+    """).fetchall()
+    conn.close()
+    return render_template("ptax.html", moedas=PTAX_MOEDAS, consulta=form_values,
+                           previsao=previsao, historico=historico)
 
 def contract_summary(conn, contrato_id):
     row = conn.execute("""
         SELECT c.id, c.numero_contrato, c.moeda, c.valor_moeda, c.status,
+               c.saldo_zerado_manual,
                COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0) AS vinculado
         FROM contratos c
         LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
@@ -415,6 +905,210 @@ def lista_contratos():
     conn.close()
     return render_template("contratos.html", contratos=contratos)
 
+@app.route("/derivativos")
+def dashboard_derivativos():
+    hoje = date.today().isoformat()
+    conn = db()
+    resumo_row = conn.execute("""
+        SELECT COUNT(*) AS ativas,
+               COALESCE(SUM(CASE WHEN moeda='USD' THEN valor_contratado ELSE 0 END), 0) AS usd_contratado,
+               COALESCE(SUM(CASE WHEN moeda='USD' AND data_vencimento >= ?
+                                 THEN valor_contratado ELSE 0 END), 0) AS usd_a_vencer
+        FROM ndfs
+        WHERE status=?
+    """, (hoje, NDF_STATUS_ATIVA)).fetchone()
+    proximos = [decorate_ndf(row) for row in conn.execute("""
+        SELECT *
+        FROM ndfs
+        WHERE status=?
+        ORDER BY CASE WHEN data_vencimento < ? THEN 0 ELSE 1 END,
+                 data_vencimento ASC, id DESC
+        LIMIT 5
+    """, (NDF_STATUS_ATIVA, hoje)).fetchall()]
+    conn.close()
+    resumo = {
+        "ativas": resumo_row["ativas"],
+        "usd_contratado": decimal_value(resumo_row["usd_contratado"]),
+        "usd_a_vencer": decimal_value(resumo_row["usd_a_vencer"]),
+    }
+    return render_template("derivativos.html", resumo=resumo, proximos=proximos)
+
+@app.route("/derivativos/ndfs")
+def lista_ndfs():
+    conn = db()
+    ndfs = [decorate_ndf(row) for row in conn.execute(
+        "SELECT * FROM ndfs ORDER BY id DESC"
+    ).fetchall()]
+    conn.close()
+    return render_template("ndfs.html", ndfs=ndfs)
+
+@app.route("/ndf/novo", methods=["GET", "POST"])
+def novo_ndf():
+    conn = db()
+    if request.method == "POST":
+        try:
+            data = parse_ndf_form(request.form, conn)
+            conn.execute("""
+                INSERT INTO ndfs
+                    (numero_operacao,cnpj,cliente_id,contraparte_id,contraparte,tipo,moeda,valor_contratado,
+                     taxa_contratada,data_contratacao,data_vencimento,posicao,
+                     finalidade,observacao,status)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                data["numero_operacao"], data["cnpj"], data["cliente_id"], data["contraparte_id"],
+                data["contraparte"], data["tipo"],
+                data["moeda"], data["valor_contratado"], data["taxa_contratada"],
+                data["data_contratacao"], data["data_vencimento"], data["posicao"],
+                data["finalidade"], data["observacao"], data["status"],
+            ))
+            ndf_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.commit()
+            conn.close()
+            flash("NDF cadastrada com sucesso.", "success")
+            return redirect(url_for("detalhe_ndf", ndf_id=ndf_id))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe uma NDF com esse número/ID de operação.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+    empresas, empresa_id = empresas_for_form(
+        conn, selected_id=request.form.get("empresa_id") if request.method == "POST" else None
+    )
+    clientes = clientes_for_form(conn)
+    contrapartes = contrapartes_for_form(conn)
+    cliente_id = form_record_id(request.form.get("cliente_id")) if request.method == "POST" else None
+    contraparte_id = form_record_id(request.form.get("contraparte_id")) if request.method == "POST" else None
+    conn.close()
+    return render_template("ndf_form.html", ndf=None, empresas=empresas, empresa_id=empresa_id,
+                           clientes=clientes, cliente_id=cliente_id,
+                           contrapartes=contrapartes, contraparte_id=contraparte_id,
+                           ndf_tipos=NDF_TIPOS, ndf_posicoes=NDF_POSICOES, ndf_statuses=NDF_STATUSES)
+
+@app.route("/ndf/<int:ndf_id>")
+def detalhe_ndf(ndf_id):
+    conn = db()
+    ndf = conn.execute("""
+        SELECT n.*, c.nome AS cliente_nome, c.pais AS cliente_pais
+        FROM ndfs n
+        LEFT JOIN clientes c ON c.id=n.cliente_id
+        WHERE n.id=?
+    """, (ndf_id,)).fetchone()
+    conn.close()
+    if not ndf:
+        return "NDF não encontrada", 404
+    return render_template("ndf_detalhe.html", ndf=decorate_ndf(ndf))
+
+@app.route("/ndf/<int:ndf_id>/editar", methods=["GET", "POST"])
+def editar_ndf(ndf_id):
+    conn = db()
+    ndf = conn.execute("SELECT * FROM ndfs WHERE id=?", (ndf_id,)).fetchone()
+    if not ndf:
+        conn.close()
+        return "NDF não encontrada", 404
+    if request.method == "POST":
+        try:
+            data = parse_ndf_form(request.form, conn, current=ndf)
+            conn.execute("""
+                UPDATE ndfs SET numero_operacao=?,cnpj=?,cliente_id=?,contraparte_id=?,contraparte=?,tipo=?,moeda=?,
+                    valor_contratado=?,taxa_contratada=?,data_contratacao=?,data_vencimento=?,
+                    posicao=?,finalidade=?,observacao=?,status=?
+                WHERE id=?
+            """, (
+                data["numero_operacao"], data["cnpj"], data["cliente_id"], data["contraparte_id"],
+                data["contraparte"], data["tipo"],
+                data["moeda"], data["valor_contratado"], data["taxa_contratada"],
+                data["data_contratacao"], data["data_vencimento"], data["posicao"],
+                data["finalidade"], data["observacao"], data["status"], ndf_id,
+            ))
+            conn.commit()
+            conn.close()
+            flash("NDF atualizada com sucesso.", "success")
+            return redirect(url_for("detalhe_ndf", ndf_id=ndf_id))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe uma NDF com esse número/ID de operação.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+    empresas, empresa_id = empresas_for_form(
+        conn, ndf["cnpj"], request.form.get("empresa_id") if request.method == "POST" else None
+    )
+    clientes = clientes_for_form(conn)
+    contrapartes = contrapartes_for_form(conn)
+    cliente_id = form_record_id(
+        request.form.get("cliente_id") if request.method == "POST" else ndf["cliente_id"]
+    )
+    contraparte_id = form_record_id(
+        request.form.get("contraparte_id") if request.method == "POST" else ndf["contraparte_id"]
+    )
+    ndf_data = decorate_ndf(ndf)
+    conn.close()
+    return render_template("ndf_form.html", ndf=ndf_data, empresas=empresas, empresa_id=empresa_id,
+                           clientes=clientes, cliente_id=cliente_id,
+                           contrapartes=contrapartes, contraparte_id=contraparte_id,
+                           ndf_tipos=NDF_TIPOS, ndf_posicoes=NDF_POSICOES, ndf_statuses=NDF_STATUSES)
+
+@app.route("/ndf/<int:ndf_id>/excluir", methods=["POST"])
+def excluir_ndf(ndf_id):
+    conn = db()
+    ndf = conn.execute("SELECT numero_operacao FROM ndfs WHERE id=?", (ndf_id,)).fetchone()
+    if not ndf:
+        conn.close()
+        return "NDF não encontrada", 404
+    conn.execute("DELETE FROM ndfs WHERE id=?", (ndf_id,))
+    conn.commit()
+    conn.close()
+    flash(f"NDF {ndf['numero_operacao']} excluída com sucesso.", "success")
+    return redirect(url_for("lista_ndfs"))
+
+@app.route("/derivativos/ptax")
+def ptax():
+    return render_ptax_page()
+
+@app.route("/derivativos/ptax/consultar", methods=["POST"])
+def consultar_ptax():
+    consulta = {
+        "moeda": request.form.get("moeda"),
+        "data_inicial": request.form.get("data_inicial"),
+        "data_final": request.form.get("data_final"),
+    }
+    try:
+        moeda, data_inicial, data_final = parse_ptax_period(request.form)
+        previsao = consultar_ptax_api(moeda, data_inicial, data_final)
+        return render_ptax_page(previsao=previsao, consulta=consulta)
+    except ValueError as exc:
+        flash(str(exc), "danger")
+        return render_ptax_page(consulta=consulta)
+
+@app.route("/derivativos/ptax/importar", methods=["POST"])
+def importar_ptax():
+    conn = db()
+    try:
+        registros = parse_ptax_importacao(request.form)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany("""
+            INSERT INTO ptax_cotacoes (data_cotacao,moeda,ptax_compra,ptax_venda)
+            VALUES (?,?,?,?)
+            ON CONFLICT(moeda,data_cotacao) DO UPDATE SET
+                ptax_compra=excluded.ptax_compra,
+                ptax_venda=excluded.ptax_venda
+        """, [(
+            registro["data_cotacao"], registro["moeda"],
+            registro["ptax_compra"], registro["ptax_venda"],
+        ) for registro in registros])
+        conn.commit()
+        flash(f"{len(registros)} cotação(ões) PTAX importada(s)/atualizada(s) com sucesso.", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    except sqlite3.Error:
+        conn.rollback()
+        flash("Não foi possível gravar as cotações PTAX.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("ptax"))
+
 @app.route("/configuracoes")
 def configuracoes():
     return render_template("configuracoes.html")
@@ -452,6 +1146,71 @@ def cadastro_empresas():
     conn.close()
     return render_template("empresas.html", empresas=empresas)
 
+@app.route("/configuracoes/clientes", methods=["GET", "POST"])
+def cadastro_clientes():
+    conn = db()
+    nome = (request.form.get("nome") or "").strip() if request.method == "POST" else ""
+    pais_selecionado = request.form.get("pais") if request.method == "POST" else ""
+    if request.method == "POST":
+        try:
+            if not nome:
+                raise ValueError("O nome do cliente é obrigatório.")
+            pais = normalize_pais(pais_selecionado)
+            conn.execute(
+                "INSERT INTO clientes (nome, pais) VALUES (?, ?)",
+                (nome, pais),
+            )
+            conn.commit()
+            conn.close()
+            flash("Cliente cadastrado com sucesso.", "success")
+            return redirect(url_for("cadastro_clientes"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe um cliente cadastrado com este nome e país.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+    clientes = conn.execute("""
+        SELECT id, nome, pais
+        FROM clientes
+        ORDER BY nome, pais
+    """).fetchall()
+    conn.close()
+    return render_template(
+        "clientes.html", clientes=clientes, paises=CLIENTE_PAISES_ORDENADOS,
+        nome=nome, pais_selecionado=pais_selecionado,
+    )
+
+@app.route("/configuracoes/contrapartes", methods=["GET", "POST"])
+def cadastro_contrapartes():
+    conn = db()
+    nome = (request.form.get("nome") or "").strip() if request.method == "POST" else ""
+    if request.method == "POST":
+        try:
+            if not nome:
+                raise ValueError("O nome do Banco / Contraparte é obrigatório.")
+            conn.execute(
+                "INSERT INTO contrapartes (nome) VALUES (?)",
+                (nome,),
+            )
+            conn.commit()
+            conn.close()
+            flash("Banco / Contraparte cadastrado com sucesso.", "success")
+            return redirect(url_for("cadastro_contrapartes"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe um Banco / Contraparte cadastrado com este nome.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+    contrapartes = conn.execute("""
+        SELECT id, nome
+        FROM contrapartes
+        ORDER BY nome
+    """).fetchall()
+    conn.close()
+    return render_template("contrapartes.html", contrapartes=contrapartes, nome=nome)
+
 def optional_number(value):
     return parse_number(value) if value and str(value).strip() else None
 
@@ -463,13 +1222,17 @@ def novo_contrato():
         try:
             valor_moeda = parse_number(f.get("valor_moeda"))
             ensure_non_negative_balance(valor_moeda, "O valor do contrato não pode ser negativo.")
+            banco_id, banco = banco_do_contrato(conn, f.get("banco_id"))
+            cliente_id, cliente = cliente_do_contrato(
+                conn, f.get("cliente_id"), legacy_name=f.get("cliente")
+            )
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"))
             conn.execute("""INSERT INTO contratos
-                (numero_contrato,banco,data_contrato,cnpj,cliente,moeda,valor_moeda,taxa_cambio,valor_reais,status,observacao)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (f["numero_contrato"].strip(), (f.get("banco") or "").strip() or None,
-                 parse_date(f.get("data_contrato")), cnpj,
-                 f.get("cliente"), f.get("moeda") or "USD", valor_moeda,
+                (numero_contrato,banco_id,banco,data_contrato,cnpj,cliente_id,cliente,moeda,valor_moeda,taxa_cambio,valor_reais,status,observacao)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (f["numero_contrato"].strip(), banco_id, banco,
+                 parse_date(f.get("data_contrato")), cnpj, cliente_id, cliente,
+                 f.get("moeda") or "USD", valor_moeda,
                  optional_number(f.get("taxa_cambio")), optional_number(f.get("valor_reais")),
                  status_from_balance(valor_moeda), f.get("observacao")))
             conn.commit(); conn.close()
@@ -483,13 +1246,24 @@ def novo_contrato():
             flash(str(exc), "danger")
     conn = db()
     empresas, empresa_id = empresas_for_form(conn, selected_id=request.form.get("empresa_id"))
+    contrapartes = contrapartes_for_form(conn)
+    banco_id = banco_id_for_form(conn, selected_id=request.form.get("banco_id"))
+    clientes = clientes_for_form(conn)
+    cliente_id = cliente_id_for_form(selected_id=request.form.get("cliente_id"))
     conn.close()
-    return render_template("contrato_form.html", contrato=None, empresas=empresas, empresa_id=empresa_id)
+    return render_template("contrato_form.html", contrato=None, empresas=empresas, empresa_id=empresa_id,
+                           contrapartes=contrapartes, banco_id=banco_id,
+                           clientes=clientes, cliente_id=cliente_id)
 
 @app.route("/contrato/<int:contrato_id>")
 def detalhe_contrato(contrato_id):
     conn = db()
-    contrato = conn.execute("SELECT * FROM contratos WHERE id=?", (contrato_id,)).fetchone()
+    contrato = conn.execute("""
+        SELECT c.*, cl.pais AS cliente_pais
+        FROM contratos c
+        LEFT JOIN clientes cl ON cl.id=c.cliente_id
+        WHERE c.id=?
+    """, (contrato_id,)).fetchone()
     if not contrato:
         conn.close(); return "Contrato não encontrado", 404
     vinculos = conn.execute("""
@@ -513,23 +1287,28 @@ def editar_contrato(contrato_id):
     contrato = conn.execute("SELECT * FROM contratos WHERE id=?", (contrato_id,)).fetchone()
     if not contrato:
         conn.close(); return "Contrato não encontrado", 404
+    resumo = contract_summary(conn, contrato_id)
     if request.method == "POST":
         f = request.form
         try:
             valor_moeda = parse_number(f.get("valor_moeda"))
-            linked = contract_summary(conn, contrato_id)["vinculado"]
+            linked = resumo["vinculado"]
             ensure_non_negative_balance(
                 decimal_value(valor_moeda) - linked,
                 "O valor do contrato não pode ficar abaixo do total já vinculado."
             )
+            banco_id, banco = banco_do_contrato(conn, f.get("banco_id"), current=contrato)
+            cliente_id, cliente = cliente_do_contrato(
+                conn, f.get("cliente_id"), current=contrato, legacy_name=f.get("cliente")
+            )
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"), contrato["cnpj"])
-            conn.execute("""UPDATE contratos SET numero_contrato=?,data_contrato=?,cnpj=?,cliente=?,moeda=?,
-                            valor_moeda=?,taxa_cambio=?,valor_reais=?,status=?,observacao=?,banco=? WHERE id=?""",
-                (f["numero_contrato"].strip(), parse_date(f.get("data_contrato")), cnpj,
-                 f.get("cliente"), f.get("moeda") or "USD", valor_moeda,
+            conn.execute("""UPDATE contratos SET numero_contrato=?,banco_id=?,banco=?,data_contrato=?,cnpj=?,cliente_id=?,cliente=?,moeda=?,
+                            valor_moeda=?,taxa_cambio=?,valor_reais=?,status=?,observacao=? WHERE id=?""",
+                (f["numero_contrato"].strip(), banco_id, banco, parse_date(f.get("data_contrato")), cnpj,
+                 cliente_id, cliente, f.get("moeda") or "USD", valor_moeda,
                  optional_number(f.get("taxa_cambio")), optional_number(f.get("valor_reais")),
-                 status_from_balance(contract_balance(valor_moeda, linked)),
-                 f.get("observacao"), (f.get("banco") or "").strip() or None, contrato_id))
+                 STATUS_CONCLUIDO if resumo["saldo_zerado_manual"] else status_from_balance(contract_balance(valor_moeda, linked)),
+                 f.get("observacao"), contrato_id))
             conn.commit(); conn.close()
             flash("Contrato atualizado com sucesso.", "success")
             return redirect(url_for("detalhe_contrato", contrato_id=contrato_id))
@@ -540,8 +1319,66 @@ def editar_contrato(contrato_id):
     empresas, empresa_id = empresas_for_form(
         conn, contrato["cnpj"], request.form.get("empresa_id") if request.method == "POST" else None
     )
+    contrapartes = contrapartes_for_form(conn)
+    banco_id = banco_id_for_form(
+        conn, contrato,
+        request.form.get("banco_id") if request.method == "POST" else None,
+    )
+    clientes = clientes_for_form(conn)
+    cliente_id = cliente_id_for_form(
+        contrato,
+        request.form.get("cliente_id") if request.method == "POST" else None,
+    )
     conn.close()
-    return render_template("contrato_form.html", contrato=contrato, empresas=empresas, empresa_id=empresa_id)
+    return render_template("contrato_form.html", contrato=contrato, resumo=resumo, empresas=empresas, empresa_id=empresa_id,
+                           contrapartes=contrapartes, banco_id=banco_id,
+                           clientes=clientes, cliente_id=cliente_id)
+
+@app.route("/contrato/<int:contrato_id>/zerar-saldo", methods=["POST"])
+def zerar_saldo(contrato_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        contrato = contract_summary(conn, contrato_id)
+        if not contrato:
+            conn.rollback()
+            return "Contrato não encontrado", 404
+        if contrato["saldo_zerado_manual"]:
+            raise ValueError("O saldo deste contrato já foi zerado manualmente.")
+        if contrato["saldo"] <= 0:
+            raise ValueError("Só é possível zerar manualmente contratos com saldo positivo.")
+        conn.execute("UPDATE contratos SET saldo_zerado_manual=1,status=? WHERE id=?",
+                     (STATUS_CONCLUIDO, contrato_id))
+        conn.commit()
+        flash("Saldo do contrato zerado manualmente e contrato marcado como concluído.", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("editar_contrato", contrato_id=contrato_id))
+
+@app.route("/contrato/<int:contrato_id>/reverter-saldo", methods=["POST"])
+def reverter_saldo(contrato_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        contrato = conn.execute("SELECT saldo_zerado_manual FROM contratos WHERE id=?", (contrato_id,)).fetchone()
+        if not contrato:
+            conn.rollback()
+            return "Contrato não encontrado", 404
+        if not contrato["saldo_zerado_manual"]:
+            raise ValueError("Este contrato não possui zeramento manual ativo.")
+        conn.execute("UPDATE contratos SET saldo_zerado_manual=0 WHERE id=?", (contrato_id,))
+        update_contract_status(conn, contrato_id)
+        conn.commit()
+        flash("Zeramento manual revertido; saldo recalculado com os vínculos atuais.", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("editar_contrato", contrato_id=contrato_id))
 
 @app.route("/contrato/<int:contrato_id>/excluir", methods=["POST"])
 def excluir_contrato(contrato_id):
@@ -829,10 +1666,11 @@ def due_detalhe(due_id):
                          LEFT JOIN due_movimentacoes m ON m.due_contrato_id=v.id AND m.tipo='VINCULACAO'
                          WHERE v.due_id=? ORDER BY v.id DESC""",(due_id,)).fetchall()
     contratos=[decorate_contract(row) for row in conn.execute("""SELECT c.*,COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0) AS vinculado
-                              FROM contratos c LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
-                              GROUP BY c.id
-                              HAVING c.valor_moeda-COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0)>?
-                              ORDER BY c.numero_contrato""", (float(SALDO_TOLERANCE),)).fetchall()]
+                               FROM contratos c LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
+                               GROUP BY c.id
+                               HAVING c.saldo_zerado_manual=0
+                                  AND c.valor_moeda-COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0)>?
+                               ORDER BY c.numero_contrato""", (float(SALDO_TOLERANCE),)).fetchall()]
     utilizado=due_effect(conn, due_id)
     conn.close()
     due = decorate_due({**dict(due_row), "utilizado": utilizado})
@@ -891,7 +1729,11 @@ def vincular(due_id):
             raise ValueError("DU-E não encontrada.")
         contrato_id=int(f["contrato_id"])
         contrato=contract_summary(conn, contrato_id)
-        if not contrato or contrato["status"] != STATUS_PENDENTE:
+        if not contrato:
+            raise ValueError("Contrato não encontrado.")
+        if contrato["saldo_zerado_manual"]:
+            raise ValueError("O contrato foi zerado manualmente e não pode receber vínculos.")
+        if contrato["status"] != STATUS_PENDENTE:
             raise ValueError("O contrato selecionado não possui saldo disponível.")
         valor=Decimal(str(parse_number(f.get("valor_vinculado"))))
         if valor<=0:

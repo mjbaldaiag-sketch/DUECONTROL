@@ -1,0 +1,29 @@
+{% extends "base.html" %}{% block content %}
+<div class="page-heading"><div><h1>Cadastrar clientes</h1><p class="muted">Cadastre clientes para reutilizar nos NDFs.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
+<form method="post" class="form">
+  <label>Nome*<input name="nome" value="{{ nome|default('') }}" required></label>
+  <label>Buscar país<input type="search" id="filtro-pais" placeholder="Digite para filtrar" autocomplete="off" aria-controls="pais-select"></label>
+  <label>País*<select name="pais" id="pais-select" required><option value="">Selecione um país</option>{% for codigo, nome_pais in paises %}<option value="{{ codigo }}" {{ 'selected' if pais_selecionado == codigo else '' }}>{{ nome_pais }}</option>{% endfor %}</select></label>
+  <div class="form-actions"><button>Cadastrar cliente</button><a class="btn secondary" href="{{ url_for('configuracoes') }}">Cancelar</a></div>
+</form>
+<h2>Clientes cadastrados</h2>
+<div class="table-wrap"><table><thead><tr><th>Nome</th><th>País</th></tr></thead><tbody>
+{% for cliente in clientes %}<tr><td>{{ cliente.nome }}</td><td>{{ cliente.pais|pais_nome }}</td></tr>{% else %}<tr><td colspan="2" class="empty">Nenhum cliente cadastrado.</td></tr>{% endfor %}
+</tbody></table></div>
+<script>
+(() => {
+  const filtro = document.getElementById('filtro-pais');
+  const select = document.getElementById('pais-select');
+  if (!filtro || !select) return;
+  const opcoes = Array.from(select.options).filter(opcao => opcao.value);
+  const normalizar = texto => (texto || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase('pt-BR');
+  filtro.addEventListener('input', () => {
+    const termo = normalizar(filtro.value.trim());
+    opcoes.forEach(opcao => {
+      const conteudo = normalizar(`${opcao.textContent} ${opcao.value}`);
+      opcao.hidden = Boolean(termo) && !conteudo.includes(termo);
+    });
+  });
+})();
+</script>
+{% endblock %}

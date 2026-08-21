@@ -1,0 +1,25 @@
+{% extends "base.html" %}{% block content %}
+<div class="page-heading"><div><h1>PTAX</h1><p class="muted">Consulte e mantenha o histórico de PTAX do Banco Central.</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('dashboard_derivativos') }}">Derivativos</a><a class="btn secondary" href="{{ url_for('lista_ndfs') }}">NDFs</a></div></div>
+
+<form method="post" action="{{ url_for('consultar_ptax') }}" class="filters">
+  <label>Moeda<select name="moeda" required>{% for moeda in moedas %}<option value="{{ moeda }}" {{ 'selected' if consulta.moeda == moeda else '' }}>{{ moeda }}</option>{% endfor %}</select></label>
+  <label>Data inicial<input name="data_inicial" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ consulta.data_inicial }}" required></label>
+  <label>Data final<input name="data_final" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ consulta.data_final }}" required></label>
+  <div class="filter-actions"><button type="submit">Consultar PTAX</button></div>
+</form>
+
+{% if previsao is not none %}<h2>Resultado da consulta</h2>
+<div class="table-wrap"><table class="compact-table" data-sortable><thead><tr><th data-sort-type="date">Data</th><th data-sort-type="text">Moeda</th><th data-sort-type="number">PTAX Compra</th><th data-sort-type="number">PTAX Venda</th></tr></thead><tbody>
+{% for cotacao in previsao %}<tr><td>{{ cotacao.data_cotacao|date_br }}</td><td>{{ cotacao.moeda }}</td><td>{{ cotacao.ptax_compra|rate }}</td><td>{{ cotacao.ptax_venda|rate }}</td></tr>{% else %}<tr><td colspan="4" class="empty">Nenhum boletim de fechamento encontrado no período informado.</td></tr>{% endfor %}
+</tbody></table></div>
+{% if previsao %}<form method="post" action="{{ url_for('importar_ptax') }}" class="actions">
+  <input type="hidden" name="consulta_moeda" value="{{ consulta.moeda }}"><input type="hidden" name="data_inicial" value="{{ consulta.data_inicial }}"><input type="hidden" name="data_final" value="{{ consulta.data_final }}">
+  {% for cotacao in previsao %}<input type="hidden" name="cotacao_data" value="{{ cotacao.data_cotacao }}"><input type="hidden" name="cotacao_moeda" value="{{ cotacao.moeda }}"><input type="hidden" name="cotacao_compra" value="{{ cotacao.ptax_compra }}"><input type="hidden" name="cotacao_venda" value="{{ cotacao.ptax_venda }}">{% endfor %}
+  <button type="submit">Importar/Atualizar dados</button>
+</form>{% endif %}{% endif %}
+
+<h2>Histórico armazenado</h2>
+<div class="table-wrap"><table class="compact-table" data-sortable><thead><tr><th data-sort-type="date">Data</th><th data-sort-type="text">Moeda</th><th data-sort-type="number">PTAX Compra</th><th data-sort-type="number">PTAX Venda</th></tr></thead><tbody>
+{% for cotacao in historico %}<tr><td>{{ cotacao.data_cotacao|date_br }}</td><td>{{ cotacao.moeda }}</td><td>{{ cotacao.ptax_compra|rate }}</td><td>{{ cotacao.ptax_venda|rate }}</td></tr>{% else %}<tr><td colspan="4" class="empty">Nenhuma cotação PTAX armazenada.</td></tr>{% endfor %}
+</tbody></table></div>
+{% endblock %}

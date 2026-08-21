@@ -2,10 +2,10 @@
 <h1>{{ 'Editar' if contrato else 'Novo' }} contrato de câmbio</h1>
 <form method="post" class="form">
   <label>Número do contrato*<input name="numero_contrato" value="{{ contrato.numero_contrato if contrato else '' }}" required></label>
-  <label>Banco<input name="banco" value="{{ contrato.banco if contrato else '' }}"></label>
+  {% if contrapartes %}<label>Banco<select name="banco_id"><option value="">{{ 'Manter Banco atual: ' ~ contrato.banco if contrato and contrato.banco else 'Nenhum Banco selecionado' }}</option>{% for contraparte in contrapartes %}<option value="{{ contraparte.id }}" {{ 'selected' if banco_id == contraparte.id else '' }}>{{ contraparte.nome }}</option>{% endfor %}</select></label>{% else %}<div class="flash danger company-help">Nenhum Banco / Contraparte cadastrado. Cadastre um registro em Configurações para vincular o Banco.</div><a class="btn secondary" href="{{ url_for('cadastro_contrapartes') }}">Cadastrar Banco / Contrapartes</a>{% if contrato and contrato.banco %}<label>Banco atual<input value="{{ contrato.banco }}" readonly></label>{% endif %}{% endif %}
   <label>Data<input name="data_contrato" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ contrato.data_contrato|date_br if contrato else '' }}"></label>
   {% if empresas %}<label>Empresa{{ '*' if not contrato else '' }}<select name="empresa_id" data-company-select data-company-cnpj-target="contrato-cnpj" {{ 'required' if not contrato else '' }}><option value="" data-cnpj="{{ contrato.cnpj if contrato else '' }}">{{ 'Selecione uma empresa' if not contrato else 'Manter CNPJ atual' }}</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" data-cnpj="{{ empresa.cnpj }}" {{ 'selected' if empresa_id == empresa.id else '' }}>{{ empresa.apelido or empresa.razao_social }} — {{ empresa.cnpj|cnpj }}</option>{% endfor %}</select></label><label>CNPJ<input id="contrato-cnpj" data-company-cnpj value="{{ contrato.cnpj|cnpj if contrato else '' }}" readonly></label>{% else %}<div class="flash danger company-help">Nenhuma empresa cadastrada. Cadastre uma empresa em Configurações &gt; Cadastrar minhas empresas para informar o CNPJ.</div><a class="btn secondary" href="{{ url_for('cadastro_empresas') }}">Cadastrar minhas empresas</a>{% if contrato %}<label>CNPJ<input data-company-cnpj value="{{ contrato.cnpj|cnpj }}" readonly></label>{% endif %}{% endif %}
-  <label>Cliente<input name="cliente" value="{{ contrato.cliente if contrato else '' }}"></label>
+  {% if clientes %}<label>Cliente<select name="cliente_id"><option value="">{{ 'Manter cliente atual: ' ~ contrato.cliente if contrato and contrato.cliente else 'Nenhum cliente selecionado' }}</option>{% for cliente in clientes %}<option value="{{ cliente.id }}" {{ 'selected' if cliente_id == cliente.id else '' }}>{{ cliente.nome }} — {{ cliente.pais|pais_nome }}</option>{% endfor %}</select><small class="muted">País exibido para diferenciar clientes com o mesmo nome.</small></label>{% else %}<label>Cliente<input name="cliente" value="{{ contrato.cliente if contrato else '' }}"></label>{% endif %}
   <label>Moeda<input name="moeda" maxlength="3" value="{{ contrato.moeda if contrato else 'USD' }}"></label>
   <label>Valor na moeda<input name="valor_moeda" data-money inputmode="decimal" value="{{ contrato.valor_moeda|money if contrato else '' }}" required></label>
   <label>Taxa de câmbio<input name="taxa_cambio" data-rate inputmode="decimal" value="{{ contrato.taxa_cambio|rate if contrato and contrato.taxa_cambio is not none else '' }}"></label>
@@ -13,4 +13,11 @@
   <label>Observação<textarea name="observacao">{{ contrato.observacao if contrato else '' }}</textarea></label>
   <div class="form-actions"><button>{{ 'Salvar alterações' if contrato else 'Cadastrar contrato' }}</button><a class="btn secondary" href="{{ url_for('detalhe_contrato', contrato_id=contrato.id) if contrato else url_for('lista_contratos') }}">Cancelar</a></div>
 </form>
+{% if contrato and resumo %}
+  {% if resumo.saldo_zerado_manual %}
+  <div class="form-actions"><form method="post" action="{{ url_for('reverter_saldo', contrato_id=contrato.id) }}" onsubmit="return confirm('Reverter zeramento manual?');"><button class="secondary" type="submit">Reverter zeramento manual</button></form></div>
+  {% elif resumo.saldo > 0 %}
+  <div class="form-actions"><form method="post" action="{{ url_for('zerar_saldo', contrato_id=contrato.id) }}" onsubmit="return confirm('Zerar saldo e marcar como concluído?');"><button type="submit">Zerar saldo e marcar como concluído</button></form></div>
+  {% endif %}
+{% endif %}
 {% endblock %}

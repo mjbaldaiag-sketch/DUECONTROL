@@ -1,5 +1,5 @@
 {% extends "base.html" %}{% block content %}
-<h1>Dashboard</h1><p class="muted">Controle de DU-E e Contratos de Câmbio</p>
+<h1>Dashboard</h1><p class="muted">Controle de DU-Es, Contratos de Câmbio e Derivativos</p>
 <div class="cards"><div>DU-Es<strong>{{ resumo.dues }}</strong></div><div>Gestão de contratos<strong>{{ resumo.contratos }}</strong></div>
 <div>DU-Es sem vínculo<strong>{{ resumo.dues_sem_vinculo }}</strong></div><div>Contratos sem vínculo<strong>{{ resumo.contratos_sem_vinculo }}</strong></div></div>
 <div class="actions"><a class="btn" href="{{url_for('nova_due')}}">+ Nova DU-E</a><a class="btn secondary" href="{{url_for('consulta_dues')}}">Gestão de DU-Es</a><a class="btn secondary" href="{{url_for('novo_contrato')}}">+ Novo contrato</a><a class="btn secondary" href="{{url_for('lista_contratos')}}">Gestão de contratos</a><a class="btn secondary" href="{{url_for('configuracoes')}}">Configurações</a><a class="btn secondary" href="{{url_for('modelo_contratos')}}">Baixar modelo Excel</a>

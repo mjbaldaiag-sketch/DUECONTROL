@@ -1,0 +1,13 @@
+{% extends "base.html" %}{% block content %}
+<div class="page-heading"><div><h1>Gestão de Derivativos</h1><p class="muted">Acompanhe suas operações NDF e os próximos vencimentos.</p></div><a class="btn" href="{{ url_for('novo_ndf') }}">+ Nova NDF</a></div>
+
+<div class="cards"><div>NDFs ativas<strong>{{ resumo.ativas }}</strong></div><div>USD contratado<strong>US$ {{ resumo.usd_contratado|money }}</strong></div><div>USD a vencer<strong>US$ {{ resumo.usd_a_vencer|money }}</strong></div><div>Resultado estimado<strong>—</strong><span class="muted">Não calculado</span></div></div>
+
+<div class="actions"><a class="btn secondary" href="{{ url_for('lista_ndfs') }}">Listar NDFs</a><a class="btn secondary" href="{{ url_for('novo_ndf') }}">Cadastrar NDF</a><a class="btn secondary" href="{{ url_for('ptax') }}">PTAX</a></div>
+
+<h2>Próximos vencimentos</h2>
+<div class="table-wrap"><table class="compact-table" data-sortable><thead><tr><th data-sort-type="text">ID</th><th data-sort-type="text">Contraparte</th><th data-sort-type="text">Posição</th><th data-sort-type="date">Vencimento</th><th data-sort-type="text">Moeda</th><th data-sort-type="number">Valor</th><th data-sort-type="text">Status</th><th data-sortable="false">Ações</th></tr></thead><tbody>
+{% for ndf in proximos %}<tr><td data-sort-value="{{ ndf.numero_operacao }}"><a href="{{ url_for('detalhe_ndf', ndf_id=ndf.id) }}">{{ ndf.numero_operacao }}</a></td><td>{{ ndf.contraparte }}</td><td>{{ 'Compra' if ndf.posicao == 'COMPRA' else 'Venda' }}</td><td>{{ ndf.data_vencimento|date_br }}</td><td>{{ ndf.moeda }}</td><td>{{ ndf.valor_contratado|money }}</td><td><span class="status {{ ndf.status_exibicao|ndf_status_class }}">{{ ndf.status_exibicao }}</span></td><td><a href="{{ url_for('detalhe_ndf', ndf_id=ndf.id) }}">Ver</a></td></tr>
+{% else %}<tr><td colspan="8" class="empty">Nenhum vencimento em aberto.</td></tr>{% endfor %}
+</tbody></table></div>
+{% endblock %}

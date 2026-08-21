@@ -1,0 +1,11 @@
+{% extends "base.html" %}{% block content %}
+<div class="page-heading"><div><h1>Cadastrar Banco / Contrapartes</h1><p class="muted">Cadastre os bancos e tradings para reutilizar nos NDFs.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
+<form method="post" class="form">
+  <label>Nome*<input name="nome" value="{{ nome|default('') }}" required></label>
+  <div class="form-actions"><button>Cadastrar Banco / Contraparte</button><a class="btn secondary" href="{{ url_for('configuracoes') }}">Cancelar</a></div>
+</form>
+<h2>Banco / Contrapartes cadastrados</h2>
+<div class="table-wrap"><table><thead><tr><th>Nome</th></tr></thead><tbody>
+{% for contraparte in contrapartes %}<tr><td>{{ contraparte.nome }}</td></tr>{% else %}<tr><td class="empty">Nenhum Banco / Contraparte cadastrado.</td></tr>{% endfor %}
+</tbody></table></div>
+{% endblock %}
