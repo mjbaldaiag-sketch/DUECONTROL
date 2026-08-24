@@ -53,6 +53,7 @@ def normalize_invoice_status(value, default=None):
         "AGUARDANDO_RECEBIMENTO": INVOICE_STATUS_AGUARDANDO_RECEBIMENTO,
         "AGUARDANDO_RECEBIMENTO_INVOICE": INVOICE_STATUS_AGUARDANDO_RECEBIMENTO,
         "PARCIAL": INVOICE_STATUS_AGUARDANDO_RECEBIMENTO,
+        "RECEBIDO": INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
         "RECEBIDO_AGUARDANDO_CAMBIO": INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
         "RECEBIDA_AGUARDANDO_CAMBIO": INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
         "LIQUIDADA": INVOICE_STATUS_LIQUIDADA,
@@ -352,6 +353,7 @@ def init_db():
                 competencia_id INTEGER,
                 cliente_id INTEGER,
                 data_emissao TEXT,
+                data_credito TEXT,
                 moeda TEXT NOT NULL DEFAULT 'USD',
                 valor_moeda REAL NOT NULL DEFAULT 0 CHECK(valor_moeda >= 0),
                 status TEXT NOT NULL DEFAULT 'AGUARDANDO_RECEBIMENTO' CHECK(status IN
@@ -428,6 +430,8 @@ def init_db():
             conn.execute("ALTER TABLE invoices ADD COLUMN competencia_id INTEGER")
         if "status_manual" not in invoice_columns:
             conn.execute("ALTER TABLE invoices ADD COLUMN status_manual INTEGER NOT NULL DEFAULT 0")
+        if "data_credito" not in invoice_columns:
+            conn.execute("ALTER TABLE invoices ADD COLUMN data_credito TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_contrato_comercial ON invoices(contrato_comercial)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_competencia ON invoices(competencia_id)")
         for invoice in conn.execute("SELECT id, status FROM invoices").fetchall():
@@ -439,6 +443,12 @@ def init_db():
                 normalized_status = INVOICE_STATUS_AGUARDANDO_RECEBIMENTO
             if normalized_status != invoice["status"]:
                 conn.execute("UPDATE invoices SET status=? WHERE id=?", (normalized_status, invoice["id"]))
+        conn.execute("""
+            UPDATE invoices
+            SET data_credito=(SELECT MIN(r.data_credito)
+                              FROM recebimentos_invoice r WHERE r.invoice_id=invoices.id)
+            WHERE data_credito IS NULL AND status IN (?, ?)
+        """, (INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, INVOICE_STATUS_LIQUIDADA))
         conn.execute(f"PRAGMA user_version = {INVOICE_SCHEMA_VERSION}")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(dues)")}
         if "chave_acesso" not in columns:
@@ -4210,6 +4220,9 @@ def invoice_summary(conn, invoice_id):
         status = INVOICE_STATUS_AGUARDANDO_RECEBIMENTO
     if not invoice["status_manual"]:
         status = invoice_status_from_totals(valor_invoice, total_recebido, total_cambio)
+    datas_credito = {row["data_credito"] for row in recebimentos if row["data_credito"]}
+    if invoice["data_credito"]:
+        datas_credito.add(invoice["data_credito"])
     data = dict(invoice)
     data.update({
         "valor_moeda": valor_invoice,
@@ -4226,7 +4239,7 @@ def invoice_summary(conn, invoice_id):
         "bancos_credito": sorted({row["banco_credito_nome"] for row in recebimentos if row["banco_credito_nome"]}),
         "bancos_liquidacao": sorted({row["banco_liquidacao"] for row in cambios if row["banco_liquidacao"]}),
         "contratos_numeros": sorted({row["numero_contrato"] for row in cambios}),
-        "datas_credito": sorted({row["data_credito"] for row in recebimentos if row["data_credito"]}),
+        "datas_credito": sorted(datas_credito),
         "datas_fechamento": sorted({row["data_fechamento"] for row in cambios if row["data_fechamento"]}),
         "datas_liquidacao": sorted({row["data_liquidacao"] for row in cambios if row["data_liquidacao"]}),
     })
@@ -4236,9 +4249,16 @@ def refresh_invoice_status(conn, invoice_id):
     summary = invoice_summary(conn, invoice_id)
     if not summary:
         return None
-    current = conn.execute("SELECT status, status_manual FROM invoices WHERE id=?", (invoice_id,)).fetchone()
-    if current and not current["status_manual"] and current["status"] != summary["status"]:
-        conn.execute("UPDATE invoices SET status=? WHERE id=?", (summary["status"], invoice_id))
+    current = conn.execute("SELECT status, status_manual, data_credito FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+    if current and not current["status_manual"]:
+        data_credito = None
+        if summary["status"] in {INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, INVOICE_STATUS_LIQUIDADA}:
+            data_credito = conn.execute(
+                "SELECT MIN(data_credito) FROM recebimentos_invoice WHERE invoice_id=?", (invoice_id,)
+            ).fetchone()[0]
+        if current["status"] != summary["status"] or current["data_credito"] != data_credito:
+            conn.execute("UPDATE invoices SET status=?, data_credito=? WHERE id=?",
+                         (summary["status"], data_credito, invoice_id))
     return summary["status"]
 
 def validate_invoice_balances(summary, extra_recebido=0, extra_cambio=0,
@@ -4303,11 +4323,21 @@ def invoice_form_data(form, conn, current=None):
     else:
         status = INVOICE_STATUS_AGUARDANDO_RECEBIMENTO
         status_manual = 0
+    if "data_credito" in form:
+        data_credito = parse_date(form.get("data_credito"))
+    elif current:
+        data_credito = current["data_credito"] if "data_credito" in current.keys() else None
+    else:
+        data_credito = None
+    if status == INVOICE_STATUS_AGUARDANDO_RECEBIMENTO:
+        data_credito = None
+    elif status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO and not data_credito:
+        raise ValueError("Informe a data do crédito para alterar o status para recebido.")
     return {
         "empresa_id": empresa_id, "numero_invoice": numero, "tipo_documento": tipo,
         "competencia_id": competencia_id, "cliente_id": cliente_id, "data_emissao": data_emissao, "moeda": moeda,
         "valor_moeda": valor, "contrato_comercial": contrato_comercial,
-        "status": status, "status_manual": status_manual,
+        "status": status, "status_manual": status_manual, "data_credito": data_credito,
         "observacao": (form.get("observacao") or "").strip() or None,
     }
 
@@ -4517,6 +4547,7 @@ def normalize_invoice_import_columns(columns):
         "invoice": "numero_invoice", "numero_da_invoice": "numero_invoice",
         "tipo_documento": "tipo_documento", "tipo": "tipo_documento",
         "status": "status", "status_invoice": "status", "situacao": "status",
+        "data_credito": "data_credito", "data_de_credito": "data_credito", "credito": "data_credito",
         "cliente": "cliente", "nome_cliente": "cliente", "data_emissao": "data_emissao", "emissao": "data_emissao",
         "competencia": "competencia", "safra": "competencia", "periodo": "competencia",
         "descricao_competencia": "competencia", "competencia_descricao": "competencia",
@@ -4582,6 +4613,11 @@ def prepare_invoice_import_rows(df, pandas):
         raw_status = raw_values.get("status")
         status_provided = raw_status is not None and str(raw_status).strip() != ""
         status = normalize_invoice_status(raw_status) if status_provided else None
+        raw_data_credito = raw_values.get("data_credito")
+        data_credito_provided = raw_data_credito is not None and str(raw_data_credito).strip() != ""
+        data_credito = parse_date(raw_data_credito)
+        if status == INVOICE_STATUS_AGUARDANDO_RECEBIMENTO:
+            data_credito = None
         competencia = normalize_competencia_import(raw_values.get("competencia"))
         if not competencia:
             raise ValueError(f"Linha {line_number}: competencia e obrigatoria.")
@@ -4602,6 +4638,7 @@ def prepare_invoice_import_rows(df, pandas):
             "data_emissao": data_emissao, "moeda": moeda, "valor_invoice": float(valor_invoice),
             "contrato_comercial": contrato_comercial,
             "status": status, "status_provided": status_provided,
+            "data_credito": data_credito, "data_credito_provided": data_credito_provided,
             "numero_contrato_cambio": contrato,
             "legacy_valor_alocado": float(valor_alocado) if valor_alocado is not None else None,
             "importa_cambio": importa_cambio,
@@ -4632,6 +4669,19 @@ def prepare_invoice_import_rows(df, pandas):
             for row in group:
                 row["status"] = imported_status
                 row["status_provided"] = True
+        credit_dates = {row["data_credito"] for row in group if row.get("data_credito_provided")}
+        if len(credit_dates) > 1:
+            raise ValueError(f"Invoice {key[1]} possui datas de crédito divergentes entre as linhas.")
+        group_data_credito = credit_dates.pop() if credit_dates else None
+        if group_data_credito:
+            for row in group:
+                row["data_credito"] = group_data_credito
+                row["data_credito_provided"] = True
+        group_status = next((row["status"] for row in group if row.get("status_provided")), None)
+        if group_status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO and not group_data_credito:
+            raise ValueError(
+                f"Invoice {key[1]}: data_credito é obrigatória quando o status é RECEBIDO AGUARDANDO CAMBIO."
+            )
     contract_groups = {}
     for row in rows:
         if row["numero_contrato_cambio"]:
@@ -4665,7 +4715,8 @@ def invoice_import_snapshot(row):
     data = dict(row)
     return {key: data.get(key) for key in (
         "id", "empresa_id", "numero_invoice", "tipo_documento", "competencia_id", "cliente_id", "data_emissao",
-        "moeda", "valor_moeda", "contrato_comercial", "status", "status_manual", "total_recebido", "total_cambio"
+        "data_credito", "moeda", "valor_moeda", "contrato_comercial", "status", "status_manual",
+        "total_recebido", "total_cambio"
     )}
 
 def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrides=None,
@@ -4684,6 +4735,16 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
         first = group[0]
         status_provided = first.get("status_provided", first.get("status") is not None)
         imported_status = first.get("status") if status_provided else None
+        data_credito_provided = first.get(
+            "data_credito_provided", first.get("data_credito") is not None
+        )
+        imported_data_credito = first.get("data_credito")
+        if imported_status == INVOICE_STATUS_AGUARDANDO_RECEBIMENTO:
+            imported_data_credito = None
+        elif imported_status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO and not imported_data_credito:
+            raise ValueError(
+                f"Invoice {first['numero_invoice']}: data_credito é obrigatória quando o status é RECEBIDO AGUARDANDO CAMBIO."
+            )
         cliente_id = first.get("cliente_id")
         current = conn.execute("""
             SELECT * FROM invoices WHERE empresa_id=? AND numero_invoice=? AND tipo_documento=?
@@ -4699,18 +4760,20 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
                 raise ValueError(f"Invoice {first['numero_invoice']} não pode mudar de moeda com recebimento ou câmbio vinculado.")
             updated += 1
             invoice_id = current["id"]
+            if not data_credito_provided and current and imported_status != INVOICE_STATUS_AGUARDANDO_RECEBIMENTO:
+                imported_data_credito = current["data_credito"]
             if status_provided:
                 conn.execute("""
                     UPDATE invoices SET cliente_id=?, competencia_id=?, data_emissao=?, moeda=?, valor_moeda=?,
-                        contrato_comercial=?, status=?, status_manual=1, observacao=? WHERE id=?
+                        contrato_comercial=?, status=?, status_manual=1, data_credito=?, observacao=? WHERE id=?
                 """, (cliente_id, first["competencia_id"], first["data_emissao"], first["moeda"], first["valor_invoice"],
-                      first["contrato_comercial"], imported_status, first["observacao"], invoice_id))
+                      first["contrato_comercial"], imported_status, imported_data_credito, first["observacao"], invoice_id))
             else:
                 conn.execute("""
                     UPDATE invoices SET cliente_id=?, competencia_id=?, data_emissao=?, moeda=?, valor_moeda=?,
-                        contrato_comercial=?, observacao=? WHERE id=?
+                        contrato_comercial=?, data_credito=?, observacao=? WHERE id=?
                 """, (cliente_id, first["competencia_id"], first["data_emissao"], first["moeda"], first["valor_invoice"],
-                      first["contrato_comercial"], first["observacao"], invoice_id))
+                      first["contrato_comercial"], imported_data_credito, first["observacao"], invoice_id))
             old_contracts = [row[0] for row in conn.execute(
                 "SELECT contrato_id FROM invoice_contrato_cambio WHERE invoice_id=?", (invoice_id,)
             ).fetchall()]
@@ -4722,12 +4785,12 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
             cursor = conn.execute("""
                 INSERT INTO invoices
                     (empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,data_emissao,moeda,valor_moeda,
-                     contrato_comercial,status,status_manual,observacao)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                     contrato_comercial,status,status_manual,data_credito,observacao)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (company["id"], first["numero_invoice"], first["tipo_documento"], first["competencia_id"], cliente_id,
                   first["data_emissao"], first["moeda"], first["valor_invoice"],
                   first["contrato_comercial"], imported_status or INVOICE_STATUS_AGUARDANDO_RECEBIMENTO,
-                  1 if status_provided else 0, first["observacao"]))
+                  1 if status_provided else 0, imported_data_credito, first["observacao"]))
             invoice_id = cursor.lastrowid
         allocation_total = sum((decimal_value(row.get("legacy_valor_alocado")) for row in group), Decimal("0"))
         summary_after_header = invoice_summary(conn, invoice_id)
@@ -4853,11 +4916,11 @@ def nova_invoice():
             conn.execute("""
                 INSERT INTO invoices
                     (empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,data_emissao,moeda,valor_moeda,
-                     contrato_comercial,status,status_manual,observacao)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                     contrato_comercial,status,status_manual,data_credito,observacao)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (data["empresa_id"], data["numero_invoice"], data["tipo_documento"], data["competencia_id"], data["cliente_id"],
                   data["data_emissao"], data["moeda"], data["valor_moeda"],
-                  data["contrato_comercial"], data["status"], data["status_manual"], data["observacao"]))
+                  data["contrato_comercial"], data["status"], data["status_manual"], data["data_credito"], data["observacao"]))
             invoice_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.commit(); conn.close()
             flash("Invoice cadastrada com sucesso.", "success")
@@ -4905,10 +4968,10 @@ def editar_invoice(invoice_id):
                 raise ValueError("Não é possível alterar a moeda de uma Invoice com recebimento ou câmbio vinculado.")
             conn.execute("""
                 UPDATE invoices SET empresa_id=?,numero_invoice=?,tipo_documento=?,competencia_id=?,cliente_id=?,data_emissao=?,
-                    moeda=?,valor_moeda=?,contrato_comercial=?,status=?,status_manual=?,observacao=? WHERE id=?
+                    moeda=?,valor_moeda=?,contrato_comercial=?,status=?,status_manual=?,data_credito=?,observacao=? WHERE id=?
             """, (data["empresa_id"], data["numero_invoice"], data["tipo_documento"], data["competencia_id"], data["cliente_id"],
                   data["data_emissao"], data["moeda"], data["valor_moeda"], data["contrato_comercial"],
-                  data["status"], data["status_manual"], data["observacao"], invoice_id))
+                  data["status"], data["status_manual"], data["data_credito"], data["observacao"], invoice_id))
             sync_contracts_for_invoice(conn, invoice_id)
             refresh_invoice_status(conn, invoice_id)
             conn.commit(); conn.close()
@@ -5291,7 +5354,7 @@ def cancelar_importacao_invoices():
 def modelo_invoices():
     import pandas as pd
     columns = ["cnpj", "numero_invoice", "tipo_documento", "cliente", "contrato_comercial", "competencia",
-               "data_emissao", "moeda", "valor_invoice", "status", "observacao"]
+               "data_emissao", "moeda", "valor_invoice", "status", "data_credito", "observacao"]
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame(columns=columns).to_excel(writer, index=False, sheet_name="Invoices")

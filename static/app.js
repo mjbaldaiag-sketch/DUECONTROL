@@ -243,6 +243,65 @@
     empresa.addEventListener('change', updateCompetencias);
     updateCompetencias();
   });
+  document.querySelectorAll('[data-invoice-status-select]').forEach((select) => {
+    const form = select.closest('form');
+    const creditDate = form ? form.querySelector('[data-invoice-credit-date]') : null;
+    const dialog = document.querySelector('[data-invoice-status-dialog]');
+    const dialogForm = dialog ? dialog.querySelector('[data-invoice-status-dialog-form]') : null;
+    const dialogDate = dialog ? dialog.querySelector('[data-invoice-status-dialog-date]') : null;
+    const cancel = dialog ? dialog.querySelector('[data-invoice-status-cancel]') : null;
+    if (!form || !creditDate || !dialog || !dialogForm || !dialogDate || !cancel) return;
+
+    const awaiting = 'AGUARDANDO_RECEBIMENTO';
+    const received = 'RECEBIDA_AGUARDANDO_CAMBIO';
+    let acceptedStatus = select.value;
+    const showDialog = () => {
+      dialogDate.value = creditDate.value || '';
+      if (typeof dialog.showModal === 'function') dialog.showModal();
+      else dialog.setAttribute('open', '');
+      dialogDate.focus();
+    };
+    const closeDialog = () => {
+      if (typeof dialog.close === 'function') dialog.close();
+      else dialog.removeAttribute('open');
+    };
+    const restoreStatus = () => {
+      select.value = acceptedStatus;
+      dialogDate.value = creditDate.value || '';
+      closeDialog();
+    };
+
+    select.addEventListener('change', () => {
+      const nextStatus = select.value;
+      if (nextStatus === received && acceptedStatus !== received && !creditDate.value) {
+        showDialog();
+        return;
+      }
+      if (nextStatus === awaiting) {
+        creditDate.value = '';
+        dialogDate.value = '';
+      }
+      acceptedStatus = nextStatus;
+    });
+    dialogForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      if (!dialogDate.reportValidity()) return;
+      creditDate.value = dialogDate.value;
+      acceptedStatus = received;
+      closeDialog();
+    });
+    cancel.addEventListener('click', restoreStatus);
+    dialog.addEventListener('cancel', (event) => {
+      event.preventDefault();
+      restoreStatus();
+    });
+    form.addEventListener('submit', (event) => {
+      if (select.value === received && !creditDate.value) {
+        event.preventDefault();
+        showDialog();
+      }
+    });
+  });
   document.querySelectorAll('[data-money]').forEach((input) => {
     input.addEventListener('blur', () => formatMoney(input));
     input.addEventListener('change', () => formatMoney(input));

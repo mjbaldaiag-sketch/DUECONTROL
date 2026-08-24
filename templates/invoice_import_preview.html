@@ -4,7 +4,7 @@
 {% if error %}<div class="flash danger">{{ error }}</div>{% endif %}
 <form method="post" action="{{ url_for('confirmar_importacao_invoices') }}" class="import-preview-form">
   <input type="hidden" name="stage_token" value="{{ stage_token }}">
-  <section class="import-preview-section"><h2>Status</h2><p class="muted">O status informado no Excel será atribuído à Invoice. Quando a coluna estiver vazia, será usado AGUARDANDO RECEBIMENTO.</p>{% for group in groups %}<p><strong>{{ group.key[1] }}</strong>: {{ group.rows[0].status|invoice_status_label if group.rows[0].status else 'AGUARDANDO RECEBIMENTO' }}</p>{% endfor %}</section>
+  <section class="import-preview-section"><h2>Status</h2><p class="muted">O status informado no Excel será atribuído à Invoice. Quando a coluna estiver vazia, será usado AGUARDANDO RECEBIMENTO. Para RECEBIDO AGUARDANDO CAMBIO, a coluna data_credito é obrigatória.</p>{% for group in groups %}<p><strong>{{ group.key[1] }}</strong>: {{ group.rows[0].status|invoice_status_label if group.rows[0].status else 'AGUARDANDO RECEBIMENTO' }} · Data do crédito: {{ group.rows[0].data_credito|date_br or '-' }}</p>{% endfor %}</section>
 {% if competencia_suggestions %}
 <section class="import-client-suggestions import-competency-suggestions">
   <h2>Competências não cadastradas</h2>

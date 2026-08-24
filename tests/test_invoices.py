@@ -45,6 +45,34 @@ class InvoiceFlowTests(unittest.TestCase):
         conn.close()
         return invoice["id"]
 
+    def test_invoice_competencies_are_scoped_to_company_and_cross_company_selection_is_rejected(self):
+        conn = app.db()
+        conn.execute("INSERT INTO empresas (razao_social, cnpj, apelido) VALUES (?,?,?)",
+                     ("Outra Empresa", "12345678000199", "Outra"))
+        conn.execute("INSERT INTO competencias (empresa_id, descricao, data_inicial, data_final) VALUES (?,?,?,?)",
+                     (2, "Setembro/2026", "2026-09-01", "2026-09-30"))
+        conn.commit()
+        conn.close()
+
+        form = self.client.get("/invoice/nova")
+        self.assertEqual(form.status_code, 200)
+        html = form.get_data(as_text=True)
+        self.assertIn('name="competencia_id" data-competencia-select', html)
+        self.assertIn('data-competencia-empresa="1"', html)
+        self.assertIn('data-competencia-empresa="2"', html)
+
+        response = self.client.post("/invoice/nova", data={
+            "empresa_id": "1", "numero_invoice": "INV-WRONG-COMPETENCIA",
+            "tipo_documento": "COMMERCIAL_INVOICE", "competencia_id": "2",
+            "data_emissao": "01/08/2026", "moeda": "USD", "valor_moeda": "100,00",
+        })
+        self.assertEqual(response.status_code, 200)
+        conn = app.db()
+        self.assertIsNone(conn.execute(
+            "SELECT id FROM invoices WHERE numero_invoice='INV-WRONG-COMPETENCIA'"
+        ).fetchone())
+        conn.close()
+
     def test_statuses_and_separate_balances(self):
         self.assertEqual(app.invoice_status_from_totals(1000, 0, 0), app.INVOICE_STATUS_AGUARDANDO_RECEBIMENTO)
         self.assertEqual(app.invoice_status_from_totals(1000, 800, 0), app.INVOICE_STATUS_PARCIAL)
@@ -56,7 +84,7 @@ class InvoiceFlowTests(unittest.TestCase):
         response = self.client.post(f"/invoice/{invoice_id}/editar", data={
             "empresa_id": "1", "numero_invoice": "INV-001", "tipo_documento": "COMMERCIAL_INVOICE",
             "competencia_id": "1", "cliente_id": "1", "data_emissao": "01/08/2026", "moeda": "USD",
-            "valor_moeda": "1000,00", "status": "RECEBIDO AGUARDANDO CAMBIO",
+            "valor_moeda": "1000,00", "status": "RECEBIDO AGUARDANDO CAMBIO", "data_credito": "10/08/2026",
         })
         self.assertEqual(response.status_code, 302)
         self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
@@ -68,16 +96,58 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(invoice["status_manual"], 1)
         conn.close()
 
+    def test_received_status_requires_credit_date_and_awaiting_clears_it(self):
+        invoice_id = self._create_invoice(number="INV-CREDIT-DATE")
+        base_data = {
+            "empresa_id": "1", "numero_invoice": "INV-CREDIT-DATE", "tipo_documento": "COMMERCIAL_INVOICE",
+            "competencia_id": "1", "cliente_id": "1", "data_emissao": "01/08/2026", "moeda": "USD",
+            "valor_moeda": "1000,00",
+        }
+        response = self.client.post(
+            f"/invoice/{invoice_id}/editar",
+            data={**base_data, "status": "RECEBIDO AGUARDANDO CAMBIO"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("data do crédito", response.get_data(as_text=True).lower())
+        conn = app.db()
+        invoice = conn.execute("SELECT status, data_credito FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+        self.assertEqual(invoice["status"], app.INVOICE_STATUS_AGUARDANDO_RECEBIMENTO)
+        self.assertIsNone(invoice["data_credito"])
+        conn.close()
+
+        response = self.client.post(
+            f"/invoice/{invoice_id}/editar",
+            data={**base_data, "status": "RECEBIDO AGUARDANDO CAMBIO", "data_credito": "15/08/2026"},
+        )
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        invoice = conn.execute("SELECT status, data_credito FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+        self.assertEqual(invoice["status"], app.INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO)
+        self.assertEqual(invoice["data_credito"], "2026-08-15")
+        conn.close()
+
+        response = self.client.post(
+            f"/invoice/{invoice_id}/editar",
+            data={**base_data, "status": "AGUARDANDO RECEBIMENTO", "data_credito": "15/08/2026"},
+        )
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        invoice = conn.execute("SELECT status, data_credito FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+        self.assertEqual(invoice["status"], app.INVOICE_STATUS_AGUARDANDO_RECEBIMENTO)
+        self.assertIsNone(invoice["data_credito"])
+        conn.close()
+
     def test_invoice_status_is_supported_by_excel_model_and_import(self):
         import pandas as pd
 
         model = pd.read_excel(BytesIO(self.client.get("/invoices/modelo").data))
         self.assertIn("status", model.columns)
+        self.assertIn("data_credito", model.columns)
         frame = pd.DataFrame([{
             "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-STATUS-IMPORT",
             "tipo_documento": "COMMERCIAL INVOICE", "competencia": "Agosto/2026",
             "data_emissao": "01/08/2026", "moeda": "USD", "valor_invoice": "100,00",
-            "status": "LIQUIDADA",
+            "status": "RECEBIDO AGUARDANDO CAMBIO", "data_credito": "10/08/2026",
         }])
         output = BytesIO()
         frame.to_excel(output, index=False)
@@ -85,17 +155,29 @@ class InvoiceFlowTests(unittest.TestCase):
         response = self.client.post("/invoices/importar", data={"arquivo": (output, "status.xlsx")},
                                     content_type="multipart/form-data")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("LIQUIDADA", response.get_data(as_text=True))
+        self.assertIn("RECEBIDO AGUARDANDO CAMBIO", response.get_data(as_text=True))
         with self.client.session_transaction() as session:
             token = session["invoice_import_stage"]
         self.assertEqual(self.client.post("/invoices/importar/confirmar", data={"stage_token": token}).status_code, 302)
         conn = app.db()
         invoice = conn.execute(
-            "SELECT status, status_manual FROM invoices WHERE numero_invoice='INV-STATUS-IMPORT'"
+            "SELECT status, status_manual, data_credito FROM invoices WHERE numero_invoice='INV-STATUS-IMPORT'"
         ).fetchone()
-        self.assertEqual(invoice["status"], app.INVOICE_STATUS_LIQUIDADA)
+        self.assertEqual(invoice["status"], app.INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO)
         self.assertEqual(invoice["status_manual"], 1)
+        self.assertEqual(invoice["data_credito"], "2026-08-10")
         conn.close()
+
+    def test_excel_received_status_requires_credit_date(self):
+        import pandas as pd
+
+        frame = pd.DataFrame([{
+            "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-MISSING-CREDIT-DATE",
+            "tipo_documento": "COMMERCIAL INVOICE", "competencia": "Agosto/2026",
+            "valor_invoice": "100,00", "status": "RECEBIDO AGUARDANDO CAMBIO",
+        }])
+        with self.assertRaisesRegex(ValueError, "data_credito"):
+            app.prepare_invoice_import_rows(frame, pd)
 
     def test_schema_bootstrap_is_idempotent_and_preserves_existing_domains(self):
         conn = app.db()
