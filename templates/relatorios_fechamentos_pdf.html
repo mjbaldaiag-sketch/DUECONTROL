@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><title>PAINEL – FECHAMENTOS DE CÂMBIO DE PRONTO</title></head>
+<body>
+  <main class="pdf-dashboard" data-report="fechamentos">
+    <header class="pdf-header">
+      <h1>PAINEL – FECHAMENTOS DE CÂMBIO DE PRONTO</h1>
+      <p>Safra: {{ safra_label }} | Empresa: {{ empresa_label }} | Período de apuração: {{ periodo_label }} | Visualização: {{ agrupamento_label }}</p>
+    </header>
+
+    <section class="pdf-kpis" data-report-section="kpis">
+      <h2>Indicadores do período</h2>
+      <div class="pdf-kpi-grid">
+        <div class="pdf-kpi"><span>Total USD fechado</span><strong>{{ kpis.total_usd|money }}</strong></div>
+        <div class="pdf-kpi"><span>Total BRL</span><strong>{{ kpis.total_brl|money }}</strong></div>
+        <div class="pdf-kpi"><span>Taxa ponderada</span><strong>{% for taxa in kpis.taxas %}{{ taxa.moeda }}: {{ taxa.valor|rate if taxa.valor is not none else '-' }}{% if not loop.last %}<br>{% endif %}{% else %}-{% endfor %}</strong></div>
+        <div class="pdf-kpi"><span>Resultado financeiro vs PTAX</span><strong>{{ kpis.resultado|money if kpis.resultado is not none else '-' }}</strong></div>
+        <div class="pdf-kpi"><span>Resultado acumulado</span><strong>{{ kpis.resultado_acumulado|money if kpis.resultado_acumulado is not none else '-' }}</strong></div>
+        <div class="pdf-kpi"><span>Quantidade de operações</span><strong>{{ kpis.operacoes }}</strong></div>
+        <div class="pdf-kpi"><span>Dias com operação</span><strong>{{ kpis.dias }}</strong></div>
+        <div class="pdf-kpi"><span>Volume médio/operação USD</span><strong>{{ kpis.media_usd_operacao|money }}</strong></div>
+        <div class="pdf-kpi"><span>Volume médio/operação BRL</span><strong>{{ kpis.media_brl_operacao|money }}</strong></div>
+        <div class="pdf-kpi"><span>Volume médio/dia USD</span><strong>{{ kpis.media_usd_dia|money }}</strong></div>
+        <div class="pdf-kpi"><span>Volume médio/dia BRL</span><strong>{{ kpis.media_brl_dia|money }}</strong></div>
+      </div>
+    </section>
+
+    <section data-report-section="empresa" data-title="Fechamentos por Empresa">
+      <h2>Fechamentos por Empresa</h2>
+      <table><thead><tr><th>Empresa</th><th>Total USD</th><th>Total BRL</th><th>Participação %</th></tr></thead><tbody>
+        {% for item in por_empresa %}<tr><td>{{ item.nome }}</td><td>{{ item.total_usd|money }}</td><td>{{ item.total_brl|money }}</td><td>{{ '%.1f'|format(item.participacao|float) }}%</td></tr>{% else %}<tr><td colspan="4">Nenhum registro encontrado.</td></tr>{% endfor %}
+      </tbody></table>
+    </section>
+
+    <section data-report-section="cliente" data-title="Fechamentos por Cliente">
+      <h2>Fechamentos por Cliente</h2>
+      <table><thead><tr><th>Cliente</th><th>Total USD</th><th>Total BRL</th><th>Participação %</th></tr></thead><tbody>
+        {% for item in por_cliente %}<tr><td>{{ item.nome }}</td><td>{{ item.total_usd|money }}</td><td>{{ item.total_brl|money }}</td><td>{{ '%.1f'|format(item.participacao|float) }}%</td></tr>{% else %}<tr><td colspan="4">Nenhum registro encontrado.</td></tr>{% endfor %}
+      </tbody></table>
+    </section>
+
+    <section data-report-section="banco" data-title="Fechamentos por Banco Recebedor">
+      <h2>Fechamentos por Banco Recebedor</h2>
+      <table><thead><tr><th>Banco</th><th>Total BRL</th><th>Participação %</th></tr></thead><tbody>
+        {% for item in por_banco %}<tr><td>{{ item.nome }}</td><td>{{ item.total_brl|money }}</td><td>{{ '%.1f'|format(item.participacao|float) }}%</td></tr>{% else %}<tr><td colspan="3">Nenhum registro encontrado.</td></tr>{% endfor %}
+      </tbody></table>
+    </section>
+
+    <section data-report-section="stats" data-title="Estatísticas">
+      <h2>Estatísticas</h2>
+      <table><thead><tr><th>Indicador</th><th>Valor</th></tr></thead><tbody>
+        <tr><td>Dias acima da PTAX</td><td>{{ stats.dias_acima }}</td></tr>
+        <tr><td>Dias abaixo da PTAX</td><td>{{ stats.dias_abaixo }}</td></tr>
+        <tr><td>Total de dias com operação</td><td>{{ stats.dias_operacao }}</td></tr>
+        <tr><td>Resultado acumulado</td><td>{{ stats.resultado_acumulado|money if stats.resultado_acumulado is not none else '-' }}</td></tr>
+      </tbody></table>
+    </section>
+
+    <section data-report-section="periodos" data-title="Fechamentos por período">
+      <h2>Fechamentos por período — {{ agrupamento_label }}</h2>
+      <table><thead><tr><th>Período</th><th>Moeda</th><th>Operações</th><th>Volume</th><th>Taxa ponderada</th><th>Resultado acumulado</th><th>Resultado (R$)</th></tr></thead><tbody>
+        {% for item in periodos %}<tr><td>{{ item.rotulo }}</td><td>{{ item.moeda }}</td><td>{{ item.resumo.contratos }}</td><td>{{ item.resumo.volume|money }}</td><td>{{ item.resumo.taxa_ponderada|rate if item.resumo.taxa_ponderada is not none else '-' }}</td><td>{{ item.resumo.resultado_acumulado|money if item.resumo.resultado_acumulado is not none else '-' }}</td><td>{{ item.resumo.resultado|money if item.resumo.resultado is not none else '-' }}</td></tr>{% else %}<tr><td colspan="7">Nenhum registro encontrado.</td></tr>{% endfor %}
+      </tbody></table>
+    </section>
+
+    <section data-report-section="graficos" data-title="Evolução por período">
+      <h2>Evolução por período — Taxa ponderada × PTAX BACEN</h2>
+      {% for grafico in graficos %}
+      <div class="pdf-chart" data-moeda="{{ grafico.moeda }}" data-granularidade="{{ grafico.granularidade }}">
+        <h3>{{ grafico.moeda }} — {{ grafico.granularidade_label }}</h3>
+        <table class="pdf-chart-data"><thead><tr><th>Período</th><th>Taxa ponderada</th><th>PTAX BACEN</th></tr></thead><tbody>
+          {% for point in grafico.points %}<tr><td>{{ point.label }}</td><td>{{ point.fechamento_valor|rate if point.fechamento_valor is not none else '-' }}</td><td>{{ point.ptax_valor|rate if point.ptax_valor is not none else '-' }}</td></tr>{% endfor %}
+        </tbody></table>
+      </div>
+      {% else %}<p>Não há taxas suficientes para desenhar o gráfico.</p>{% endfor %}
+    </section>
+  </main>
+</body>
+</html>

@@ -1,26 +1,32 @@
-{% extends "base.html" %}{% block content %}
-<div class="page-heading"><div><h1>Gestão de DU-Es</h1><p class="muted">{{ total }} registro(s) encontrado(s)</p></div><div class="actions"><a class="btn" href="{{ url_for('nova_due') }}">+ Nova DU-E</a><a class="btn secondary" href="{{ url_for('modelo_dues') }}">Baixar modelo Excel</a></div></div>
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading"><div><h1>Gest&atilde;o de DU-Es</h1><p class="muted">{{ total }} registro(s) encontrado(s)</p></div><div class="actions"><a class="btn" href="{{ url_for('nova_due') }}">+ Nova DU-E</a><a class="btn secondary" href="{{ url_for('modelo_dues') }}">Baixar modelo Excel</a></div></div>
 <div class="import-box"><form class="inline" action="{{ url_for('importar_dues') }}" method="post" enctype="multipart/form-data"><input type="file" name="arquivo" accept=".xlsx,.xls" required><button>Importar Excel</button></form><span class="muted">Use as colunas do modelo para validar os registros corretamente.</span></div>
 <form method="get" class="filters">
-  <label>Número da DU-E<input name="numero_due" value="{{ request.args.get('numero_due','') }}" placeholder="Pesquisar número"></label>
+  <label>N&uacute;mero da DU-E<input name="numero_due" value="{{ request.args.get('numero_due','') }}" placeholder="Pesquisar n&uacute;mero"></label>
   <label>Chave de Acesso<input name="chave_acesso" maxlength="14" value="{{ request.args.get('chave_acesso','') }}" placeholder="14 caracteres"></label>
   <label>Cliente<input name="cliente" value="{{ request.args.get('cliente','') }}" placeholder="Nome do cliente"></label>
   <label>CNPJ<input name="cnpj" value="{{ request.args.get('cnpj','') }}"></label>
   <label>Moeda<select name="moeda"><option value="">Todas</option>{% for moeda in moedas %}<option value="{{ moeda }}" {{ 'selected' if request.args.get('moeda') == moeda else '' }}>{{ moeda }}</option>{% endfor %}</select></label>
-  <label>Status<select name="status"><option value="">Todos</option>{% for status in ['PENDENTE','CONCLUÍDO'] %}<option value="{{ status }}" {{ 'selected' if request.args.get('status') == status else '' }}>{{ status }}</option>{% endfor %}</select></label>
-  <label>Data de Lançamento inicial<input name="data_de" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ request.args.get('data_de','') }}"></label>
-  <label>Data de Lançamento final<input name="data_ate" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ request.args.get('data_ate','') }}"></label>
-  <label>Valor mínimo<input name="valor_min" data-money inputmode="decimal" value="{{ request.args.get('valor_min','') }}"></label>
-  <label>Valor máximo<input name="valor_max" data-money inputmode="decimal" value="{{ request.args.get('valor_max','') }}"></label>
+  <label>Status<select name="status"><option value="">Todos</option><option value="PENDENTE" {{ 'selected' if request.args.get('status') == 'PENDENTE' else '' }}>PENDENTE</option><option value="{{ status_concluido }}" {{ 'selected' if request.args.get('status') == status_concluido else '' }}>{{ status_concluido }}</option></select></label>
+  <label>Data de Lan&ccedil;amento inicial<input name="data_de" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ request.args.get('data_de','') }}"></label>
+  <label>Data de Lan&ccedil;amento final<input name="data_ate" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ request.args.get('data_ate','') }}"></label>
+  <label>Valor m&iacute;nimo<input name="valor_min" data-money inputmode="decimal" value="{{ request.args.get('valor_min','') }}"></label>
+  <label>Valor m&aacute;ximo<input name="valor_max" data-money inputmode="decimal" value="{{ request.args.get('valor_max','') }}"></label>
   <div class="filter-actions"><button type="submit">Filtrar</button><a class="btn secondary" href="{{ url_for('consulta_dues') }}">Limpar filtros</a></div>
 </form>
+
+<form method="post" action="{{ url_for('excluir_dues_lote') }}" class="batch-form" data-batch-form data-confirm-message="Excluir os {count} DU-E(s) selecionado(s)? Os vínculos, movimentações e saldos relacionados serão removidos.">
+{% for key, value in request.args.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+<div class="batch-toolbar"><span class="muted"><strong data-batch-count>0</strong> selecionado(s) nesta p&aacute;gina</span><button type="submit" class="btn batch-delete" data-batch-submit disabled>Excluir selecionados</button></div>
 <div class="table-wrap"><table class="compact-table" data-sortable-server><thead><tr>
-  {% for key, label in [('numero_due','DU-E'),('chave_acesso','Chave de Acesso'),('data_due','Data de Lançamento'),('cliente','Cliente'),('moeda','Moeda'),('valor_original','Valor'),('status','Status')] %}
+  <th class="selection-column" data-sortable="false"><input type="checkbox" data-batch-select-all aria-label="Selecionar todos os DU-Es"></th>{% for key, label in [('numero_due','DU-E'),('chave_acesso','Chave de Acesso'),('data_due','Data de Lançamento'),('cliente','Cliente'),('moeda','Moeda'),('valor_original','Valor'),('status','Status')] %}
   <th class="sortable-server-header" aria-sort="{{ 'ascending' if sort == key and direction == 'ASC' else 'descending' if sort == key else 'none' }}" data-sort-direction="{{ 'ascending' if sort == key and direction == 'ASC' else 'descending' if sort == key else 'none' }}"><a href="{{ url_for('consulta_dues', **sort_links[key]) }}">{{ label }}</a></th>
-  {% endfor %}<th>Saldo</th><th>Ações</th>
+  {% endfor %}<th>Saldo</th><th>A&ccedil;&otilde;es</th>
 </tr></thead><tbody>
-{% for d in dues %}<tr><td data-sort-value="{{ d.numero_due }}"><a href="{{ url_for('due_detalhe', due_id=d.id) }}">{{ d.numero_due }}</a> <button type="button" class="copy-data-btn" data-copy-value="{{ d.numero_due }}" aria-label="Copiar DU-E"><span aria-hidden="true">⧉</span></button></td><td data-sort-value="{{ d.chave_acesso or '' }}">{{ d.chave_acesso or 'Sem chave' }}{% if d.chave_acesso %} <button type="button" class="copy-data-btn" data-copy-value="{{ d.chave_acesso }}" aria-label="Copiar Chave de Acesso"><span aria-hidden="true">⧉</span></button>{% endif %}</td><td>{{ d.created_at|date_br }}</td><td>{{ d.cliente or '-' }}</td><td>{{ d.moeda }}</td><td>{{ d.valor_original|money }}</td><td><span class="status {{ d.status|status_class }}">{{ d.status }}</span></td><td>{{ d.saldo|money }}</td><td><a href="{{ url_for('editar_due', due_id=d.id) }}">Editar</a></td></tr>
-{% else %}<tr><td colspan="9" class="empty">Nenhuma DU-E encontrada para os filtros informados.</td></tr>{% endfor %}
+{% for d in dues %}<tr><td class="selection-column"><input type="checkbox" name="selected_ids" value="{{ d.id }}" data-batch-checkbox aria-label="Selecionar DU-E {{ d.numero_due }}"></td><td data-sort-value="{{ d.numero_due }}"><a href="{{ url_for('due_detalhe', due_id=d.id) }}">{{ d.numero_due }}</a> <button type="button" class="copy-data-btn" data-copy-value="{{ d.numero_due }}" aria-label="Copiar DU-E"><span aria-hidden="true">&#x27e7;</span></button></td><td data-sort-value="{{ d.chave_acesso or '' }}">{{ d.chave_acesso or 'Sem chave' }}{% if d.chave_acesso %} <button type="button" class="copy-data-btn" data-copy-value="{{ d.chave_acesso }}" aria-label="Copiar Chave de Acesso"><span aria-hidden="true">&#x27e7;</span></button>{% endif %}</td><td>{{ d.created_at|date_br }}</td><td>{{ d.cliente or '-' }}</td><td>{{ d.moeda }}</td><td>{{ d.valor_original|money }}</td><td><span class="status {{ d.status|status_class }}">{{ d.status }}</span></td><td>{{ d.saldo|money }}</td><td><a href="{{ url_for('editar_due', due_id=d.id) }}">Editar</a></td></tr>
+{% else %}<tr><td colspan="10" class="empty">Nenhuma DU-E encontrada para os filtros informados.</td></tr>{% endfor %}
 </tbody></table></div>
-{% if pages > 1 %}<div class="pagination"><span>Página {{ page }} de {{ pages }}</span><div>{% if page > 1 %}<a class="btn secondary" href="{{ url_for('consulta_dues', **previous_args) }}">Anterior</a>{% endif %}{% if page < pages %}<a class="btn" href="{{ url_for('consulta_dues', **next_args) }}">Próxima</a>{% endif %}</div></div>{% endif %}
+</form>
+{% if pages > 1 %}<div class="pagination"><span>P&aacute;gina {{ page }} de {{ pages }}</span><div>{% if page > 1 %}<a class="btn secondary" href="{{ url_for('consulta_dues', **previous_args) }}">Anterior</a>{% endif %}{% if page < pages %}<a class="btn" href="{{ url_for('consulta_dues', **next_args) }}">Pr&oacute;xima</a>{% endif %}</div></div>{% endif %}
 {% endblock %}

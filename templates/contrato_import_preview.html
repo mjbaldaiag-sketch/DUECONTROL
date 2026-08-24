@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading"><div><h1>Pr&eacute;via da importa&ccedil;&atilde;o de contratos</h1><p class="muted">{{ total_rows }} linha(s) v&aacute;lida(s) analisada(s). Nenhum dado foi gravado ainda.</p></div></div>
+{% if error %}<div class="flash danger">{{ error }}</div>{% endif %}
+
+{% if new_rows %}
+<section class="import-preview-section"><h2>Novos contratos</h2><p class="muted">Estas linhas n&atilde;o possuem duplicidade e ser&atilde;o inseridas ap&oacute;s a confirma&ccedil;&atilde;o.</p><div class="table-wrap"><table class="compact-table"><thead><tr><th>Linha</th><th>N&uacute;mero</th><th>Cliente</th><th>Data</th><th>Moeda</th><th>Valor</th></tr></thead><tbody>
+{% for row in new_rows %}<tr><td>{{ row.source_row }}</td><td>{{ row.numero_contrato }}</td><td>{{ row.cliente or '-' }}</td><td>{{ row.data_contrato|date_br or '-' }}</td><td>{{ row.moeda }}</td><td>{{ row.valor_moeda|money }}</td></tr>{% endfor %}
+</tbody></table></div></section>
+{% endif %}
+
+<form method="post" action="{{ url_for('confirmar_importacao_contratos') }}" class="import-preview-form" data-import-confirm>
+<input type="hidden" name="stage_token" value="{{ stage_token }}">
+{% if conflicts %}<h2>Duplicidades que exigem decis&atilde;o</h2><p class="muted">Cada grupo deve ser mantido/atualizado ou descartado antes do lan&ccedil;amento.</p>{% endif %}
+{% for group in conflicts %}
+<section class="import-conflict" data-import-conflict>
+  <div class="page-heading"><div><h3>Contrato {{ group.numero_contrato }}</h3>{% if group.existing %}<p class="muted">N&uacute;mero j&aacute; cadastrado no sistema.</p>{% else %}<p class="muted">N&uacute;mero repetido na pr&oacute;pria planilha.</p>{% endif %}</div></div>
+  <div class="sr-only" data-import-message>{% for row in group.rows %}N&uacute;mero: {{ row.numero_contrato }}; Cliente: {{ row.cliente or '-' }}; Data: {{ row.data_contrato|date_br or '-' }}; Valor moeda: {{ row.valor_moeda|money }}. {% endfor %}</div>
+  {% if group.existing %}<div class="import-data-grid"><div><span>Cliente atual</span><strong>{{ group.existing.cliente or '-' }}</strong></div><div><span>Data atual</span><strong>{{ group.existing.data_contrato|date_br or '-' }}</strong></div><div><span>Valor atual</span><strong>{{ group.existing.valor_moeda|money }}</strong></div><div><span>Vinculado</span><strong>{{ group.existing.vinculado|money }}</strong></div></div>{% endif %}
+  {% if group.requires_choice %}<fieldset class="import-choice"><legend>Escolha uma linha da planilha para aplicar</legend>{% for row in group.rows %}<label class="import-row-option"><input type="radio" name="chosen_row_{{ group.group_id }}" value="{{ row.row_id }}" required><span><strong>Linha {{ row.source_row }}</strong> &mdash; Cliente: {{ row.cliente or '-' }}; Data: {{ row.data_contrato|date_br or '-' }}; Valor moeda: {{ row.valor_moeda|money }}{% if row.update_error %}<em class="import-warning">{{ row.update_error }}</em>{% endif %}</span></label>{% endfor %}</fieldset>{% else %}<div class="import-row-option"><strong>Linha {{ group.rows[0].source_row }}</strong> &mdash; Cliente: {{ group.rows[0].cliente or '-' }}; Data: {{ group.rows[0].data_contrato|date_br or '-' }}; Valor moeda: {{ group.rows[0].valor_moeda|money }}{% if group.rows[0].update_error %}<em class="import-warning">{{ group.rows[0].update_error }}</em>{% endif %}</div>{% endif %}
+  {% if group.existing %}<fieldset class="import-choice"><legend>A&ccedil;&atilde;o</legend><label><input type="radio" name="duplicate_action_{{ group.group_id }}" value="update" {{ 'checked' if group.can_update else 'disabled' }}> Atualizar contrato existente</label><label><input type="radio" name="duplicate_action_{{ group.group_id }}" value="discard" {{ 'checked' if not group.can_update else '' }}> Excluir linha importada</label></fieldset>{% else %}<fieldset class="import-choice"><legend>A&ccedil;&atilde;o</legend><label><input type="radio" name="file_duplicate_action_{{ group.group_id }}" value="insert" checked> Inserir a linha escolhida</label><label><input type="radio" name="file_duplicate_action_{{ group.group_id }}" value="discard"> Excluir todas as linhas repetidas</label></fieldset>{% endif %}
+</section>
+{% endfor %}
+<div class="form-actions"><button type="submit">Confirmar importa&ccedil;&atilde;o</button></div>
+</form>
+<form method="post" action="{{ url_for('cancelar_importacao_contratos') }}" class="form-actions"><input type="hidden" name="stage_token" value="{{ stage_token }}"><button type="submit" class="secondary">Cancelar importa&ccedil;&atilde;o</button></form>
+{% endblock %}

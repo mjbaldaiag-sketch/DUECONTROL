@@ -25,6 +25,8 @@
       <div><span>Banco de Liquidação</span><strong>{{ contrato.banco_liquidacao or contrato.banco_credito or contrato.banco or '-' }}</strong></div>
       <div><span>Moeda</span><strong>{{ contrato.moeda or '-' }}</strong></div>
       <div><span>Data do contrato</span><strong>{{ contrato.data_contrato|date_br or '-' }}</strong></div>
+      <div><span>Data de recebimento</span><strong>{{ contrato.data_recebimento|date_br or '-' }}</strong></div>
+      <div><span>Data de liquidação</span><strong>{{ contrato.data_liquidacao|date_br or '-' }}</strong></div>
     </div>
   </section>
 

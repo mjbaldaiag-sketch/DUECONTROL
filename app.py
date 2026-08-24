@@ -1,8 +1,10 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, send_file, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file, jsonify, session
 import json
 import sqlite3
 import re
 import unicodedata
+import secrets
+import tempfile
 from pathlib import Path
 from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, timedelta
@@ -16,6 +18,9 @@ BASE = Path(__file__).resolve().parent
 DB = BASE / "due.db"
 app = Flask(__name__)
 app.secret_key = "troque-esta-chave-em-producao"
+
+CONTRACT_IMPORT_STAGE_TTL = 1800
+CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 
 SALDO_TOLERANCE = Decimal("0.005")
 STATUS_PENDENTE = "PENDENTE"
@@ -176,6 +181,8 @@ def init_db():
         banco_credito TEXT,
         banco_liquidacao TEXT,
         data_contrato TEXT,
+        data_recebimento TEXT,
+        data_liquidacao TEXT,
         cnpj TEXT,
         cliente TEXT,
         moeda TEXT NOT NULL DEFAULT 'USD',
@@ -259,6 +266,10 @@ def init_db():
             conn.execute("ALTER TABLE contratos ADD COLUMN banco_credito TEXT")
         if "banco_liquidacao" not in contrato_columns:
             conn.execute("ALTER TABLE contratos ADD COLUMN banco_liquidacao TEXT")
+        if "data_recebimento" not in contrato_columns:
+            conn.execute("ALTER TABLE contratos ADD COLUMN data_recebimento TEXT")
+        if "data_liquidacao" not in contrato_columns:
+            conn.execute("ALTER TABLE contratos ADD COLUMN data_liquidacao TEXT")
         conn.execute("UPDATE contratos SET banco_credito=COALESCE(NULLIF(banco_credito,''),banco), banco_liquidacao=COALESCE(NULLIF(banco_liquidacao,''),banco_credito,banco)")
         if "cliente_id" not in contrato_columns:
             conn.execute("ALTER TABLE contratos ADD COLUMN cliente_id INTEGER")
@@ -266,6 +277,7 @@ def init_db():
             conn.execute("ALTER TABLE contratos ADD COLUMN saldo_zerado_manual INTEGER NOT NULL DEFAULT 0")
         if "competencia_id" not in contrato_columns:
             conn.execute("ALTER TABLE contratos ADD COLUMN competencia_id INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_contratos_data_contrato ON contratos(data_contrato)")
         due_columns = {row[1] for row in conn.execute("PRAGMA table_info(dues)")}
         if "competencia_id" not in due_columns:
             conn.execute("ALTER TABLE dues ADD COLUMN competencia_id INTEGER")
@@ -360,6 +372,44 @@ def parse_date(value):
     except ValueError:
         raise ValueError("Data inválida. Use o formato dd/mm/aaaa.")
 
+def normalize_contract_import_columns(columns):
+    """Normaliza cabeçalhos do Excel para os nomes canônicos dos contratos."""
+    aliases = {
+        "numero_contrato": "numero_contrato",
+        "numero_do_contrato": "numero_contrato",
+        "numero_de_contrato": "numero_contrato",
+        "banco": "banco",
+        "banco_credito": "banco_credito",
+        "banco_de_credito": "banco_credito",
+        "banco_liquidacao": "banco_liquidacao",
+        "banco_de_liquidacao": "banco_liquidacao",
+        "data_contrato": "data_contrato",
+        "data_do_contrato": "data_contrato",
+        "data_de_contrato": "data_contrato",
+        "data_recebimento": "data_recebimento",
+        "data_de_recebimento": "data_recebimento",
+        "data_liquidacao": "data_liquidacao",
+        "data_de_liquidacao": "data_liquidacao",
+        "cnpj": "cnpj",
+        "cliente": "cliente",
+        "moeda": "moeda",
+        "valor_moeda": "valor_moeda",
+        "valor_na_moeda": "valor_moeda",
+        "taxa_cambio": "taxa_cambio",
+        "taxa_de_cambio": "taxa_cambio",
+        "valor_reais": "valor_reais",
+        "valor_em_reais": "valor_reais",
+    }
+    normalized = []
+    for column in columns:
+        text = unicodedata.normalize("NFKD", str(column)).encode("ascii", "ignore").decode("ascii")
+        key = re.sub(r"[^a-zA-Z0-9]+", "_", text.strip().lower()).strip("_")
+        normalized.append(aliases.get(key, key))
+    duplicates = sorted({column for column in normalized if normalized.count(column) > 1})
+    if duplicates:
+        raise ValueError("O Excel contém colunas duplicadas após a normalização: " + ", ".join(duplicates) + ".")
+    return normalized
+
 def launch_timestamp():
     """Gera no backend a data e hora do lançamento de uma nova DU-E."""
     return datetime.now().replace(microsecond=0).isoformat(sep=" ")
@@ -374,6 +424,40 @@ def parse_number(value):
         return float(Decimal(text))
     except (InvalidOperation, ValueError):
         raise ValueError("Valor inválido. Use o formato 1.234,56.")
+
+def selected_record_ids(form):
+    """Validate and deduplicate IDs sent by a batch deletion form."""
+    raw_ids = form.getlist("selected_ids")
+    if not raw_ids:
+        raise ValueError("Selecione pelo menos um registro para excluir.")
+    ids = []
+    for raw_id in raw_ids:
+        value = str(raw_id or "").strip()
+        if not re.fullmatch(r"[1-9]\d*", value):
+            raise ValueError("A seleção contém um identificador inválido.")
+        record_id = int(value)
+        if record_id not in ids:
+            ids.append(record_id)
+    return ids
+
+def ensure_existing_record_ids(conn, table, ids, label):
+    """Prevent partial deletion when one of the selected IDs no longer exists."""
+    placeholders = ",".join("?" for _ in ids)
+    found = {
+        row[0] for row in conn.execute(
+            f"SELECT id FROM {table} WHERE id IN ({placeholders})", ids
+        ).fetchall()
+    }
+    if len(found) != len(ids):
+        raise ValueError(f"Um ou mais {label} selecionados não foram encontrados.")
+
+def redirect_batch_result(endpoint):
+    """Preserve filters, ordering and pagination sent as hidden form fields."""
+    args = {
+        key: value for key, value in request.form.items()
+        if key != "selected_ids" and value not in (None, "")
+    }
+    return redirect(url_for(endpoint, **args))
 
 def parse_chave_acesso(value):
     chave = (value or "").strip().upper()
@@ -1060,6 +1144,50 @@ def lista_contratos():
     return render_template("contratos.html", contratos=contratos, empresas=empresas, competencias=competencias,
                            empresa_id=empresa_id, competencia_id=competencia_id)
 
+@app.route("/contratos/excluir-lote", methods=["POST"])
+def excluir_contratos_lote():
+    conn = db()
+    try:
+        contrato_ids = selected_record_ids(request.form)
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_existing_record_ids(conn, "contratos", contrato_ids, "contratos")
+        placeholders = ",".join("?" for _ in contrato_ids)
+        due_rows = conn.execute(f"""
+            SELECT DISTINCT due_id
+            FROM due_movimentacoes
+            WHERE contrato_id IN ({placeholders})
+            UNION
+            SELECT DISTINCT due_id
+            FROM due_contratos
+            WHERE contrato_id IN ({placeholders})
+        """, contrato_ids + contrato_ids).fetchall()
+        due_ids = [row[0] for row in due_rows]
+
+        conn.execute(f"""
+            DELETE FROM due_movimentacoes
+            WHERE contrato_id IN ({placeholders})
+               OR due_contrato_id IN (
+                   SELECT id FROM due_contratos WHERE contrato_id IN ({placeholders})
+               )
+        """, contrato_ids + contrato_ids)
+        conn.execute(f"DELETE FROM due_contratos WHERE contrato_id IN ({placeholders})", contrato_ids)
+        conn.execute(f"DELETE FROM contratos WHERE id IN ({placeholders})", contrato_ids)
+        recalculate_statuses(conn, due_ids=due_ids, contrato_ids=[])
+        conn.commit()
+        flash(f"{len(contrato_ids)} contrato(s) excluído(s) com sucesso.", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    except (sqlite3.Error, OverflowError):
+        conn.rollback()
+        flash("Não foi possível concluir a exclusão dos contratos.", "danger")
+    except Exception:
+        conn.rollback()
+        flash("Não foi possível concluir a exclusão dos contratos.", "danger")
+    finally:
+        conn.close()
+    return redirect_batch_result("lista_contratos")
+
 @app.route("/contratos/exportar")
 def exportar_contratos():
     import pandas as pd
@@ -1090,7 +1218,7 @@ def exportar_contratos():
     def excel_value(value, field=None):
         if value is None:
             return None
-        if field in {"data_contrato", "created_at", "data_lancamento"}:
+        if field in {"data_contrato", "data_recebimento", "data_liquidacao", "created_at", "data_lancamento"}:
             return date_br(value)
         if isinstance(value, Decimal):
             return float(value)
@@ -1101,7 +1229,8 @@ def exportar_contratos():
     labels = {
         "id": "ID", "numero_contrato": "Número do contrato", "banco": "Banco legado",
         "banco_credito": "Banco de Crédito", "banco_liquidacao": "Banco de Liquidação",
-        "data_contrato": "Data do contrato", "cnpj": "CNPJ", "cliente": "Cliente",
+        "data_contrato": "Data do contrato", "data_recebimento": "Data de recebimento",
+        "data_liquidacao": "Data de liquidação", "cnpj": "CNPJ", "cliente": "Cliente",
         "moeda": "Moeda", "valor_moeda": "Valor na moeda", "taxa_cambio": "Taxa de câmbio",
         "valor_reais": "Valor em reais", "status": "Status", "saldo_zerado_manual": "Saldo zerado manualmente",
         "observacao": "Observação", "created_at": "Criado em", "competencia_id": "Competência ID",
@@ -1148,31 +1277,197 @@ def exportar_contratos():
     return send_file(output, as_attachment=True, download_name="contratos_exportacao.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-def build_contract_report_chart(rows, moeda):
-    """Prepara o gráfico diário com fechamento médio ponderado pelo volume."""
+REPORT_GRANULARITIES = ("diario", "semanal", "mensal")
+REPORT_GRANULARITY_LABELS = {"diario": "diário", "semanal": "semanal", "mensal": "mensal"}
+
+def report_date(value):
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+def report_bucket(value, granularity):
+    current = report_date(value)
+    if not current:
+        return None
+    if granularity == "semanal":
+        current -= timedelta(days=current.weekday())
+    elif granularity == "mensal":
+        current = current.replace(day=1)
+    return current.isoformat()
+
+def report_period_label(value, granularity):
+    current = report_date(value)
+    if not current:
+        return "Data não informada"
+    if granularity == "semanal":
+        return f"Semana de {current.strftime('%d/%m/%Y')}"
+    if granularity == "mensal":
+        return current.strftime("%m/%Y")
+    return current.strftime("%d/%m/%Y")
+
+def report_chart_label(value, granularity):
+    current = report_date(value)
+    if not current:
+        return "-"
+    if granularity == "semanal":
+        return f"Sem. {current.strftime('%d/%m')}"
+    if granularity == "mensal":
+        return current.strftime("%m/%Y")
+    return current.strftime("%d/%m")
+
+def choose_report_granularity(items):
+    dates = [report_date(item.get("data_contrato")) for item in items]
+    dates = [item for item in dates if item]
+    if not dates:
+        return "diario"
+    span_days = (max(dates) - min(dates)).days
+    distinct_days = len(set(dates))
+    record_count = len(items)
+    if record_count <= 60 and distinct_days <= 45:
+        return "diario"
+    if span_days <= 365 and distinct_days <= 180 and record_count <= 3000:
+        return "semanal"
+    return "mensal"
+
+def report_summary():
+    return {
+        "contratos": 0, "volume": Decimal("0"), "usd_volume": Decimal("0"),
+        "brl_total": Decimal("0"), "resultado": Decimal("0"), "resultado_count": 0,
+        "taxa_valor": Decimal("0"), "taxa_volume": Decimal("0"),
+        "ptax_valor": Decimal("0"), "ptax_volume": Decimal("0"),
+        "ptax_dia": None,
+    }
+
+def report_brl_value(item):
+    if item.get("valor_reais") is not None:
+        return item["valor_reais"]
+    if item.get("taxa_cambio") is not None:
+        return item["valor_moeda"] * item["taxa_cambio"]
+    return None
+
+def add_report_item(summary, item):
+    volume = item["valor_moeda"]
+    summary["contratos"] += 1
+    summary["volume"] += volume
+    if item.get("moeda") == "USD":
+        summary["usd_volume"] += volume
+    brl_value = item.get("valor_brl")
+    if brl_value is not None:
+        summary["brl_total"] += brl_value
+    if item["resultado"] is not None:
+        summary["resultado"] += item["resultado"]
+        summary["resultado_count"] += 1
+    if item["taxa_cambio"] is not None and volume > 0:
+        summary["taxa_valor"] += item["taxa_cambio"] * volume
+        summary["taxa_volume"] += volume
+    if item.get("ptax_venda") is not None and volume > 0:
+        summary["ptax_valor"] += item["ptax_venda"] * volume
+        summary["ptax_volume"] += volume
+    if item.get("ptax_venda") is not None and summary["ptax_dia"] is None:
+        summary["ptax_dia"] = item["ptax_venda"]
+
+def finish_report_summary(summary):
+    summary["taxa_ponderada"] = summary["taxa_valor"] / summary["taxa_volume"] if summary["taxa_volume"] else None
+    summary["ptax_ponderada"] = summary["ptax_valor"] / summary["ptax_volume"] if summary["ptax_volume"] else None
+    summary["resultado"] = summary["resultado"] if summary["resultado_count"] else None
+    return summary
+
+def add_result_accumulated(summaries):
+    acumulado = Decimal("0")
+    tem_resultado = False
+    for summary in summaries:
+        if summary["resultado"] is not None:
+            acumulado += summary["resultado"]
+            tem_resultado = True
+        summary["resultado_acumulado"] = acumulado if tem_resultado else None
+
+def add_result_accumulated_by_period(items):
+    """Aplica o mesmo acumulado a todas as moedas de cada período."""
+    acumulado = Decimal("0")
+    tem_resultado = False
+    index = 0
+    while index < len(items):
+        periodo = items[index]["periodo"]
+        end = index
+        resultado_periodo = Decimal("0")
+        tem_resultado_periodo = False
+        while end < len(items) and items[end]["periodo"] == periodo:
+            resumo = items[end]["resumo"]
+            if resumo["resultado"] is not None:
+                resultado_periodo += resumo["resultado"]
+                tem_resultado_periodo = True
+            end += 1
+        if tem_resultado_periodo:
+            acumulado += resultado_periodo
+            tem_resultado = True
+        for item in items[index:end]:
+            item["resumo"]["resultado_acumulado"] = acumulado if tem_resultado else None
+        index = end
+
+def grouped_report_summaries(items, granularity):
+    grouped = {}
+    for item in items:
+        bucket = report_bucket(item.get("data_contrato"), granularity)
+        if not bucket:
+            continue
+        key = (bucket, item["moeda"])
+        grouped.setdefault(key, report_summary())
+        add_report_item(grouped[key], item)
+    result = []
+    for (bucket, moeda), summary in sorted(grouped.items(), key=lambda entry: (entry[0][0], entry[0][1])):
+        result.append({"periodo": bucket, "rotulo": report_period_label(bucket, granularity),
+                       "moeda": moeda, "resumo": finish_report_summary(summary)})
+    add_result_accumulated_by_period(result)
+    return result
+
+def build_contract_report_chart(rows, moeda, granularity="diario"):
+    """Prepara a série temporal compartilhada pela tela e pelo PDF."""
     daily = {}
     for row in rows:
         if row["moeda"] != moeda or not row["data_contrato"]:
             continue
-        item = daily.setdefault(row["data_contrato"], {"date": row["data_contrato"], "ptax": row["ptax_venda"], "volume": Decimal("0"), "weighted_rate": Decimal("0")})
-        if item["ptax"] is None and row["ptax_venda"] is not None:
-            item["ptax"] = row["ptax_venda"]
+        item = daily.setdefault(row["data_contrato"], {"date": row["data_contrato"], "ptax_soma": Decimal("0"), "ptax_count": 0, "volume": Decimal("0"), "weighted_rate": Decimal("0")})
+        if row["ptax_venda"] is not None:
+            item["ptax_soma"] += row["ptax_venda"]
+            item["ptax_count"] += 1
         if row["taxa_cambio"] is not None and row["valor_moeda"] > 0:
             item["volume"] += row["valor_moeda"]
             item["weighted_rate"] += row["valor_moeda"] * row["taxa_cambio"]
-    daily = sorted(daily.values(), key=lambda item: item["date"])
+    daily = sorted(daily.values(), key=lambda item: report_date(item["date"]) or date.max)
     for item in daily:
+        item["ptax"] = item["ptax_soma"] / item["ptax_count"] if item["ptax_count"] else None
         item["fechamento"] = item["weighted_rate"] / item["volume"] if item["volume"] else None
+    if granularity != "diario":
+        grouped = {}
+        for item in daily:
+            bucket = report_bucket(item["date"], granularity)
+            target = grouped.setdefault(bucket, {"date": bucket, "ptax_soma": Decimal("0"), "ptax_count": 0, "volume": Decimal("0"), "weighted_rate": Decimal("0")})
+            if item["ptax"] is not None:
+                target["ptax_soma"] += item["ptax"]
+                target["ptax_count"] += 1
+            target["volume"] += item["volume"]
+            target["weighted_rate"] += item["weighted_rate"]
+        daily = sorted(grouped.values(), key=lambda item: report_date(item["date"]) or date.max)
+        for item in daily:
+            item["ptax"] = item["ptax_soma"] / item["ptax_count"] if item["ptax_count"] else None
+            item["fechamento"] = item["weighted_rate"] / item["volume"] if item["volume"] else None
     values = [value for item in daily for value in (item["ptax"], item["fechamento"]) if value is not None]
+    base = {"moeda": moeda, "granularidade": granularity,
+            "granularidade_label": REPORT_GRANULARITY_LABELS[granularity], "points": []}
     if not values:
-        return {"moeda": moeda, "points": []}
+        return base
     minimum, maximum = min(values), max(values)
     padding = max((maximum - minimum) * Decimal("0.12"), Decimal("0.001"))
     minimum -= padding; maximum += padding
     count = max(len(daily) - 1, 1)
+    label_step = max(1, (len(daily) + 7) // 8)
     points = []
     for index, item in enumerate(daily):
-        point = {"date": item["date"], "x": round(40 + index * 720 / count, 2)}
+        show_label = index == 0 or index == len(daily) - 1 or index % label_step == 0
+        point = {"date": item["date"], "label": report_chart_label(item["date"], granularity),
+                 "show_label": show_label, "x": round(40 + index * 720 / count, 2),
+                 "ptax_valor": item["ptax"], "fechamento_valor": item["fechamento"]}
         for key in ("ptax", "fechamento"):
             value = item[key]
             point[key] = round(float(160 - ((value - minimum) / (maximum - minimum) * 130)), 2) if value is not None else None
@@ -1186,67 +1481,517 @@ def build_contract_report_chart(rows, moeda):
             else:
                 current.append(f"{point['x']},{point[key]}")
         if current: segments[key].append(current)
-    return {"moeda": moeda, "points": points, "segments": segments}
+    base["points"] = points
+    base["segments"] = segments
+    return base
+
+def report_dimension_rows(items, name_getter, total_brl):
+    grouped = {}
+    for item in items:
+        name = name_getter(item) or "Não informado"
+        summary = grouped.setdefault(name, report_summary())
+        add_report_item(summary, item)
+    result = []
+    for name, summary in sorted(grouped.items(), key=lambda entry: entry[0].casefold()):
+        participation = summary["brl_total"] / total_brl * Decimal("100") if total_brl else Decimal("0")
+        result.append({"nome": name, "total_usd": summary["usd_volume"],
+                       "total_brl": summary["brl_total"], "participacao": participation})
+    return result
+
+def report_period_range_label(inicio, fim, periodo):
+    if inicio and fim:
+        return f"{date_br(inicio)} a {date_br(fim)}"
+    if inicio:
+        return f"A partir de {date_br(inicio)}"
+    if fim:
+        return f"Até {date_br(fim)}"
+    if periodo != "todos":
+        return f"Últimos {periodo} dias"
+    return "Todo o período"
+
+def parse_report_filters(args, forced_granularity=None):
+    data_de = (args.get("data_de", "") or "").strip()
+    data_ate = (args.get("data_ate", "") or "").strip()
+    numero_contrato = (args.get("numero_contrato", "") or "").strip()
+    moeda = (args.get("moeda", "") or "").strip().upper()
+    periodo = (args.get("periodo", "todos") or "todos").strip()
+    if periodo not in {"todos", "30", "90", "180", "365"}:
+        periodo = "todos"
+    agrupamento_solicitado = forced_granularity or (args.get("agrupamento", "auto") or "auto").strip().lower()
+    if agrupamento_solicitado not in {"auto", *REPORT_GRANULARITIES}:
+        agrupamento_solicitado = "auto"
+    try:
+        inicio = parse_date(data_de) if data_de else None
+        fim = parse_date(data_ate) if data_ate else None
+    except ValueError:
+        raise ValueError("Data inválida. Use o formato dd/mm/aaaa.")
+    if not data_de and not data_ate and periodo != "todos":
+        fim = date.today().isoformat()
+        inicio = (date.today() - timedelta(days=int(periodo) - 1)).isoformat()
+    if inicio and fim and inicio > fim:
+        raise ValueError("A data inicial não pode ser posterior à data final.")
+    return {
+        "data_de": data_de, "data_ate": data_ate, "numero_contrato": numero_contrato,
+        "moeda": moeda, "periodo": periodo, "inicio": inicio, "fim": fim,
+        "agrupamento_solicitado": agrupamento_solicitado,
+        "empresa_id": form_record_id(args.get("empresa_id")),
+        "competencia_id": form_record_id(args.get("competencia_id")),
+    }
+
+def build_contract_report_context(args, forced_granularity=None):
+    filters = parse_report_filters(args, forced_granularity=forced_granularity)
+    where, params = [], []
+    if filters["inicio"]:
+        where.append("c.data_contrato >= ?"); params.append(filters["inicio"])
+    if filters["fim"]:
+        where.append("c.data_contrato <= ?"); params.append(filters["fim"])
+    if filters["numero_contrato"]:
+        where.append("c.numero_contrato LIKE ?"); params.append(f"%{filters['numero_contrato']}%")
+    if filters["moeda"]:
+        where.append("c.moeda = ?"); params.append(filters["moeda"])
+    if filters["empresa_id"]:
+        where.append("e.id = ?"); params.append(filters["empresa_id"])
+    if filters["competencia_id"]:
+        where.append("c.competencia_id = ?"); params.append(filters["competencia_id"])
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    conn = db()
+    try:
+        rows = conn.execute(f"""SELECT c.id, c.numero_contrato, c.data_contrato, c.cnpj, c.moeda,
+                c.valor_moeda, c.taxa_cambio, c.valor_reais, c.cliente, c.cliente_id,
+                c.banco, c.banco_credito, c.banco_liquidacao, c.competencia_id,
+                e.id AS empresa_id, e.razao_social AS empresa_razao_social,
+                e.apelido AS empresa_apelido, comp.descricao AS competencia_descricao,
+                cl.nome AS cliente_base_nome,
+                p.ptax_venda
+            FROM contratos c
+            LEFT JOIN empresas e ON REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(c.cnpj,''),'.',''),'/',''),'-',''),' ','')=e.cnpj
+            LEFT JOIN competencias comp ON comp.id=c.competencia_id
+            LEFT JOIN clientes cl ON cl.id=c.cliente_id
+            LEFT JOIN ptax_cotacoes p ON p.moeda=c.moeda AND p.data_cotacao=date(c.data_contrato)
+            {clause}
+            ORDER BY CASE WHEN c.data_contrato IS NULL OR c.data_contrato='' THEN 1 ELSE 0 END,
+                     c.data_contrato ASC, c.numero_contrato ASC""", params).fetchall()
+        empresas = conn.execute("""SELECT id, razao_social, apelido, cnpj FROM empresas
+                                  ORDER BY CASE WHEN TRIM(COALESCE(apelido,''))<>'' THEN 0 ELSE 1 END,
+                                           apelido, razao_social""").fetchall()
+        competencias = conn.execute("""SELECT comp.id, comp.empresa_id, comp.descricao,
+                comp.data_inicial, comp.data_final, e.apelido, e.razao_social
+            FROM competencias comp JOIN empresas e ON e.id=comp.empresa_id
+            ORDER BY comp.data_inicial DESC, comp.descricao""").fetchall()
+    finally:
+        conn.close()
+
+    contratos = []
+    for row in rows:
+        item = dict(row)
+        item["valor_moeda"] = decimal_value(item.get("valor_moeda"))
+        item["taxa_cambio"] = decimal_value(item["taxa_cambio"]) if item.get("taxa_cambio") is not None else None
+        item["valor_reais"] = decimal_value(item["valor_reais"]) if item.get("valor_reais") is not None else None
+        item["ptax_venda"] = decimal_value(item["ptax_venda"]) if item.get("ptax_venda") is not None else None
+        item["resultado"] = (item["valor_moeda"] * (item["taxa_cambio"] - item["ptax_venda"])
+                             if item["taxa_cambio"] is not None and item["ptax_venda"] is not None else None)
+        item["cliente_nome"] = item.get("cliente_base_nome") or item.get("cliente") or "Não informado"
+        item["empresa_nome"] = item.get("empresa_apelido") or item.get("empresa_razao_social") or item.get("cnpj") or "Não informado"
+        item["banco_recebedor"] = item.get("banco_liquidacao") or item.get("banco_credito") or item.get("banco") or "Não informado"
+        item["valor_brl"] = report_brl_value(item)
+        contratos.append(item)
+
+    granularidade = (choose_report_granularity(contratos)
+                     if filters["agrupamento_solicitado"] == "auto"
+                     else filters["agrupamento_solicitado"])
+    monthly_groups = grouped_report_summaries(contratos, "mensal")
+    daily_groups = grouped_report_summaries(contratos, "diario")
+    period_groups = grouped_report_summaries(contratos, granularidade)
+    mensais = [((item["periodo"], item["moeda"]), item["resumo"]) for item in monthly_groups]
+    diarios = [((item["periodo"], item["moeda"]), item["resumo"]) for item in daily_groups]
+    moedas = sorted({item["moeda"] for item in contratos if item["moeda"]})
+    graficos = [build_contract_report_chart(contratos, item, granularidade) for item in moedas]
+
+    total = report_summary()
+    currency_totals = {}
+    for item in contratos:
+        add_report_item(total, item)
+        currency_totals.setdefault(item["moeda"], report_summary())
+        add_report_item(currency_totals[item["moeda"]], item)
+    finish_report_summary(total)
+    for summary in currency_totals.values():
+        finish_report_summary(summary)
+    operation_days = sorted({item["data_contrato"][:10] for item in contratos if item.get("data_contrato")})
+    operations = len(contratos)
+    day_count = len(operation_days)
+    accumulated = next((item["resumo"]["resultado_acumulado"] for item in reversed(period_groups)
+                        if item["resumo"].get("resultado_acumulado") is not None), None)
+    kpis = {
+        "total_usd": total["usd_volume"], "total_brl": total["brl_total"],
+        "resultado": total["resultado"], "resultado_acumulado": accumulated,
+        "operacoes": operations, "dias": day_count,
+        "media_usd_operacao": total["usd_volume"] / operations if operations else Decimal("0"),
+        "media_brl_operacao": total["brl_total"] / operations if operations else Decimal("0"),
+        "media_usd_dia": total["usd_volume"] / day_count if day_count else Decimal("0"),
+        "media_brl_dia": total["brl_total"] / day_count if day_count else Decimal("0"),
+        "taxas": [{"moeda": moeda, "valor": summary["taxa_ponderada"]}
+                  for moeda, summary in sorted(currency_totals.items())
+                  if summary["taxa_ponderada"] is not None],
+    }
+    comparacoes_por_dia = {}
+    for (dia, _moeda), resumo in diarios:
+        if resumo.get("taxa_ponderada") is not None and resumo.get("ptax_dia") is not None:
+            comparacoes_por_dia.setdefault(dia, []).append(resumo["taxa_ponderada"] - resumo["ptax_dia"])
+    stats = {
+        "dias_acima": sum(1 for deltas in comparacoes_por_dia.values() if any(delta > 0 for delta in deltas)),
+        "dias_abaixo": sum(1 for deltas in comparacoes_por_dia.values() if any(delta < 0 for delta in deltas)),
+        "dias_operacao": day_count,
+        "resultado_acumulado": accumulated,
+    }
+    total_brl = total["brl_total"]
+    por_empresa = report_dimension_rows(contratos, lambda item: item.get("empresa_nome"), total_brl)
+    por_cliente = report_dimension_rows(contratos, lambda item: item.get("cliente_nome"), total_brl)
+    por_banco = report_dimension_rows(contratos, lambda item: item.get("banco_recebedor"), total_brl)
+    selected_empresa = next((item for item in empresas if item["id"] == filters["empresa_id"]), None)
+    selected_competencia = next((item for item in competencias if item["id"] == filters["competencia_id"]), None)
+    empresa_label = ((selected_empresa["apelido"] or selected_empresa["razao_social"])
+                     if selected_empresa else "Todas as empresas")
+    safra_label = selected_competencia["descricao"] if selected_competencia else "Todas as safras"
+    return {
+        "contratos": contratos, "mensais": mensais, "diarios": diarios,
+        "agrupados": period_groups, "periodos": period_groups,
+        "agrupamento_solicitado": filters["agrupamento_solicitado"],
+        "agrupamento": granularidade, "agrupamento_label": REPORT_GRANULARITY_LABELS[granularidade],
+        "periodo": filters["periodo"], "periodo_label": report_period_range_label(filters["inicio"], filters["fim"], filters["periodo"]),
+        "graficos": graficos, "moedas": moedas,
+        "numero_contrato": filters["numero_contrato"], "moeda": filters["moeda"],
+        "data_de": filters["data_de"], "data_ate": filters["data_ate"],
+        "empresa_id": filters["empresa_id"], "competencia_id": filters["competencia_id"],
+        "empresas": empresas, "competencias": competencias,
+        "empresa_label": empresa_label, "safra_label": safra_label,
+        "kpis": kpis, "stats": stats,
+        "por_empresa": por_empresa, "por_cliente": por_cliente, "por_banco": por_banco,
+        "data_emissao": datetime.now().strftime("%d/%m/%Y %H:%M"),
+    }
 
 @app.route("/contratos/relatorios")
 def relatorios_contratos():
-    data_de = request.args.get("data_de", "").strip(); data_ate = request.args.get("data_ate", "").strip()
-    numero_contrato = request.args.get("numero_contrato", "").strip(); moeda = request.args.get("moeda", "").strip().upper()
-    where, params = [], []
     try:
-        inicio = parse_date(data_de) if data_de else None; fim = parse_date(data_ate) if data_ate else None
-        if inicio and fim and inicio > fim:
-            raise ValueError("A data inicial não pode ser posterior à data final.")
-        if inicio: where.append("date(c.data_contrato) >= ?"); params.append(inicio)
-        if fim: where.append("date(c.data_contrato) <= ?"); params.append(fim)
+        context = build_contract_report_context(request.args)
     except ValueError as exc:
         flash(str(exc), "danger")
-    if numero_contrato: where.append("c.numero_contrato LIKE ?"); params.append(f"%{numero_contrato}%")
-    if moeda: where.append("c.moeda = ?"); params.append(moeda)
-    clause = " WHERE " + " AND ".join(where) if where else ""
-    conn = db()
-    rows = conn.execute(f"""SELECT c.id, c.numero_contrato, c.data_contrato, c.moeda, c.valor_moeda, c.taxa_cambio, p.ptax_venda
-        FROM contratos c LEFT JOIN ptax_cotacoes p ON p.moeda=c.moeda AND p.data_cotacao=date(c.data_contrato)
-        {clause} ORDER BY c.data_contrato DESC, c.numero_contrato ASC""", params).fetchall()
-    conn.close()
-    contratos, monthly = [], {}
+        return redirect(url_for("relatorios_contratos"))
+    return render_template("contratos_relatorios.html", **context)
+
+def report_pdf_fonts():
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    candidates = (
+        (Path("C:/Windows/Fonts/arial.ttf"), Path("C:/Windows/Fonts/arialbd.ttf")),
+        (Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"), Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")),
+    )
+    for regular_path, bold_path in candidates:
+        if not regular_path.exists():
+            continue
+        try:
+            if "DueReport" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont("DueReport", str(regular_path)))
+            if bold_path.exists() and "DueReportBold" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont("DueReportBold", str(bold_path)))
+            return "DueReport", "DueReportBold" if bold_path.exists() else "DueReport"
+        except Exception:
+            continue
+    return "Helvetica", "Helvetica-Bold"
+
+def report_pdf_styles():
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+
+    regular, bold = report_pdf_fonts()
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle("DuePdfTitle", parent=styles["Title"], fontName=bold,
+                              fontSize=18, leading=21, textColor=colors.HexColor("#18324f"),
+                              spaceAfter=3))
+    styles.add(ParagraphStyle("DuePdfSubtitle", parent=styles["Normal"], fontName=regular,
+                              fontSize=8.5, leading=11, textColor=colors.HexColor("#557084"),
+                              spaceAfter=8))
+    styles.add(ParagraphStyle("DuePdfSection", parent=styles["Heading2"], fontName=bold,
+                              fontSize=10.5, leading=13, textColor=colors.HexColor("#18324f"),
+                              spaceBefore=8, spaceAfter=4))
+    styles.add(ParagraphStyle("DuePdfBody", parent=styles["BodyText"], fontName=regular,
+                              fontSize=7.5, leading=9.5, textColor=colors.HexColor("#263b4d")))
+    styles.add(ParagraphStyle("DuePdfSmall", parent=styles["BodyText"], fontName=regular,
+                              fontSize=6.8, leading=8, textColor=colors.HexColor("#557084")))
+    styles.add(ParagraphStyle("DuePdfTableHeader", parent=styles["BodyText"], fontName=bold,
+                              fontSize=7, leading=8.5, textColor=colors.HexColor("#18324f")))
+    styles.add(ParagraphStyle("DuePdfKpiLabel", parent=styles["BodyText"], fontName=regular,
+                              fontSize=6.8, leading=8, textColor=colors.HexColor("#557084")))
+    styles.add(ParagraphStyle("DuePdfKpiValue", parent=styles["BodyText"], fontName=bold,
+                              fontSize=10.5, leading=12, textColor=colors.HexColor("#18324f")))
+    styles.add(ParagraphStyle("DuePdfChartLabel", parent=styles["BodyText"], fontName=regular,
+                              fontSize=6.5, leading=7.5, textColor=colors.HexColor("#557084")))
+    return styles, regular, bold
+
+def report_pdf_paragraph(value, style, bold=False):
+    from html import escape
+    from reportlab.platypus import Paragraph
+
+    text = "-" if value is None or str(value) == "" else str(value)
+    text = escape(text, quote=False).replace("\n", "<br/>")
+    if bold:
+        text = f"<b>{text}</b>"
+    return Paragraph(text, style)
+
+def report_pdf_percent(value):
+    if value is None:
+        return "-"
+    return f"{float(value):,.1f}%".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def report_pdf_table(story, title, headers, rows, widths, styles, accent="#EAF3FA"):
+    from reportlab.lib import colors
+    from reportlab.platypus import Table, TableStyle
+
+    story.append(report_pdf_paragraph(title, styles["DuePdfSection"], bold=True))
+    if not rows:
+        story.append(report_pdf_paragraph("Nenhum registro encontrado para os filtros informados.", styles["DuePdfSmall"]))
+        return
+    data = [[report_pdf_paragraph(header, styles["DuePdfTableHeader"]) for header in headers]]
     for row in rows:
-        item = dict(row); item["valor_moeda"] = decimal_value(item["valor_moeda"])
-        item["taxa_cambio"] = decimal_value(item["taxa_cambio"]) if item["taxa_cambio"] is not None else None
-        item["ptax_venda"] = decimal_value(item["ptax_venda"]) if item["ptax_venda"] is not None else None
-        # Resultado em R$: valor na moeda x (taxa de fechamento - PTAX venda).
-        item["resultado"] = item["valor_moeda"] * (item["taxa_cambio"] - item["ptax_venda"]) if item["taxa_cambio"] is not None and item["ptax_venda"] is not None else None
-        contratos.append(item); mes = (item["data_contrato"] or "")[:7]
-        if not mes: continue
-        resumo = monthly.setdefault(mes, {"contratos": 0, "volume": Decimal("0"), "resultado": Decimal("0"), "resultado_count": 0, "taxa_valor": Decimal("0"), "taxa_volume": Decimal("0"), "ptax_soma": Decimal("0"), "ptax_count": 0})
-        resumo["contratos"] += 1; resumo["volume"] += item["valor_moeda"]
-        if item["resultado"] is not None: resumo["resultado"] += item["resultado"]; resumo["resultado_count"] += 1
-        if item["taxa_cambio"] is not None: resumo["taxa_valor"] += item["taxa_cambio"] * item["valor_moeda"]; resumo["taxa_volume"] += item["valor_moeda"]
-        if item["ptax_venda"] is not None: resumo["ptax_soma"] += item["ptax_venda"]; resumo["ptax_count"] += 1
-    for resumo in monthly.values():
-        resumo["taxa_ponderada"] = resumo["taxa_valor"] / resumo["taxa_volume"] if resumo["taxa_volume"] else None
-        resumo["ptax_media"] = resumo["ptax_soma"] / resumo["ptax_count"] if resumo["ptax_count"] else None
-        resumo["resultado"] = resumo["resultado"] if resumo["resultado_count"] else None
-    daily = {}
-    for item in contratos:
-        mes = (item["data_contrato"] or "")[:10]
-        if not mes: continue
-        key = (mes, item["moeda"])
-        resumo = daily.setdefault(key, {"contratos": 0, "volume": Decimal("0"), "resultado": Decimal("0"), "resultado_count": 0, "taxa_valor": Decimal("0"), "taxa_volume": Decimal("0"), "ptax_soma": Decimal("0"), "ptax_count": 0})
-        resumo["contratos"] += 1; resumo["volume"] += item["valor_moeda"]
-        if item["resultado"] is not None: resumo["resultado"] += item["resultado"]; resumo["resultado_count"] += 1
-        if item["taxa_cambio"] is not None: resumo["taxa_valor"] += item["taxa_cambio"] * item["valor_moeda"]; resumo["taxa_volume"] += item["valor_moeda"]
-        if item["ptax_venda"] is not None: resumo["ptax_soma"] += item["ptax_venda"]; resumo["ptax_count"] += 1
-    def finish_summary(summary):
-        summary["taxa_ponderada"] = summary["taxa_valor"] / summary["taxa_volume"] if summary["taxa_volume"] else None
-        summary["ptax_media"] = summary["ptax_soma"] / summary["ptax_count"] if summary["ptax_count"] else None
-        summary["resultado"] = summary["resultado"] if summary["resultado_count"] else None
-        return summary
-    for summary in monthly.values(): finish_summary(summary)
-    for summary in daily.values(): finish_summary(summary)
-    moedas = sorted({item["moeda"] for item in contratos if item["moeda"]})
-    graficos = [build_contract_report_chart(contratos, item) for item in moedas]
-    return render_template("contratos_relatorios.html", contratos=contratos, mensais=sorted(monthly.items(), reverse=True), diarios=sorted(daily.items(), reverse=True), graficos=graficos, moedas=moedas, numero_contrato=numero_contrato, moeda=moeda, data_de=data_de, data_ate=data_ate)
+        data.append([report_pdf_paragraph(value, styles["DuePdfBody"]) for value in row])
+    table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(accent)),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D8E1E8")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 3.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFCFD")]),
+    ]))
+    story.append(table)
+
+def report_pdf_kpis(story, kpis, styles, available_width):
+    from reportlab.lib import colors
+    from reportlab.platypus import Table, TableStyle
+
+    rates = "<br/>".join(
+        f"{item['moeda']}: {report_pdf_paragraph(item['valor'], styles['DuePdfKpiValue']).getPlainText() if item['valor'] is not None else '-'}"
+        for item in kpis["taxas"]
+    ) or "-"
+    values = [
+        ("Total USD fechado", money(kpis["total_usd"]), "#EAF3FA"),
+        ("Total BRL", money(kpis["total_brl"]), "#FFF5D6"),
+        ("Taxa ponderada", rates, "#E5F4E8"),
+        ("Resultado financeiro vs PTAX", money(kpis["resultado"]) if kpis["resultado"] is not None else "-", "#EAF3FA"),
+        ("Quantidade de operações", str(kpis["operacoes"]), "#FFF5D6"),
+        ("Dias com operação", str(kpis["dias"]), "#E5F4E8"),
+        ("Volume médio/operação USD", money(kpis["media_usd_operacao"]), "#EAF3FA"),
+        ("Volume médio/operação BRL", money(kpis["media_brl_operacao"]), "#FFF5D6"),
+        ("Volume médio/dia USD", money(kpis["media_usd_dia"]), "#E5F4E8"),
+        ("Volume médio/dia BRL", money(kpis["media_brl_dia"]), "#EAF3FA"),
+    ]
+    cards = []
+    card_width = available_width / 5
+    for label, value, background in values:
+        value_html = value if label == "Taxa ponderada" else report_pdf_paragraph(value, styles["DuePdfKpiValue"]).getPlainText()
+        card = Table([[report_pdf_paragraph(label, styles["DuePdfKpiLabel"]),
+                       report_pdf_paragraph(value_html, styles["DuePdfKpiValue"])]] ,
+                     colWidths=[card_width * .65, card_width * .35])
+        card.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(background)),
+            ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#D8E1E8")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        cards.append(card)
+    rows = []
+    for index in range(0, len(cards), 5):
+        row = cards[index:index + 5]
+        while len(row) < 5:
+            row.append("")
+        rows.append(row)
+    table = Table(rows, colWidths=[card_width] * 5, hAlign="LEFT")
+    table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                               ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                               ("TOPPADDING", (0, 0), (-1, -1), 0),
+                               ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+    story.append(report_pdf_paragraph("Indicadores do período", styles["DuePdfSection"], bold=True))
+    story.append(table)
+
+def report_pdf_chart_drawing(grafico, styles, width=790, height=175):
+    from reportlab.graphics.shapes import Drawing, Line, PolyLine, String
+    from reportlab.lib import colors
+
+    points = grafico.get("points", [])
+    values = [point[key] for point in points for key in ("ptax_valor", "fechamento_valor") if point.get(key) is not None]
+    if not values:
+        return None
+    minimum, maximum = min(values), max(values)
+    padding = max((maximum - minimum) * Decimal("0.12"), Decimal("0.001"))
+    minimum -= padding; maximum += padding
+    left, right, bottom, top = 34, width - 18, 25, height - 15
+    plot_height = top - bottom
+    plot_width = right - left
+    drawing = Drawing(width, height)
+    drawing.add(Line(left, bottom, right, bottom, strokeColor=colors.HexColor("#CBD7E2"), strokeWidth=0.6))
+    drawing.add(Line(left, bottom, left, top, strokeColor=colors.HexColor("#CBD7E2"), strokeWidth=0.6))
+    drawing.add(String(2, bottom - 2, rate(minimum), fontName=styles["DuePdfChartLabel"].fontName,
+                      fontSize=6.5, fillColor=colors.HexColor("#557084")))
+    drawing.add(String(2, top - 2, rate(maximum), fontName=styles["DuePdfChartLabel"].fontName,
+                      fontSize=6.5, fillColor=colors.HexColor("#557084")))
+    scale_x = plot_width / Decimal("720")
+    series = (("ptax_valor", "#1769AA"), ("fechamento_valor", "#2F9E54"))
+    for key, color in series:
+        segment = []
+        for point in points:
+            value = point.get(key)
+            if value is None:
+                if len(segment) > 1:
+                    drawing.add(PolyLine(segment, strokeColor=colors.HexColor(color), strokeWidth=1.8))
+                segment = []
+                continue
+            x = float(left + (Decimal(str(point["x"])) - Decimal("40")) * scale_x)
+            y = float(bottom + ((value - minimum) / (maximum - minimum)) * Decimal(str(plot_height)))
+            segment.append((x, y))
+        if len(segment) > 1:
+            drawing.add(PolyLine(segment, strokeColor=colors.HexColor(color), strokeWidth=1.8))
+    for point in points:
+        if not point.get("show_label"):
+            continue
+        x = float(left + (Decimal(str(point["x"])) - Decimal("40")) * scale_x)
+        drawing.add(String(x, 8, str(point.get("label") or "-"),
+                          fontName=styles["DuePdfChartLabel"].fontName, fontSize=6.5,
+                          textAnchor="middle", fillColor=colors.HexColor("#557084")))
+    return drawing
+
+def report_pdf_html_metadata(source_html):
+    from html.parser import HTMLParser
+
+    class MetadataParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.in_title = False
+            self.in_h1 = False
+            self.title = []
+            self.h1 = []
+
+        def handle_starttag(self, tag, attrs):
+            self.in_title = self.in_title or tag == "title"
+            self.in_h1 = self.in_h1 or tag == "h1"
+
+        def handle_endtag(self, tag):
+            if tag == "title":
+                self.in_title = False
+            if tag == "h1":
+                self.in_h1 = False
+
+        def handle_data(self, data):
+            if self.in_title:
+                self.title.append(data)
+            if self.in_h1:
+                self.h1.append(data)
+
+    parser = MetadataParser()
+    parser.feed(source_html)
+    return " ".join("".join(parser.h1).split()) or " ".join("".join(parser.title).split())
+
+def render_contract_report_pdf(rendered_html, context):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Spacer
+
+    styles, regular, bold = report_pdf_styles()
+    title = report_pdf_html_metadata(rendered_html) or "PAINEL – FECHAMENTOS DE CÂMBIO DE PRONTO"
+    output = io.BytesIO()
+    page_width, page_height = landscape(A4)
+    document = SimpleDocTemplate(output, pagesize=(page_width, page_height),
+                                 leftMargin=24, rightMargin=24, topMargin=22, bottomMargin=24,
+                                 title=title, author="DUE Control")
+    story = [report_pdf_paragraph(title, styles["DuePdfTitle"], bold=True),
+             report_pdf_paragraph(
+                 f"Safra: {context['safra_label']}  |  Empresa: {context['empresa_label']}  |  "
+                 f"Período de apuração: {context['periodo_label']}  |  "
+                 f"Visualização: {context['agrupamento_label']}", styles["DuePdfSubtitle"])]
+    available_width = page_width - 48
+    report_pdf_kpis(story, context["kpis"], styles, available_width)
+    story.append(Spacer(1, 2))
+
+    report_pdf_table(story, "Fechamentos por Empresa",
+                     ["Empresa", "Total USD", "Total BRL", "Participação %"],
+                     [[item["nome"], money(item["total_usd"]), money(item["total_brl"]), report_pdf_percent(item["participacao"])]
+                      for item in context["por_empresa"]],
+                     [available_width * .43, available_width * .18, available_width * .21, available_width * .18], styles,
+                     accent="#EAF3FA")
+    report_pdf_table(story, "Fechamentos por Cliente",
+                     ["Cliente", "Total USD", "Total BRL", "Participação %"],
+                     [[item["nome"], money(item["total_usd"]), money(item["total_brl"]), report_pdf_percent(item["participacao"])]
+                      for item in context["por_cliente"]],
+                     [available_width * .43, available_width * .18, available_width * .21, available_width * .18], styles,
+                     accent="#FFF5D6")
+    report_pdf_table(story, "Fechamentos por Banco Recebedor",
+                     ["Banco", "Total BRL", "Participação %"],
+                     [[item["nome"], money(item["total_brl"]), report_pdf_percent(item["participacao"])]
+                      for item in context["por_banco"]],
+                     [available_width * .61, available_width * .21, available_width * .18], styles,
+                     accent="#E5F4E8")
+
+    report_pdf_table(story, "Estatísticas",
+                     ["Indicador", "Valor"],
+                     [["Dias acima da PTAX", context["stats"]["dias_acima"]],
+                      ["Dias abaixo da PTAX", context["stats"]["dias_abaixo"]],
+                      ["Total de dias com operação", context["stats"]["dias_operacao"]],
+                      ["Resultado acumulado", money(context["stats"]["resultado_acumulado"]) if context["stats"]["resultado_acumulado"] is not None else "-"]],
+                     [available_width * .68, available_width * .32], styles, accent="#FFF5D6")
+    report_pdf_table(story, f"Fechamentos por período — {context['agrupamento_label']}",
+                     ["Período", "Moeda", "Operações", "Volume", "Taxa ponderada", "Resultado acumulado", "Resultado (R$)"],
+                     [[item["rotulo"], item["moeda"], item["resumo"]["contratos"], money(item["resumo"]["volume"]),
+                       rate(item["resumo"]["taxa_ponderada"]) if item["resumo"]["taxa_ponderada"] is not None else "-",
+                       money(item["resumo"]["resultado_acumulado"]) if item["resumo"].get("resultado_acumulado") is not None else "-",
+                       money(item["resumo"]["resultado"]) if item["resumo"]["resultado"] is not None else "-"]
+                      for item in context["periodos"]],
+                     [available_width * .19, available_width * .09, available_width * .10, available_width * .16,
+                      available_width * .14, available_width * .17, available_width * .15], styles,
+                     accent="#EAF3FA")
+
+    story.append(report_pdf_paragraph("Evolução por período — Taxa ponderada × PTAX BACEN", styles["DuePdfSection"], bold=True))
+    for grafico in context["graficos"]:
+        story.append(report_pdf_paragraph(f"{grafico['moeda']} — {grafico['granularidade_label']}", styles["DuePdfSmall"], bold=True))
+        drawing = report_pdf_chart_drawing(grafico, styles)
+        if drawing:
+            story.append(drawing)
+            story.append(report_pdf_paragraph("PTAX BACEN   •   Taxa média ponderada pelo volume", styles["DuePdfSmall"]))
+        else:
+            story.append(report_pdf_paragraph("Não há taxas suficientes para desenhar o gráfico.", styles["DuePdfSmall"]))
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(regular, 7)
+        canvas.setFillColor(colors.HexColor("#557084"))
+        canvas.drawString(24, 12, f"Emitido em {context['data_emissao']}")
+        canvas.drawRightString(page_width - 24, 12, f"Página {doc.page}")
+        canvas.restoreState()
+
+    document.build(story, onFirstPage=footer, onLaterPages=footer)
+    output.seek(0)
+    return output
+
+@app.route("/contratos/relatorios/pdf")
+def relatorios_contratos_pdf():
+    agrupamento = (request.args.get("agrupamento", "auto") or "auto").strip().lower()
+    if agrupamento not in {"auto", *REPORT_GRANULARITIES}:
+        return "Granularidade inválida. Use diário, semanal ou mensal.", 400
+    try:
+        context = build_contract_report_context(request.args, forced_granularity=agrupamento)
+    except ValueError as exc:
+        return str(exc), 400
+    rendered_html = render_template("relatorios_fechamentos_pdf.html", **context)
+    output = render_contract_report_pdf(rendered_html, context)
+    filename = f"fechamentos_cambio_{context['agrupamento']}.pdf"
+    response = send_file(output, as_attachment=False, download_name=filename, mimetype="application/pdf")
+    response.headers["Content-Disposition"] = f'inline; filename="{filename}"'
+    return response
 
 @app.route("/derivativos")
 def dashboard_derivativos():
@@ -1402,18 +2147,29 @@ def editar_ndf(ndf_id):
                            competencias=competencias, competencia_id=competencia_id,
                            ndf_tipos=NDF_TIPOS, ndf_posicoes=NDF_POSICOES, ndf_statuses=NDF_STATUSES)
 
-@app.route("/ndf/<int:ndf_id>/excluir", methods=["POST"])
-def excluir_ndf(ndf_id):
+@app.route("/derivativos/ndfs/excluir-lote", methods=["POST"])
+def excluir_ndfs_lote():
     conn = db()
-    ndf = conn.execute("SELECT numero_operacao FROM ndfs WHERE id=?", (ndf_id,)).fetchone()
-    if not ndf:
+    try:
+        ndf_ids = selected_record_ids(request.form)
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_existing_record_ids(conn, "ndfs", ndf_ids, "NDFs")
+        placeholders = ",".join("?" for _ in ndf_ids)
+        conn.execute(f"DELETE FROM ndfs WHERE id IN ({placeholders})", ndf_ids)
+        conn.commit()
+        flash(f"{len(ndf_ids)} NDF(s) excluída(s) com sucesso.", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    except (sqlite3.Error, OverflowError):
+        conn.rollback()
+        flash("Não foi possível concluir a exclusão das NDFs.", "danger")
+    except Exception:
+        conn.rollback()
+        flash("Não foi possível concluir a exclusão das NDFs.", "danger")
+    finally:
         conn.close()
-        return "NDF não encontrada", 404
-    conn.execute("DELETE FROM ndfs WHERE id=?", (ndf_id,))
-    conn.commit()
-    conn.close()
-    flash(f"NDF {ndf['numero_operacao']} excluída com sucesso.", "success")
-    return redirect(url_for("lista_ndfs"))
+    return redirect_batch_result("lista_ndfs")
 
 @app.route("/derivativos/ptax")
 def ptax():
@@ -1652,12 +2408,14 @@ def novo_contrato():
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"))
             empresa_id = form_record_id(f.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
             data_contrato = parse_date(f.get("data_contrato"))
+            data_recebimento = parse_date(f.get("data_recebimento"))
+            data_liquidacao = parse_date(f.get("data_liquidacao"))
             competencia_id = competencia_da_operacao(conn, f.get("competencia_id"), empresa_id, data_contrato or date.today().isoformat())
             conn.execute("""INSERT INTO contratos
-                (numero_contrato,banco_id,banco,banco_credito,banco_liquidacao,data_contrato,cnpj,cliente_id,cliente,moeda,valor_moeda,taxa_cambio,valor_reais,status,observacao,competencia_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (numero_contrato,banco_id,banco,banco_credito,banco_liquidacao,data_contrato,data_recebimento,data_liquidacao,cnpj,cliente_id,cliente,moeda,valor_moeda,taxa_cambio,valor_reais,status,observacao,competencia_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (f["numero_contrato"].strip(), banco_id, banco, banco, banco_liquidacao,
-                 data_contrato, cnpj, cliente_id, cliente,
+                 data_contrato, data_recebimento, data_liquidacao, cnpj, cliente_id, cliente,
                  f.get("moeda") or "USD", valor_moeda,
                  optional_number(f.get("taxa_cambio")), optional_number(f.get("valor_reais")),
                  status_from_balance(valor_moeda), f.get("observacao"), competencia_id))
@@ -1761,10 +2519,12 @@ def editar_contrato(contrato_id):
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"), contrato["cnpj"])
             empresa_id = form_record_id(f.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
             data_contrato = parse_date(f.get("data_contrato"))
+            data_recebimento = parse_date(f.get("data_recebimento"))
+            data_liquidacao = parse_date(f.get("data_liquidacao"))
             competencia_id = competencia_da_operacao(conn, f.get("competencia_id"), empresa_id, data_contrato or date.today().isoformat(), contrato["competencia_id"] if "competencia_id" in contrato.keys() else None)
-            conn.execute("""UPDATE contratos SET numero_contrato=?,banco_id=?,banco=?,banco_credito=?,banco_liquidacao=?,data_contrato=?,cnpj=?,cliente_id=?,cliente=?,moeda=?,
+            conn.execute("""UPDATE contratos SET numero_contrato=?,banco_id=?,banco=?,banco_credito=?,banco_liquidacao=?,data_contrato=?,data_recebimento=?,data_liquidacao=?,cnpj=?,cliente_id=?,cliente=?,moeda=?,
                             valor_moeda=?,taxa_cambio=?,valor_reais=?,status=?,observacao=?,competencia_id=? WHERE id=?""",
-                (f["numero_contrato"].strip(), banco_id, banco, banco, banco_liquidacao, data_contrato, cnpj,
+                (f["numero_contrato"].strip(), banco_id, banco, banco, banco_liquidacao, data_contrato, data_recebimento, data_liquidacao, cnpj,
                  cliente_id, cliente, f.get("moeda") or "USD", valor_moeda,
                  optional_number(f.get("taxa_cambio")), optional_number(f.get("valor_reais")),
                  STATUS_CONCLUIDO if resumo["saldo_zerado_manual"] else status_from_balance(contract_balance(valor_moeda, linked)),
@@ -1845,22 +2605,6 @@ def reverter_saldo(contrato_id):
         conn.close()
     return redirect(url_for("editar_contrato", contrato_id=contrato_id))
 
-@app.route("/contrato/<int:contrato_id>/excluir", methods=["POST"])
-def excluir_contrato(contrato_id):
-    conn = db()
-    contrato = conn.execute("SELECT numero_contrato FROM contratos WHERE id=?", (contrato_id,)).fetchone()
-    if not contrato:
-        conn.close(); return "Contrato não encontrado", 404
-    due_ids = [row[0] for row in conn.execute(
-        "SELECT DISTINCT due_id FROM due_movimentacoes WHERE contrato_id=?", (contrato_id,)
-    )]
-    conn.execute("DELETE FROM due_movimentacoes WHERE contrato_id=?", (contrato_id,))
-    conn.execute("DELETE FROM contratos WHERE id=?", (contrato_id,))
-    recalculate_statuses(conn, due_ids=due_ids, contrato_ids=[])
-    conn.commit(); conn.close()
-    flash(f"Contrato {contrato['numero_contrato']} excluído com sucesso.", "success")
-    return redirect(url_for("lista_contratos"))
-
 @app.route("/contratos/<int:contrato_id>/saldo")
 def saldo_contrato(contrato_id):
     conn = db()
@@ -1937,7 +2681,46 @@ def consulta_dues():
     next_args = {**filters, "sort": sort, "direction": direction, "page": page + 1}
     return render_template("due_consulta.html", dues=dues, total=total, page=page, pages=pages,
                            filters=filters, moedas=moedas, sort=sort, direction=direction,
-                           sort_links=sort_links, previous_args=previous_args, next_args=next_args)
+                           sort_links=sort_links, previous_args=previous_args, next_args=next_args,
+                           status_concluido=STATUS_CONCLUIDO)
+
+@app.route("/dues/excluir-lote", methods=["POST"])
+def excluir_dues_lote():
+    conn = db()
+    try:
+        due_ids = selected_record_ids(request.form)
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_existing_record_ids(conn, "dues", due_ids, "DU-Es")
+        placeholders = ",".join("?" for _ in due_ids)
+        contrato_rows = conn.execute(f"""
+            SELECT DISTINCT contrato_id
+            FROM due_movimentacoes
+            WHERE due_id IN ({placeholders}) AND contrato_id IS NOT NULL
+            UNION
+            SELECT DISTINCT contrato_id
+            FROM due_contratos
+            WHERE due_id IN ({placeholders})
+        """, due_ids + due_ids).fetchall()
+        contrato_ids = [row[0] for row in contrato_rows]
+
+        conn.execute(f"DELETE FROM due_movimentacoes WHERE due_id IN ({placeholders})", due_ids)
+        conn.execute(f"DELETE FROM due_contratos WHERE due_id IN ({placeholders})", due_ids)
+        conn.execute(f"DELETE FROM dues WHERE id IN ({placeholders})", due_ids)
+        recalculate_statuses(conn, due_ids=[], contrato_ids=contrato_ids)
+        conn.commit()
+        flash(f"{len(due_ids)} DU-E(s) excluída(s) com sucesso.", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    except (sqlite3.Error, OverflowError):
+        conn.rollback()
+        flash("Não foi possível concluir a exclusão das DU-Es.", "danger")
+    except Exception:
+        conn.rollback()
+        flash("Não foi possível concluir a exclusão das DU-Es.", "danger")
+    finally:
+        conn.close()
+    return redirect_batch_result("consulta_dues")
 
 @app.route("/dues/modelo")
 def modelo_dues():
@@ -2318,86 +3101,409 @@ def excluir_movimentacao(due_id, mov_id):
         conn.close()
     return redirect(url_for("due_detalhe", due_id=due_id))
 
+def contract_import_stage_path(token):
+    if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", token):
+        raise ValueError("A prévia da importação é inválida ou expirou.")
+    return Path(tempfile.gettempdir()) / f"{CONTRACT_IMPORT_STAGE_PREFIX}{token}.json"
+
+def cleanup_contract_import_stages():
+    cutoff = time.time() - CONTRACT_IMPORT_STAGE_TTL
+    directory = Path(tempfile.gettempdir())
+    for path in directory.glob(f"{CONTRACT_IMPORT_STAGE_PREFIX}*.json"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+def remove_contract_import_stage(token=None):
+    stage_token = token if token is not None else session.get("contract_import_stage")
+    if stage_token:
+        try:
+            contract_import_stage_path(stage_token).unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
+    if session.get("contract_import_stage") == stage_token:
+        session.pop("contract_import_stage", None)
+
+def save_contract_import_stage(payload):
+    cleanup_contract_import_stages()
+    old_token = session.get("contract_import_stage")
+    if old_token:
+        remove_contract_import_stage(old_token)
+    token = secrets.token_urlsafe(24)
+    payload = dict(payload)
+    payload["created_at"] = time.time()
+    path = contract_import_stage_path(token)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    session["contract_import_stage"] = token
+    return token
+
+def load_contract_import_stage(token=None):
+    token = (token or session.get("contract_import_stage") or "").strip()
+    if not token or token != session.get("contract_import_stage"):
+        raise ValueError("A prévia da importação não pertence a esta sessão.")
+    path = contract_import_stage_path(token)
+    try:
+        if time.time() - path.stat().st_mtime > CONTRACT_IMPORT_STAGE_TTL:
+            raise FileNotFoundError
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        remove_contract_import_stage(token)
+        raise ValueError("A prévia da importação é inválida ou expirou.")
+    allowed_date_columns = {"data_recebimento", "data_liquidacao"}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or not isinstance(payload.get("rows"), list)
+        or not isinstance(payload.get("date_columns", []), list)
+        or not set(payload.get("date_columns", [])).issubset(allowed_date_columns)
+    ):
+        remove_contract_import_stage(token)
+        raise ValueError("A prévia da importação é inválida ou expirou.")
+    return payload
+
+def contract_import_cell(record, columns, column, pandas, default=None):
+    if column not in columns:
+        return default
+    value = record[column]
+    return None if pandas.isna(value) else value
+
+def contract_import_text(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+def prepare_contract_import_rows(df, pandas):
+    date_columns = {
+        column for column in ("data_recebimento", "data_liquidacao")
+        if column in df.columns
+    }
+    rows = []
+    for line_number, (_, record) in enumerate(df.iterrows(), start=2):
+        raw_number = contract_import_cell(record, df.columns, "numero_contrato", pandas, "")
+        numero = contract_import_text(raw_number)
+        if not numero:
+            values = [contract_import_cell(record, df.columns, column, pandas) for column in df.columns]
+            if any(contract_import_text(value) for value in values):
+                raise ValueError(f"Linha {line_number}: o numero_contrato é obrigatório.")
+            continue
+        try:
+            valor_moeda = parse_number(contract_import_cell(record, df.columns, "valor_moeda", pandas, 0))
+            ensure_non_negative_balance(valor_moeda, "valor_moeda não pode ser negativo")
+            data_contrato = parse_date(contract_import_cell(record, df.columns, "data_contrato", pandas))
+            data_recebimento = parse_date(contract_import_cell(record, df.columns, "data_recebimento", pandas))
+            data_liquidacao = parse_date(contract_import_cell(record, df.columns, "data_liquidacao", pandas))
+            taxa_cambio = optional_number(contract_import_cell(record, df.columns, "taxa_cambio", pandas))
+            valor_reais = optional_number(contract_import_cell(record, df.columns, "valor_reais", pandas))
+        except ValueError as exc:
+            raise ValueError(f"Linha {line_number}: {exc}") from exc
+        banco_credito = contract_import_cell(record, df.columns, "banco_credito", pandas)
+        banco_credito = banco_credito or contract_import_cell(record, df.columns, "banco", pandas)
+        banco_credito = contract_import_text(banco_credito)
+        banco_liquidacao = contract_import_cell(record, df.columns, "banco_liquidacao", pandas)
+        banco_liquidacao = contract_import_text(banco_liquidacao) or banco_credito
+        rows.append({
+            "row_id": f"r{line_number}",
+            "source_row": line_number,
+            "numero_contrato": numero,
+            "banco_credito": banco_credito,
+            "banco_liquidacao": banco_liquidacao,
+            "data_contrato": data_contrato,
+            "data_recebimento": data_recebimento,
+            "data_liquidacao": data_liquidacao,
+            "cnpj": contract_import_text(contract_import_cell(record, df.columns, "cnpj", pandas)),
+            "cliente": contract_import_text(contract_import_cell(record, df.columns, "cliente", pandas)),
+            "moeda": (contract_import_text(contract_import_cell(record, df.columns, "moeda", pandas, "USD")) or "USD").upper(),
+            "valor_moeda": float(valor_moeda),
+            "taxa_cambio": taxa_cambio,
+            "valor_reais": valor_reais,
+        })
+    if not rows:
+        raise ValueError("A planilha não contém contratos válidos para importar.")
+    return rows, date_columns
+
+def contracts_for_import(conn, numbers):
+    if not numbers:
+        return {}
+    numbers = [str(number).strip() for number in numbers]
+    placeholders = ",".join("?" for _ in numbers)
+    rows = conn.execute(f"""
+        SELECT c.*, COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END), 0) AS vinculado
+        FROM contratos c
+        LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
+        WHERE TRIM(c.numero_contrato) IN ({placeholders})
+        GROUP BY c.id
+    """, numbers).fetchall()
+    result = {}
+    for row in rows:
+        numero = str(row["numero_contrato"] or "").strip()
+        if numero in result and result[numero]["id"] != row["id"]:
+            raise ValueError(f"O banco contém mais de um contrato com o número {numero} após a normalização.")
+        result[numero] = dict(row)
+    return result
+
+def contract_import_snapshot(row):
+    if not row:
+        return None
+    data = dict(row)
+    snapshot = {
+        key: data.get(key) for key in (
+            "id", "numero_contrato", "banco", "banco_credito", "banco_liquidacao",
+            "data_contrato", "data_recebimento", "data_liquidacao", "cnpj", "cliente",
+            "moeda", "valor_moeda", "taxa_cambio", "valor_reais", "status",
+            "saldo_zerado_manual", "observacao", "competencia_id", "vinculado",
+        )
+    }
+    if snapshot["vinculado"] is not None:
+        snapshot["vinculado"] = float(snapshot["vinculado"])
+    return snapshot
+
+def build_contract_import_payload(conn, rows, date_columns):
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["numero_contrato"], []).append(row)
+    existing = contracts_for_import(conn, list(grouped))
+    existing_snapshots = {}
+    for numero, group_rows in grouped.items():
+        current = contract_import_snapshot(existing.get(numero))
+        existing_snapshots[numero] = current
+        if current:
+            for row in group_rows:
+                try:
+                    ensure_non_negative_balance(
+                        decimal_value(row["valor_moeda"]) - decimal_value(current.get("vinculado")),
+                        "valor_moeda não pode ficar abaixo do total já vinculado"
+                    )
+                except ValueError as exc:
+                    row["update_error"] = str(exc)
+    return {
+        "version": 1,
+        "date_columns": sorted(date_columns),
+        "rows": rows,
+        "existing_by_number": existing_snapshots,
+    }
+
+def contract_import_preview_context(payload):
+    grouped = {}
+    for row in payload["rows"]:
+        grouped.setdefault(row["numero_contrato"], []).append(row)
+    conflicts = []
+    new_rows = []
+    for group_index, (numero, rows) in enumerate(grouped.items()):
+        existing = payload.get("existing_by_number", {}).get(numero)
+        if existing or len(rows) > 1:
+            conflicts.append({
+                "group_id": f"g{group_index}",
+                "numero_contrato": numero,
+                "rows": rows,
+                "existing": existing,
+                "kind": "existing" if existing else "planilha",
+                "requires_choice": len(rows) > 1,
+                "can_update": bool(existing) and any(not row.get("update_error") for row in rows),
+            })
+        else:
+            new_rows.append(rows[0])
+    return {
+        "new_rows": new_rows,
+        "conflicts": conflicts,
+        "total_rows": len(payload["rows"]),
+        "duplicate_rows": sum(len(group["rows"]) for group in conflicts),
+        "date_columns": payload.get("date_columns", []),
+    }
+
+def render_contract_import_preview(payload, error=None):
+    context = contract_import_preview_context(payload)
+    context.update(stage_token=session.get("contract_import_stage"), error=error)
+    return render_template("contrato_import_preview.html", **context)
+
+def contract_import_decisions(payload, form):
+    context = contract_import_preview_context(payload)
+    rows_to_apply = list(context["new_rows"])
+    discarded = 0
+    for conflict in context["conflicts"]:
+        rows = conflict["rows"]
+        selected = rows[0]
+        if conflict["requires_choice"]:
+            selected_id = (form.get(f"chosen_row_{conflict['group_id']}") or "").strip()
+            selected = next((row for row in rows if row["row_id"] == selected_id), None)
+            if selected is None:
+                raise ValueError(f"Escolha uma linha para o contrato {conflict['numero_contrato']}.")
+        if conflict["existing"]:
+            action = form.get(f"duplicate_action_{conflict['group_id']}")
+            if action not in {"update", "discard"}:
+                raise ValueError(f"Escolha uma ação para o contrato {conflict['numero_contrato']}.")
+            if action == "update":
+                if selected.get("update_error"):
+                    raise ValueError(
+                        f"Contrato {conflict['numero_contrato']}: {selected['update_error']}."
+                    )
+                rows_to_apply.append(selected)
+            discarded += len(rows) if action == "discard" else len(rows) - 1
+        else:
+            action = form.get(f"file_duplicate_action_{conflict['group_id']}")
+            if action not in {"insert", "discard"}:
+                raise ValueError(f"Escolha uma ação para o grupo {conflict['numero_contrato']}.")
+            if action == "insert":
+                rows_to_apply.append(selected)
+                discarded += len(rows) - 1
+            else:
+                discarded += len(rows)
+    return rows_to_apply, discarded
+
+def apply_contract_import_rows(conn, rows, date_columns):
+    allowed_date_columns = {"data_recebimento", "data_liquidacao"}
+    date_columns = set(date_columns)
+    if not date_columns.issubset(allowed_date_columns):
+        raise ValueError("A prévia contém colunas de data inválidas.")
+    update_columns = [
+        "numero_contrato=?", "banco=?", "banco_credito=?", "banco_liquidacao=?",
+        "data_contrato=?", "cnpj=?", "cliente=?", "moeda=?", "valor_moeda=?",
+        "taxa_cambio=?", "valor_reais=?", "status=?",
+    ]
+    for column in sorted(date_columns):
+        update_columns.insert(5, f"{column}=?")
+    update_query = "UPDATE contratos SET " + ",".join(update_columns) + " WHERE id=?"
+    insert_query = """INSERT INTO contratos
+        (numero_contrato,banco,banco_credito,banco_liquidacao,data_contrato,data_recebimento,data_liquidacao,cnpj,cliente,moeda,valor_moeda,taxa_cambio,valor_reais,status)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """
+    inserted = 0
+    updated = 0
+    contrato_ids = []
+    for row in rows:
+        existing = conn.execute(
+            "SELECT id FROM contratos WHERE TRIM(numero_contrato)=?", (row["numero_contrato"],)
+        ).fetchone()
+        if existing:
+            linked = contract_summary(conn, existing["id"])["vinculado"]
+            ensure_non_negative_balance(
+                decimal_value(row["valor_moeda"]) - decimal_value(linked),
+                "valor_moeda não pode ficar abaixo do total já vinculado"
+            )
+            updated += 1
+        else:
+            inserted += 1
+        values = [
+            row["numero_contrato"], row["banco_credito"], row["banco_credito"],
+            row["banco_liquidacao"], row["data_contrato"], row["cnpj"], row["cliente"],
+            row["moeda"], row["valor_moeda"], row["taxa_cambio"], row["valor_reais"],
+            status_from_balance(row["valor_moeda"]),
+        ]
+        for column in sorted(date_columns):
+            values.insert(5, row[column])
+        if existing:
+            conn.execute(update_query, values + [existing["id"]])
+        else:
+            conn.execute(insert_query, (
+                row["numero_contrato"], row["banco_credito"], row["banco_credito"],
+                row["banco_liquidacao"], row["data_contrato"], row["data_recebimento"],
+                row["data_liquidacao"], row["cnpj"], row["cliente"], row["moeda"],
+                row["valor_moeda"], row["taxa_cambio"], row["valor_reais"],
+                status_from_balance(row["valor_moeda"]),
+            ))
+        contrato_ids.append(conn.execute(
+            "SELECT id FROM contratos WHERE TRIM(numero_contrato)=?", (row["numero_contrato"],)
+        ).fetchone()[0])
+    recalculate_statuses(conn, due_ids=[], contrato_ids=contrato_ids)
+    return {"inserted": inserted, "updated": updated, "discarded": 0}
+
+def revalidate_contract_import_stage(conn, payload):
+    numbers = list(payload.get("existing_by_number", {}))
+    current = contracts_for_import(conn, numbers)
+    expected = payload.get("existing_by_number", {})
+    for numero in numbers:
+        if contract_import_snapshot(current.get(numero)) != expected.get(numero):
+            raise ValueError(
+                f"O contrato {numero} foi alterado desde a prévia. Analise a planilha novamente."
+            )
+
 @app.route("/contratos/importar", methods=["POST"])
 def importar_contratos():
-    # Importação real via Excel usa pandas/openpyxl. Mantém atualização por número.
     conn = None
     try:
         import pandas as pd
-        arquivo=request.files.get("arquivo")
+        arquivo = request.files.get("arquivo")
         if not arquivo or not arquivo.filename:
             flash("Selecione um arquivo Excel.", "danger")
             return redirect(url_for("index"))
-        df=pd.read_excel(arquivo)
-        df.columns=[str(c).strip().lower() for c in df.columns]
-        obrigatorias={"numero_contrato"}
-        if not obrigatorias.issubset(df.columns):
+        df = pd.read_excel(arquivo)
+        df.columns = normalize_contract_import_columns(df.columns)
+        if "numero_contrato" not in df.columns:
             flash("O Excel precisa conter a coluna numero_contrato.", "danger")
             return redirect(url_for("index"))
         conn = db()
-        query = """INSERT INTO contratos
-            (numero_contrato,banco,banco_credito,banco_liquidacao,data_contrato,cnpj,cliente,moeda,valor_moeda,taxa_cambio,valor_reais,status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(numero_contrato) DO UPDATE SET
-            banco=excluded.banco,banco_credito=excluded.banco_credito,banco_liquidacao=excluded.banco_liquidacao,
-            data_contrato=excluded.data_contrato,cnpj=excluded.cnpj,cliente=excluded.cliente,
-            moeda=excluded.moeda,valor_moeda=excluded.valor_moeda,taxa_cambio=excluded.taxa_cambio,
-            valor_reais=excluded.valor_reais"""
-        contrato_ids = []
-        for attempt in range(6):
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                for _, r in df.iterrows():
-                    def val(col, default=None):
-                        x = r[col] if col in df.columns else default
-                        return None if pd.isna(x) else x
-                    numero = str(val("numero_contrato", "")).strip()
-                    if not numero:
-                        continue
-                    valor_moeda = parse_number(val("valor_moeda", 0))
-                    ensure_non_negative_balance(valor_moeda, "valor_moeda não pode ser negativo")
-                    existing = conn.execute(
-                        "SELECT id FROM contratos WHERE numero_contrato=?", (numero,)
-                    ).fetchone()
-                    if existing:
-                        linked = contract_summary(conn, existing["id"])["vinculado"]
-                        ensure_non_negative_balance(
-                            decimal_value(valor_moeda) - linked,
-                            "valor_moeda não pode ficar abaixo do total já vinculado"
-                        )
-                    banco_credito = val("banco_credito") or val("banco")
-                    banco_liquidacao = val("banco_liquidacao") or banco_credito
-                    banco_credito = str(banco_credito).strip() if banco_credito is not None else None
-                    banco_liquidacao = str(banco_liquidacao).strip() if banco_liquidacao is not None else banco_credito
-                    conn.execute(query, (numero, banco_credito, banco_credito, banco_liquidacao, parse_date(val("data_contrato")), val("cnpj"), val("cliente"),
-                                         str(val("moeda", "USD") or "USD").strip().upper(), float(valor_moeda),
-                                         optional_number(val("taxa_cambio")),
-                                         optional_number(val("valor_reais")),
-                                         status_from_balance(valor_moeda)))
-                    contrato_id = conn.execute(
-                        "SELECT id FROM contratos WHERE numero_contrato=?", (numero,)
-                    ).fetchone()[0]
-                    contrato_ids.append(contrato_id)
-                recalculate_statuses(conn, due_ids=[], contrato_ids=contrato_ids)
-                conn.commit()
-                break
-            except sqlite3.OperationalError as exc:
-                conn.rollback()
-                if "locked" not in str(exc).lower() or attempt == 5:
-                    raise
-                time.sleep(0.5)
-        flash(f"Importação concluída: {len(df)} linhas processadas.", "success")
-    except Exception as e:
-        flash(f"Erro na importação: {e}", "danger")
+        rows, date_columns = prepare_contract_import_rows(df, pd)
+        payload = build_contract_import_payload(conn, rows, date_columns)
+        save_contract_import_stage(payload)
+        return render_contract_import_preview(payload)
+    except ValueError as exc:
+        flash(str(exc), "danger")
+    except Exception as exc:
+        flash(f"Erro na análise da importação: {exc}", "danger")
     finally:
         if conn is not None:
             conn.close()
     return redirect(url_for("index"))
 
+@app.route("/contratos/importar/confirmar", methods=["POST"])
+def confirmar_importacao_contratos():
+    token = request.form.get("stage_token")
+    payload = None
+    conn = None
+    preview_error = None
+    try:
+        payload = load_contract_import_stage(token)
+        conn = db()
+        conn.execute("BEGIN IMMEDIATE")
+        revalidate_contract_import_stage(conn, payload)
+        rows, discarded = contract_import_decisions(payload, request.form)
+        result = apply_contract_import_rows(conn, rows, set(payload.get("date_columns", [])))
+        result["discarded"] = discarded
+        conn.commit()
+        remove_contract_import_stage(token)
+        flash(
+            f"Importação concluída: {result['inserted']} inserido(s), "
+            f"{result['updated']} atualizado(s) e {result['discarded']} descartado(s).",
+            "success",
+        )
+        return redirect(url_for("index"))
+    except ValueError as exc:
+        if conn is not None:
+            conn.rollback()
+        if payload is not None and session.get("contract_import_stage") == token:
+            preview_error = str(exc)
+        else:
+            flash(str(exc), "danger")
+    except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+        if payload is not None and session.get("contract_import_stage") == token:
+            preview_error = f"Não foi possível concluir a importação: {exc}"
+        else:
+            flash(f"Erro na confirmação da importação: {exc}", "danger")
+    finally:
+        if conn is not None:
+            conn.close()
+    if preview_error:
+        return render_contract_import_preview(payload, error=preview_error), 400
+    return redirect(url_for("index"))
+
+@app.route("/contratos/importar/cancelar", methods=["POST"])
+def cancelar_importacao_contratos():
+    token = request.form.get("stage_token")
+    if token and token == session.get("contract_import_stage"):
+        remove_contract_import_stage(token)
+        flash("Importação cancelada.", "success")
+    else:
+        flash("A prévia da importação já expirou ou não é válida.", "danger")
+    return redirect(url_for("index"))
+
 @app.route("/contratos/modelo")
 def modelo_contratos():
     import pandas as pd
-    df=pd.DataFrame(columns=["numero_contrato","banco_credito","banco_liquidacao","data_contrato","cnpj","cliente","moeda","valor_moeda","taxa_cambio","valor_reais"])
+    df=pd.DataFrame(columns=["numero_contrato","banco_credito","banco_liquidacao","data_contrato","data_recebimento","data_liquidacao","cnpj","cliente","moeda","valor_moeda","taxa_cambio","valor_reais"])
     out=io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df.to_excel(writer,index=False,sheet_name="Contratos")

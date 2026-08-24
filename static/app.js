@@ -115,7 +115,7 @@
     let activeDirection = 1;
     const rows = () => [...body.querySelectorAll('tr')].filter((row) => !row.querySelector('.empty'));
     const valueFor = (row, index, type) => {
-      const cell = row.children[index];
+      const cell = row.children[headers[index].cellIndex];
       const value = cell ? (cell.dataset.sortValue || cell.textContent.trim()) : '';
       if (type === 'number') return sortableNumber(value);
       if (type === 'date') return sortableDate(value);
@@ -153,6 +153,62 @@
           applySort(index);
         }
       });
+    });
+  });
+
+  document.querySelectorAll('[data-batch-form]').forEach((form) => {
+    const checkboxes = [...form.querySelectorAll('[data-batch-checkbox]')];
+    const selectAll = form.querySelector('[data-batch-select-all]');
+    const count = form.querySelector('[data-batch-count]');
+    const submit = form.querySelector('[data-batch-submit]');
+    const sync = () => {
+      const selected = checkboxes.filter((checkbox) => checkbox.checked).length;
+      if (count) count.textContent = selected;
+      if (submit) submit.disabled = selected === 0;
+      if (selectAll) {
+        selectAll.checked = checkboxes.length > 0 && selected === checkboxes.length;
+        selectAll.indeterminate = selected > 0 && selected < checkboxes.length;
+      }
+    };
+    if (selectAll) {
+      selectAll.addEventListener('change', () => {
+        checkboxes.forEach((checkbox) => { checkbox.checked = selectAll.checked; });
+        sync();
+      });
+    }
+    checkboxes.forEach((checkbox) => checkbox.addEventListener('change', sync));
+    form.addEventListener('submit', (event) => {
+      const selected = checkboxes.filter((checkbox) => checkbox.checked);
+      if (!selected.length) {
+        event.preventDefault();
+        return;
+      }
+      const template = form.dataset.confirmMessage || 'Confirmar a exclusao dos registros selecionados?';
+      const message = template.split('{count}').join(String(selected.length));
+      if (!window.confirm(message)) event.preventDefault();
+    });
+    sync();
+  });
+
+  document.querySelectorAll('[data-import-confirm]').forEach((form) => {
+    form.addEventListener('submit', (event) => {
+      const conflicts = [...form.querySelectorAll('[data-import-conflict]')];
+      const actionLabels = {
+        update: 'Atualizar contrato existente',
+        discard: 'Excluir linha importada',
+        insert: 'Inserir linha escolhida',
+      };
+      const details = conflicts.map((conflict) => {
+        const description = conflict.querySelector('[data-import-message]');
+        const action = conflict.querySelector('input[type="radio"][name^="duplicate_action_"]:checked, input[type="radio"][name^="file_duplicate_action_"]:checked');
+        const text = description ? description.textContent.trim() : '';
+        const selectedAction = actionLabels[action ? action.value : ''] || 'Decisão pendente';
+        return `${text}\nAção: ${selectedAction}`;
+      });
+      const message = details.length
+        ? `Confirmar a importação?\n\n${details.join('\n\n')}`
+        : 'Confirmar a importação dos contratos analisados?';
+      if (!window.confirm(message)) event.preventDefault();
     });
   });
 
