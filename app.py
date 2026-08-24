@@ -128,6 +128,18 @@ def init_db():
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS competencias (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        empresa_id INTEGER NOT NULL,
+        descricao TEXT NOT NULL,
+        data_inicial TEXT NOT NULL,
+        data_final TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ABERTA',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE CASCADE,
+        UNIQUE(empresa_id, descricao)
+    );
+
     CREATE TABLE IF NOT EXISTS clientes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         nome TEXT NOT NULL COLLATE NOCASE,
@@ -154,12 +166,15 @@ def init_db():
         status TEXT NOT NULL DEFAULT 'PENDENTE',
         observacao TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ,competencia_id INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS contratos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         numero_contrato TEXT NOT NULL UNIQUE,
         banco TEXT,
+        banco_credito TEXT,
+        banco_liquidacao TEXT,
         data_contrato TEXT,
         cnpj TEXT,
         cliente TEXT,
@@ -171,6 +186,7 @@ def init_db():
         saldo_zerado_manual INTEGER NOT NULL DEFAULT 0,
         observacao TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ,competencia_id INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS ndfs (
@@ -189,6 +205,7 @@ def init_db():
         observacao TEXT,
         status TEXT NOT NULL DEFAULT 'ATIVA',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ,competencia_id INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS ptax_cotacoes (
@@ -238,15 +255,27 @@ def init_db():
             conn.execute("ALTER TABLE contratos ADD COLUMN banco TEXT")
         if "banco_id" not in contrato_columns:
             conn.execute("ALTER TABLE contratos ADD COLUMN banco_id INTEGER")
+        if "banco_credito" not in contrato_columns:
+            conn.execute("ALTER TABLE contratos ADD COLUMN banco_credito TEXT")
+        if "banco_liquidacao" not in contrato_columns:
+            conn.execute("ALTER TABLE contratos ADD COLUMN banco_liquidacao TEXT")
+        conn.execute("UPDATE contratos SET banco_credito=COALESCE(NULLIF(banco_credito,''),banco), banco_liquidacao=COALESCE(NULLIF(banco_liquidacao,''),banco_credito,banco)")
         if "cliente_id" not in contrato_columns:
             conn.execute("ALTER TABLE contratos ADD COLUMN cliente_id INTEGER")
         if "saldo_zerado_manual" not in contrato_columns:
             conn.execute("ALTER TABLE contratos ADD COLUMN saldo_zerado_manual INTEGER NOT NULL DEFAULT 0")
+        if "competencia_id" not in contrato_columns:
+            conn.execute("ALTER TABLE contratos ADD COLUMN competencia_id INTEGER")
+        due_columns = {row[1] for row in conn.execute("PRAGMA table_info(dues)")}
+        if "competencia_id" not in due_columns:
+            conn.execute("ALTER TABLE dues ADD COLUMN competencia_id INTEGER")
         ndf_columns = {row[1] for row in conn.execute("PRAGMA table_info(ndfs)")}
         if "cliente_id" not in ndf_columns:
             conn.execute("ALTER TABLE ndfs ADD COLUMN cliente_id INTEGER")
         if "contraparte_id" not in ndf_columns:
             conn.execute("ALTER TABLE ndfs ADD COLUMN contraparte_id INTEGER")
+        if "competencia_id" not in ndf_columns:
+            conn.execute("ALTER TABLE ndfs ADD COLUMN competencia_id INTEGER")
         conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_dues_chave_acesso
                        ON dues(chave_acesso)
                        WHERE chave_acesso IS NOT NULL AND chave_acesso <> ''""")
@@ -412,6 +441,71 @@ def cnpj_da_empresa(conn, empresa_id, current_cnpj=None):
         return normalize_cnpj(current_cnpj)
     raise ValueError("Selecione uma empresa em Configurações > Cadastrar minhas empresas.")
 
+COMPETENCIA_STATUS_ABERTA = "ABERTA"
+COMPETENCIA_STATUS_ENCERRADA = "ENCERRADA"
+COMPETENCIA_STATUSES = (COMPETENCIA_STATUS_ABERTA, COMPETENCIA_STATUS_ENCERRADA)
+
+def competencia_data(form, conn, current=None):
+    descricao = (form.get("descricao") or "").strip()
+    if not descricao:
+        raise ValueError("A descrição da competência é obrigatória.")
+    try:
+        empresa_id = int(form.get("empresa_id"))
+    except (TypeError, ValueError):
+        empresa_id = current["empresa_id"] if current else None
+    if not empresa_id or not conn.execute("SELECT id FROM empresas WHERE id=?", (empresa_id,)).fetchone():
+        raise ValueError("Selecione uma empresa cadastrada.")
+    data_inicial = parse_date(form.get("data_inicial"))
+    data_final = parse_date(form.get("data_final"))
+    if not data_inicial or not data_final:
+        raise ValueError("As datas inicial e final são obrigatórias.")
+    if data_inicial > data_final:
+        raise ValueError("A data inicial não pode ser posterior à data final.")
+    status = (form.get("status") or COMPETENCIA_STATUS_ABERTA).strip().upper()
+    if status not in COMPETENCIA_STATUSES:
+        raise ValueError("Selecione um status válido para a competência.")
+    return {"empresa_id": empresa_id, "descricao": descricao, "data_inicial": data_inicial, "data_final": data_final, "status": status}
+
+def sugerir_competencia(conn, empresa_id, data_recebimento):
+    """Busca uma competência aberta que contenha a data de recebimento.
+
+    Contratos ainda não possuem data_recebimento nem competencia_id; a função
+    fica pronta para a integração futura sem alterar a regra atual.
+    """
+    data = parse_date(data_recebimento)
+    if not data or not empresa_id:
+        return None
+    return conn.execute("""SELECT id, empresa_id, descricao, data_inicial, data_final, status
+        FROM competencias WHERE empresa_id=? AND status=? AND data_inicial <= ? AND data_final >= ?
+        ORDER BY data_inicial DESC, id DESC LIMIT 1""",
+        (empresa_id, COMPETENCIA_STATUS_ABERTA, data, data)).fetchone()
+
+def empresa_id_por_cnpj(conn, cnpj):
+    if not cnpj:
+        return None
+    row = conn.execute("SELECT id FROM empresas WHERE cnpj=?", (re.sub(r"\D", "", str(cnpj)),)).fetchone()
+    return row["id"] if row else None
+
+def competencia_da_operacao(conn, raw_id, empresa_id, data_referencia, current_id=None):
+    """Valida a competência da operação e sugere uma aberta pela data."""
+    competencia_id = form_record_id(raw_id, current_id)
+    if not competencia_id:
+        sugerida = sugerir_competencia(conn, empresa_id, data_referencia)
+        competencia_id = sugerida["id"] if sugerida else None
+    if not competencia_id:
+        raise ValueError("Selecione uma competência para a operação.")
+    competencia = conn.execute("SELECT id FROM competencias WHERE id=? AND empresa_id=?", (competencia_id, empresa_id)).fetchone()
+    if not competencia:
+        raise ValueError("A competência selecionada não pertence à empresa da operação.")
+    return competencia_id
+
+def competencias_for_empresa(conn, empresa_id):
+    if empresa_id:
+        return conn.execute("""SELECT id, empresa_id, descricao, data_inicial, data_final, status
+            FROM competencias WHERE empresa_id=? ORDER BY data_inicial DESC, descricao""", (empresa_id,)).fetchall()
+    return conn.execute("""SELECT id, empresa_id, descricao, data_inicial, data_final, status
+        FROM competencias ORDER BY data_inicial DESC, descricao""").fetchall()
+
 @app.template_filter("pais_nome")
 def pais_nome(value):
     codigo = str(value or "").strip().upper()
@@ -502,6 +596,35 @@ def banco_id_for_form(conn, contrato=None, selected_id=None):
         ).fetchone()
         return registro["id"] if registro else None
     return None
+
+def banco_ids_for_contrato_form(conn, contrato=None, credito_id=None, liquidacao_id=None):
+    """Resolve os dois bancos para o formulário, mantendo contratos legados."""
+    credito_id = banco_id_for_form(conn, contrato, credito_id)
+    credito_nome = ((contrato["banco_credito"] if "banco_credito" in contrato.keys() else None) if contrato else None) or ((contrato["banco"] if contrato and "banco" in contrato.keys() else None) if contrato else None)
+    liquidacao_nome = ((contrato["banco_liquidacao"] if "banco_liquidacao" in contrato.keys() else None) if contrato else None) or credito_nome
+    if liquidacao_id in (None, "") and liquidacao_nome:
+        row = conn.execute("SELECT id FROM contrapartes WHERE nome=? COLLATE NOCASE", (liquidacao_nome,)).fetchone()
+        liquidacao_id = row["id"] if row else None
+    return credito_id, liquidacao_id
+
+def bancos_do_contrato(conn, form, current=None):
+    """Obtém crédito/liquidação sem perder o banco legado nem uma escolha manual."""
+    credito_raw = form.get("banco_credito_id")
+    if credito_raw in (None, ""):
+        credito_raw = form.get("banco_id")
+    credito_id, credito = banco_do_contrato(conn, credito_raw, current=current)
+    anterior_credito = ((current["banco_credito"] if "banco_credito" in current.keys() else None) or
+                        (current["banco"] if current else None)) if current else None
+    anterior_liquidacao = ((current["banco_liquidacao"] if "banco_liquidacao" in current.keys() else None) or
+                           anterior_credito) if current else None
+    liquidacao_raw = form.get("banco_liquidacao_id")
+    if liquidacao_raw in (None, ""):
+        liquidacao_id, liquidacao = credito_id, credito
+    else:
+        liquidacao_id, liquidacao = banco_do_contrato(conn, liquidacao_raw)
+        if current and anterior_liquidacao == anterior_credito and liquidacao == anterior_credito and credito != anterior_credito:
+            liquidacao_id, liquidacao = credito_id, credito
+    return credito_id, credito, liquidacao_id, liquidacao
 
 def cliente_do_contrato(conn, raw_id, current=None, legacy_name=None):
     current_id = current["cliente_id"] if current and "cliente_id" in current.keys() else None
@@ -640,6 +763,7 @@ def parse_ndf_form(form, conn, current=None):
         raise ValueError("O número/ID da operação é obrigatório.")
 
     cnpj = cnpj_da_empresa(conn, form.get("empresa_id"), current["cnpj"] if current else None)
+    empresa_id = form_record_id(form.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
     current_cliente_id = current["cliente_id"] if current and "cliente_id" in current.keys() else None
     current_contraparte_id = current["contraparte_id"] if current and "contraparte_id" in current.keys() else None
     cliente = cliente_da_selecao(
@@ -678,6 +802,10 @@ def parse_ndf_form(form, conn, current=None):
         raise ValueError("As datas de contratação e vencimento são obrigatórias.")
     if data_vencimento < data_contratacao:
         raise ValueError("A data de vencimento não pode ser anterior à data de contratação.")
+    competencia_id = competencia_da_operacao(
+        conn, form.get("competencia_id"), empresa_id, data_contratacao,
+        current["competencia_id"] if current and "competencia_id" in current.keys() else None,
+    )
 
     posicao = (form.get("posicao") or "").strip().upper()
     if posicao not in NDF_POSICOES:
@@ -690,6 +818,7 @@ def parse_ndf_form(form, conn, current=None):
     return {
         "numero_operacao": numero_operacao,
         "cnpj": cnpj,
+        "competencia_id": competencia_id,
         "cliente_id": cliente["id"] if cliente else None,
         "contraparte_id": contraparte_registro["id"] if contraparte_registro else None,
         "contraparte": contraparte,
@@ -894,16 +1023,230 @@ def index():
     conn.close()
     return render_template("index.html", dues=dues, contratos=contratos, resumo=resumo)
 
+def contratos_filtros(args):
+    empresa_id = form_record_id(args.get("empresa_id"))
+    competencia_id = form_record_id(args.get("competencia_id"))
+    where, params = [], []
+    if empresa_id:
+        where.append("e.id=?"); params.append(empresa_id)
+    if competencia_id:
+        where.append("c.competencia_id=?"); params.append(competencia_id)
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    return empresa_id, competencia_id, clause, params
+
+def consulta_contratos(conn, args):
+    empresa_id, competencia_id, clause, params = contratos_filtros(args)
+    rows = conn.execute(f"""
+        SELECT c.*, e.id AS empresa_id_filtro, e.razao_social AS empresa_razao_social,
+               e.apelido AS empresa_apelido, comp.descricao AS competencia_descricao,
+               COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0) AS vinculado
+        FROM contratos c
+        LEFT JOIN empresas e ON REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(c.cnpj,''),'.',''),'/',''),'-',''),' ','')=e.cnpj
+        LEFT JOIN competencias comp ON comp.id=c.competencia_id
+        LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
+        {clause}
+        GROUP BY c.id ORDER BY c.id DESC
+    """, params).fetchall()
+    return rows, empresa_id, competencia_id
+
 @app.route("/contratos")
 def lista_contratos():
     conn = db()
-    contratos = [decorate_contract(row) for row in conn.execute("""
-        SELECT c.*, COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0) AS vinculado
-        FROM contratos c LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
-        GROUP BY c.id ORDER BY c.id DESC
-    """).fetchall()]
+    rows, empresa_id, competencia_id = consulta_contratos(conn, request.args)
+    contratos = [decorate_contract(row) for row in rows]
+    empresas = conn.execute("SELECT id, razao_social, apelido, cnpj FROM empresas ORDER BY razao_social").fetchall()
+    competencias = conn.execute("SELECT id, descricao, data_inicial, data_final FROM competencias ORDER BY data_inicial DESC, descricao").fetchall()
     conn.close()
-    return render_template("contratos.html", contratos=contratos)
+    return render_template("contratos.html", contratos=contratos, empresas=empresas, competencias=competencias,
+                           empresa_id=empresa_id, competencia_id=competencia_id)
+
+@app.route("/contratos/exportar")
+def exportar_contratos():
+    import pandas as pd
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    conn = db()
+    rows, _, _ = consulta_contratos(conn, request.args)
+    contrato_ids = [row["id"] for row in rows]
+    vinculos = []
+    if contrato_ids:
+        placeholders = ",".join("?" for _ in contrato_ids)
+        vinculos = conn.execute(f"""
+            SELECT v.id, v.due_id, v.contrato_id, v.valor_vinculado, v.observacao,
+                   v.created_at, c.numero_contrato, c.moeda AS contrato_moeda,
+                   d.numero_due, d.chave_acesso, d.created_at AS data_lancamento,
+                   COALESCE(SUM(m.valor), v.valor_vinculado) AS valor_calculado
+            FROM due_contratos v
+            JOIN contratos c ON c.id=v.contrato_id
+            JOIN dues d ON d.id=v.due_id
+            LEFT JOIN due_movimentacoes m ON m.due_contrato_id=v.id AND m.tipo='VINCULACAO'
+            WHERE v.contrato_id IN ({placeholders})
+            GROUP BY v.id
+            ORDER BY c.numero_contrato, d.numero_due, v.id
+        """, contrato_ids).fetchall()
+    conn.close()
+
+    def excel_value(value, field=None):
+        if value is None:
+            return None
+        if field in {"data_contrato", "created_at", "data_lancamento"}:
+            return date_br(value)
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, bool):
+            return "Sim" if value else "Não"
+        return value
+
+    labels = {
+        "id": "ID", "numero_contrato": "Número do contrato", "banco": "Banco legado",
+        "banco_credito": "Banco de Crédito", "banco_liquidacao": "Banco de Liquidação",
+        "data_contrato": "Data do contrato", "cnpj": "CNPJ", "cliente": "Cliente",
+        "moeda": "Moeda", "valor_moeda": "Valor na moeda", "taxa_cambio": "Taxa de câmbio",
+        "valor_reais": "Valor em reais", "status": "Status", "saldo_zerado_manual": "Saldo zerado manualmente",
+        "observacao": "Observação", "created_at": "Criado em", "competencia_id": "Competência ID",
+        "empresa_id_filtro": "Empresa ID", "empresa_razao_social": "Empresa - Razão social",
+        "empresa_apelido": "Empresa - Apelido", "competencia_descricao": "Competência",
+        "vinculado": "Total vinculado", "saldo": "Saldo disponível",
+    }
+    contratos_data = []
+    for row in rows:
+        item = decorate_contract(row)
+        contratos_data.append({labels.get(key, key): excel_value(value, key) for key, value in item.items()})
+    vinculos_data = []
+    vinculo_labels = {
+        "id": "Vínculo ID", "due_id": "DU-E ID", "contrato_id": "Contrato ID",
+        "numero_contrato": "Número do contrato", "numero_due": "Número da DU-E",
+        "chave_acesso": "Chave de acesso", "data_lancamento": "Data de lançamento",
+        "contrato_moeda": "Moeda do contrato", "valor_vinculado": "Valor vinculado registrado",
+        "valor_calculado": "Valor vinculado calculado", "observacao": "Observação",
+        "created_at": "Vínculo criado em",
+    }
+    for row in vinculos:
+        vinculos_data.append({vinculo_labels.get(key, key): excel_value(value, key) for key, value in dict(row).items()})
+
+    contrato_columns = list(labels.values())
+    vinculo_columns = list(vinculo_labels.values())
+    contratos_df = pd.DataFrame(contratos_data, columns=contrato_columns)
+    vinculos_df = pd.DataFrame(vinculos_data, columns=vinculo_columns)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        contratos_df.to_excel(writer, index=False, sheet_name="Contratos")
+        vinculos_df.to_excel(writer, index=False, sheet_name="Vínculos")
+        for worksheet in writer.book.worksheets:
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1769AA")
+                cell.alignment = Alignment(horizontal="center")
+            for column in worksheet.columns:
+                letter = get_column_letter(column[0].column)
+                width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 12), 45)
+                worksheet.column_dimensions[letter].width = width
+    output.seek(0)
+    return send_file(output, as_attachment=True, download_name="contratos_exportacao.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+def build_contract_report_chart(rows, moeda):
+    """Prepara o gráfico diário com fechamento médio ponderado pelo volume."""
+    daily = {}
+    for row in rows:
+        if row["moeda"] != moeda or not row["data_contrato"]:
+            continue
+        item = daily.setdefault(row["data_contrato"], {"date": row["data_contrato"], "ptax": row["ptax_venda"], "volume": Decimal("0"), "weighted_rate": Decimal("0")})
+        if item["ptax"] is None and row["ptax_venda"] is not None:
+            item["ptax"] = row["ptax_venda"]
+        if row["taxa_cambio"] is not None and row["valor_moeda"] > 0:
+            item["volume"] += row["valor_moeda"]
+            item["weighted_rate"] += row["valor_moeda"] * row["taxa_cambio"]
+    daily = sorted(daily.values(), key=lambda item: item["date"])
+    for item in daily:
+        item["fechamento"] = item["weighted_rate"] / item["volume"] if item["volume"] else None
+    values = [value for item in daily for value in (item["ptax"], item["fechamento"]) if value is not None]
+    if not values:
+        return {"moeda": moeda, "points": []}
+    minimum, maximum = min(values), max(values)
+    padding = max((maximum - minimum) * Decimal("0.12"), Decimal("0.001"))
+    minimum -= padding; maximum += padding
+    count = max(len(daily) - 1, 1)
+    points = []
+    for index, item in enumerate(daily):
+        point = {"date": item["date"], "x": round(40 + index * 720 / count, 2)}
+        for key in ("ptax", "fechamento"):
+            value = item[key]
+            point[key] = round(float(160 - ((value - minimum) / (maximum - minimum) * 130)), 2) if value is not None else None
+        points.append(point)
+    segments = {"ptax": [], "fechamento": []}
+    for key in segments:
+        current = []
+        for point in points:
+            if point[key] is None:
+                if current: segments[key].append(current); current = []
+            else:
+                current.append(f"{point['x']},{point[key]}")
+        if current: segments[key].append(current)
+    return {"moeda": moeda, "points": points, "segments": segments}
+
+@app.route("/contratos/relatorios")
+def relatorios_contratos():
+    data_de = request.args.get("data_de", "").strip(); data_ate = request.args.get("data_ate", "").strip()
+    numero_contrato = request.args.get("numero_contrato", "").strip(); moeda = request.args.get("moeda", "").strip().upper()
+    where, params = [], []
+    try:
+        inicio = parse_date(data_de) if data_de else None; fim = parse_date(data_ate) if data_ate else None
+        if inicio and fim and inicio > fim:
+            raise ValueError("A data inicial não pode ser posterior à data final.")
+        if inicio: where.append("date(c.data_contrato) >= ?"); params.append(inicio)
+        if fim: where.append("date(c.data_contrato) <= ?"); params.append(fim)
+    except ValueError as exc:
+        flash(str(exc), "danger")
+    if numero_contrato: where.append("c.numero_contrato LIKE ?"); params.append(f"%{numero_contrato}%")
+    if moeda: where.append("c.moeda = ?"); params.append(moeda)
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    conn = db()
+    rows = conn.execute(f"""SELECT c.id, c.numero_contrato, c.data_contrato, c.moeda, c.valor_moeda, c.taxa_cambio, p.ptax_venda
+        FROM contratos c LEFT JOIN ptax_cotacoes p ON p.moeda=c.moeda AND p.data_cotacao=date(c.data_contrato)
+        {clause} ORDER BY c.data_contrato DESC, c.numero_contrato ASC""", params).fetchall()
+    conn.close()
+    contratos, monthly = [], {}
+    for row in rows:
+        item = dict(row); item["valor_moeda"] = decimal_value(item["valor_moeda"])
+        item["taxa_cambio"] = decimal_value(item["taxa_cambio"]) if item["taxa_cambio"] is not None else None
+        item["ptax_venda"] = decimal_value(item["ptax_venda"]) if item["ptax_venda"] is not None else None
+        # Resultado em R$: valor na moeda x (taxa de fechamento - PTAX venda).
+        item["resultado"] = item["valor_moeda"] * (item["taxa_cambio"] - item["ptax_venda"]) if item["taxa_cambio"] is not None and item["ptax_venda"] is not None else None
+        contratos.append(item); mes = (item["data_contrato"] or "")[:7]
+        if not mes: continue
+        resumo = monthly.setdefault(mes, {"contratos": 0, "volume": Decimal("0"), "resultado": Decimal("0"), "resultado_count": 0, "taxa_valor": Decimal("0"), "taxa_volume": Decimal("0"), "ptax_soma": Decimal("0"), "ptax_count": 0})
+        resumo["contratos"] += 1; resumo["volume"] += item["valor_moeda"]
+        if item["resultado"] is not None: resumo["resultado"] += item["resultado"]; resumo["resultado_count"] += 1
+        if item["taxa_cambio"] is not None: resumo["taxa_valor"] += item["taxa_cambio"] * item["valor_moeda"]; resumo["taxa_volume"] += item["valor_moeda"]
+        if item["ptax_venda"] is not None: resumo["ptax_soma"] += item["ptax_venda"]; resumo["ptax_count"] += 1
+    for resumo in monthly.values():
+        resumo["taxa_ponderada"] = resumo["taxa_valor"] / resumo["taxa_volume"] if resumo["taxa_volume"] else None
+        resumo["ptax_media"] = resumo["ptax_soma"] / resumo["ptax_count"] if resumo["ptax_count"] else None
+        resumo["resultado"] = resumo["resultado"] if resumo["resultado_count"] else None
+    daily = {}
+    for item in contratos:
+        mes = (item["data_contrato"] or "")[:10]
+        if not mes: continue
+        key = (mes, item["moeda"])
+        resumo = daily.setdefault(key, {"contratos": 0, "volume": Decimal("0"), "resultado": Decimal("0"), "resultado_count": 0, "taxa_valor": Decimal("0"), "taxa_volume": Decimal("0"), "ptax_soma": Decimal("0"), "ptax_count": 0})
+        resumo["contratos"] += 1; resumo["volume"] += item["valor_moeda"]
+        if item["resultado"] is not None: resumo["resultado"] += item["resultado"]; resumo["resultado_count"] += 1
+        if item["taxa_cambio"] is not None: resumo["taxa_valor"] += item["taxa_cambio"] * item["valor_moeda"]; resumo["taxa_volume"] += item["valor_moeda"]
+        if item["ptax_venda"] is not None: resumo["ptax_soma"] += item["ptax_venda"]; resumo["ptax_count"] += 1
+    def finish_summary(summary):
+        summary["taxa_ponderada"] = summary["taxa_valor"] / summary["taxa_volume"] if summary["taxa_volume"] else None
+        summary["ptax_media"] = summary["ptax_soma"] / summary["ptax_count"] if summary["ptax_count"] else None
+        summary["resultado"] = summary["resultado"] if summary["resultado_count"] else None
+        return summary
+    for summary in monthly.values(): finish_summary(summary)
+    for summary in daily.values(): finish_summary(summary)
+    moedas = sorted({item["moeda"] for item in contratos if item["moeda"]})
+    graficos = [build_contract_report_chart(contratos, item) for item in moedas]
+    return render_template("contratos_relatorios.html", contratos=contratos, mensais=sorted(monthly.items(), reverse=True), diarios=sorted(daily.items(), reverse=True), graficos=graficos, moedas=moedas, numero_contrato=numero_contrato, moeda=moeda, data_de=data_de, data_ate=data_ate)
 
 @app.route("/derivativos")
 def dashboard_derivativos():
@@ -952,14 +1295,14 @@ def novo_ndf():
                 INSERT INTO ndfs
                     (numero_operacao,cnpj,cliente_id,contraparte_id,contraparte,tipo,moeda,valor_contratado,
                      taxa_contratada,data_contratacao,data_vencimento,posicao,
-                     finalidade,observacao,status)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     finalidade,observacao,status,competencia_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 data["numero_operacao"], data["cnpj"], data["cliente_id"], data["contraparte_id"],
                 data["contraparte"], data["tipo"],
                 data["moeda"], data["valor_contratado"], data["taxa_contratada"],
                 data["data_contratacao"], data["data_vencimento"], data["posicao"],
-                data["finalidade"], data["observacao"], data["status"],
+                data["finalidade"], data["observacao"], data["status"], data["competencia_id"],
             ))
             ndf_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.commit()
@@ -979,10 +1322,16 @@ def novo_ndf():
     contrapartes = contrapartes_for_form(conn)
     cliente_id = form_record_id(request.form.get("cliente_id")) if request.method == "POST" else None
     contraparte_id = form_record_id(request.form.get("contraparte_id")) if request.method == "POST" else None
+    competencias = competencias_for_empresa(conn, empresa_id)
+    competencia_id = form_record_id(request.form.get("competencia_id")) if request.method == "POST" else None
+    if not competencia_id and empresa_id:
+        sugerida = sugerir_competencia(conn, empresa_id, request.form.get("data_contratacao") or date.today().isoformat())
+        competencia_id = sugerida["id"] if sugerida else None
     conn.close()
     return render_template("ndf_form.html", ndf=None, empresas=empresas, empresa_id=empresa_id,
                            clientes=clientes, cliente_id=cliente_id,
                            contrapartes=contrapartes, contraparte_id=contraparte_id,
+                           competencias=competencias, competencia_id=competencia_id,
                            ndf_tipos=NDF_TIPOS, ndf_posicoes=NDF_POSICOES, ndf_statuses=NDF_STATUSES)
 
 @app.route("/ndf/<int:ndf_id>")
@@ -1012,14 +1361,14 @@ def editar_ndf(ndf_id):
             conn.execute("""
                 UPDATE ndfs SET numero_operacao=?,cnpj=?,cliente_id=?,contraparte_id=?,contraparte=?,tipo=?,moeda=?,
                     valor_contratado=?,taxa_contratada=?,data_contratacao=?,data_vencimento=?,
-                    posicao=?,finalidade=?,observacao=?,status=?
+                    posicao=?,finalidade=?,observacao=?,status=?,competencia_id=?
                 WHERE id=?
             """, (
                 data["numero_operacao"], data["cnpj"], data["cliente_id"], data["contraparte_id"],
                 data["contraparte"], data["tipo"],
                 data["moeda"], data["valor_contratado"], data["taxa_contratada"],
                 data["data_contratacao"], data["data_vencimento"], data["posicao"],
-                data["finalidade"], data["observacao"], data["status"], ndf_id,
+                data["finalidade"], data["observacao"], data["status"], data["competencia_id"], ndf_id,
             ))
             conn.commit()
             conn.close()
@@ -1036,6 +1385,9 @@ def editar_ndf(ndf_id):
     )
     clientes = clientes_for_form(conn)
     contrapartes = contrapartes_for_form(conn)
+    empresa_id = empresa_id_por_cnpj(conn, ndf["cnpj"])
+    competencias = competencias_for_empresa(conn, empresa_id)
+    competencia_id = form_record_id(request.form.get("competencia_id"), ndf["competencia_id"] if "competencia_id" in ndf.keys() else None)
     cliente_id = form_record_id(
         request.form.get("cliente_id") if request.method == "POST" else ndf["cliente_id"]
     )
@@ -1047,6 +1399,7 @@ def editar_ndf(ndf_id):
     return render_template("ndf_form.html", ndf=ndf_data, empresas=empresas, empresa_id=empresa_id,
                            clientes=clientes, cliente_id=cliente_id,
                            contrapartes=contrapartes, contraparte_id=contraparte_id,
+                           competencias=competencias, competencia_id=competencia_id,
                            ndf_tipos=NDF_TIPOS, ndf_posicoes=NDF_POSICOES, ndf_statuses=NDF_STATUSES)
 
 @app.route("/ndf/<int:ndf_id>/excluir", methods=["POST"])
@@ -1211,6 +1564,76 @@ def cadastro_contrapartes():
     conn.close()
     return render_template("contrapartes.html", contrapartes=contrapartes, nome=nome)
 
+@app.route("/configuracoes/competencias", methods=["GET", "POST"])
+def cadastro_competencias():
+    conn = db()
+    competencia = None
+    if request.method == "POST":
+        try:
+            data = competencia_data(request.form, conn)
+            conn.execute("INSERT INTO competencias (empresa_id,descricao,data_inicial,data_final,status) VALUES (?,?,?,?,?)",
+                         (data["empresa_id"], data["descricao"], data["data_inicial"], data["data_final"], data["status"]))
+            conn.commit(); conn.close()
+            flash("Competência cadastrada com sucesso.", "success")
+            return redirect(url_for("cadastro_competencias"))
+        except sqlite3.IntegrityError:
+            conn.rollback(); flash("Já existe uma competência com essa descrição para a empresa selecionada.", "danger")
+        except ValueError as exc:
+            conn.rollback(); flash(str(exc), "danger")
+        competencia = dict(request.form)
+    competencias = conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
+        e.razao_social, e.apelido FROM competencias c JOIN empresas e ON e.id=c.empresa_id
+        ORDER BY c.data_inicial DESC, c.descricao""").fetchall()
+    empresas = conn.execute("SELECT id, razao_social, apelido, cnpj FROM empresas ORDER BY razao_social").fetchall()
+    conn.close()
+    return render_template("competencias.html", competencia=competencia, competencias=competencias, empresas=empresas, statuses=COMPETENCIA_STATUSES)
+
+@app.route("/configuracoes/competencias/<int:competencia_id>/editar", methods=["GET", "POST"])
+def editar_competencia(competencia_id):
+    conn = db()
+    competencia = conn.execute("SELECT * FROM competencias WHERE id=?", (competencia_id,)).fetchone()
+    if not competencia:
+        conn.close(); return "Competência não encontrada", 404
+    if request.method == "POST":
+        try:
+            data = competencia_data(request.form, conn, current=competencia)
+            conn.execute("UPDATE competencias SET empresa_id=?, descricao=?, data_inicial=?, data_final=?, status=? WHERE id=?",
+                         (data["empresa_id"], data["descricao"], data["data_inicial"], data["data_final"], data["status"], competencia_id))
+            conn.commit(); conn.close()
+            flash("Competência atualizada com sucesso.", "success")
+            return redirect(url_for("cadastro_competencias"))
+        except sqlite3.IntegrityError:
+            conn.rollback(); flash("Já existe uma competência com essa descrição para a empresa selecionada.", "danger")
+        except ValueError as exc:
+            conn.rollback(); flash(str(exc), "danger")
+        competencia = dict(request.form); competencia["id"] = competencia_id
+    empresas = conn.execute("SELECT id, razao_social, apelido, cnpj FROM empresas ORDER BY razao_social").fetchall()
+    competencias = conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
+        e.razao_social, e.apelido FROM competencias c JOIN empresas e ON e.id=c.empresa_id
+        ORDER BY c.data_inicial DESC, c.descricao""").fetchall()
+    conn.close()
+    return render_template("competencias.html", competencia=competencia, competencias=competencias, empresas=empresas, statuses=COMPETENCIA_STATUSES)
+
+@app.route("/configuracoes/competencias/<int:competencia_id>/encerrar", methods=["POST"])
+def encerrar_competencia(competencia_id):
+    conn = db()
+    if not conn.execute("SELECT id FROM competencias WHERE id=?", (competencia_id,)).fetchone():
+        conn.close(); return "Competência não encontrada", 404
+    conn.execute("UPDATE competencias SET status=? WHERE id=?", (COMPETENCIA_STATUS_ENCERRADA, competencia_id))
+    conn.commit(); conn.close()
+    flash("Competência encerrada com sucesso.", "success")
+    return redirect(url_for("cadastro_competencias"))
+
+@app.route("/configuracoes/competencias/<int:competencia_id>/excluir", methods=["POST"])
+def excluir_competencia(competencia_id):
+    conn = db()
+    if not conn.execute("SELECT id FROM competencias WHERE id=?", (competencia_id,)).fetchone():
+        conn.close(); return "Competência não encontrada", 404
+    conn.execute("DELETE FROM competencias WHERE id=?", (competencia_id,))
+    conn.commit(); conn.close()
+    flash("Competência excluída com sucesso.", "success")
+    return redirect(url_for("cadastro_competencias"))
+
 def optional_number(value):
     return parse_number(value) if value and str(value).strip() else None
 
@@ -1222,19 +1645,22 @@ def novo_contrato():
         try:
             valor_moeda = parse_number(f.get("valor_moeda"))
             ensure_non_negative_balance(valor_moeda, "O valor do contrato não pode ser negativo.")
-            banco_id, banco = banco_do_contrato(conn, f.get("banco_id"))
+            banco_id, banco, banco_liquidacao_id, banco_liquidacao = bancos_do_contrato(conn, f)
             cliente_id, cliente = cliente_do_contrato(
                 conn, f.get("cliente_id"), legacy_name=f.get("cliente")
             )
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"))
+            empresa_id = form_record_id(f.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
+            data_contrato = parse_date(f.get("data_contrato"))
+            competencia_id = competencia_da_operacao(conn, f.get("competencia_id"), empresa_id, data_contrato or date.today().isoformat())
             conn.execute("""INSERT INTO contratos
-                (numero_contrato,banco_id,banco,data_contrato,cnpj,cliente_id,cliente,moeda,valor_moeda,taxa_cambio,valor_reais,status,observacao)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (f["numero_contrato"].strip(), banco_id, banco,
-                 parse_date(f.get("data_contrato")), cnpj, cliente_id, cliente,
+                (numero_contrato,banco_id,banco,banco_credito,banco_liquidacao,data_contrato,cnpj,cliente_id,cliente,moeda,valor_moeda,taxa_cambio,valor_reais,status,observacao,competencia_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (f["numero_contrato"].strip(), banco_id, banco, banco, banco_liquidacao,
+                 data_contrato, cnpj, cliente_id, cliente,
                  f.get("moeda") or "USD", valor_moeda,
                  optional_number(f.get("taxa_cambio")), optional_number(f.get("valor_reais")),
-                 status_from_balance(valor_moeda), f.get("observacao")))
+                 status_from_balance(valor_moeda), f.get("observacao"), competencia_id))
             conn.commit(); conn.close()
             flash("Contrato cadastrado com sucesso.", "success")
             return redirect(url_for("lista_contratos"))
@@ -1247,25 +1673,36 @@ def novo_contrato():
     conn = db()
     empresas, empresa_id = empresas_for_form(conn, selected_id=request.form.get("empresa_id"))
     contrapartes = contrapartes_for_form(conn)
-    banco_id = banco_id_for_form(conn, selected_id=request.form.get("banco_id"))
+    banco_credito_id, banco_liquidacao_id = banco_ids_for_contrato_form(
+        conn, credito_id=request.form.get("banco_credito_id") or request.form.get("banco_id"),
+        liquidacao_id=request.form.get("banco_liquidacao_id"),
+    )
     clientes = clientes_for_form(conn)
     cliente_id = cliente_id_for_form(selected_id=request.form.get("cliente_id"))
+    competencias = competencias_for_empresa(conn, empresa_id)
+    competencia_id = form_record_id(request.form.get("competencia_id"))
+    if not competencia_id and empresa_id:
+        sugerida = sugerir_competencia(conn, empresa_id, request.form.get("data_contrato") or date.today().isoformat())
+        competencia_id = sugerida["id"] if sugerida else None
     conn.close()
     return render_template("contrato_form.html", contrato=None, empresas=empresas, empresa_id=empresa_id,
-                           contrapartes=contrapartes, banco_id=banco_id,
-                           clientes=clientes, cliente_id=cliente_id)
+                           contrapartes=contrapartes, banco_id=banco_credito_id,
+                           banco_credito_id=banco_credito_id, banco_liquidacao_id=banco_liquidacao_id,
+                           clientes=clientes, cliente_id=cliente_id,
+                           competencias=competencias, competencia_id=competencia_id)
 
-@app.route("/contrato/<int:contrato_id>")
-def detalhe_contrato(contrato_id):
-    conn = db()
+def carregar_detalhe_contrato(conn, contrato_id):
     contrato = conn.execute("""
-        SELECT c.*, cl.pais AS cliente_pais
+        SELECT c.*, cl.pais AS cliente_pais,
+               e.razao_social AS empresa_razao_social,
+               e.apelido AS empresa_apelido
         FROM contratos c
         LEFT JOIN clientes cl ON cl.id=c.cliente_id
+        LEFT JOIN empresas e ON e.cnpj=c.cnpj
         WHERE c.id=?
     """, (contrato_id,)).fetchone()
     if not contrato:
-        conn.close(); return "Contrato não encontrado", 404
+        return None
     vinculos = conn.execute("""
         SELECT v.*, m.id AS movimentacao_id, m.valor AS valor_movimentacao,
                d.chave_acesso, d.numero_due, d.created_at AS data_lancamento,
@@ -1275,10 +1712,30 @@ def detalhe_contrato(contrato_id):
         WHERE v.contrato_id=? ORDER BY v.id DESC
     """, (contrato_id,)).fetchall()
     summary = contract_summary(conn, contrato_id)
-    conn.close()
     contrato = dict(contrato)
     contrato.update({"vinculado": summary["vinculado"], "saldo": summary["saldo"], "status": summary["status"]})
+    return contrato, vinculos, summary
+
+@app.route("/contrato/<int:contrato_id>")
+def detalhe_contrato(contrato_id):
+    conn = db()
+    dados = carregar_detalhe_contrato(conn, contrato_id)
+    conn.close()
+    if not dados:
+        return "Contrato não encontrado", 404
+    contrato, vinculos, summary = dados
     return render_template("contrato_detalhe.html", contrato=contrato, vinculos=vinculos,
+                           vinculado=summary["vinculado"], saldo=summary["saldo"])
+
+@app.route("/contrato/<int:contrato_id>/relatorio")
+def relatorio_contrato(contrato_id):
+    conn = db()
+    dados = carregar_detalhe_contrato(conn, contrato_id)
+    conn.close()
+    if not dados:
+        return "Contrato não encontrado", 404
+    contrato, vinculos, summary = dados
+    return render_template("contrato_relatorio.html", contrato=contrato, vinculos=vinculos,
                            vinculado=summary["vinculado"], saldo=summary["saldo"])
 
 @app.route("/contrato/<int:contrato_id>/editar", methods=["GET", "POST"])
@@ -1297,18 +1754,21 @@ def editar_contrato(contrato_id):
                 decimal_value(valor_moeda) - linked,
                 "O valor do contrato não pode ficar abaixo do total já vinculado."
             )
-            banco_id, banco = banco_do_contrato(conn, f.get("banco_id"), current=contrato)
+            banco_id, banco, banco_liquidacao_id, banco_liquidacao = bancos_do_contrato(conn, f, current=contrato)
             cliente_id, cliente = cliente_do_contrato(
                 conn, f.get("cliente_id"), current=contrato, legacy_name=f.get("cliente")
             )
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"), contrato["cnpj"])
-            conn.execute("""UPDATE contratos SET numero_contrato=?,banco_id=?,banco=?,data_contrato=?,cnpj=?,cliente_id=?,cliente=?,moeda=?,
-                            valor_moeda=?,taxa_cambio=?,valor_reais=?,status=?,observacao=? WHERE id=?""",
-                (f["numero_contrato"].strip(), banco_id, banco, parse_date(f.get("data_contrato")), cnpj,
+            empresa_id = form_record_id(f.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
+            data_contrato = parse_date(f.get("data_contrato"))
+            competencia_id = competencia_da_operacao(conn, f.get("competencia_id"), empresa_id, data_contrato or date.today().isoformat(), contrato["competencia_id"] if "competencia_id" in contrato.keys() else None)
+            conn.execute("""UPDATE contratos SET numero_contrato=?,banco_id=?,banco=?,banco_credito=?,banco_liquidacao=?,data_contrato=?,cnpj=?,cliente_id=?,cliente=?,moeda=?,
+                            valor_moeda=?,taxa_cambio=?,valor_reais=?,status=?,observacao=?,competencia_id=? WHERE id=?""",
+                (f["numero_contrato"].strip(), banco_id, banco, banco, banco_liquidacao, data_contrato, cnpj,
                  cliente_id, cliente, f.get("moeda") or "USD", valor_moeda,
                  optional_number(f.get("taxa_cambio")), optional_number(f.get("valor_reais")),
                  STATUS_CONCLUIDO if resumo["saldo_zerado_manual"] else status_from_balance(contract_balance(valor_moeda, linked)),
-                 f.get("observacao"), contrato_id))
+                 f.get("observacao"), competencia_id, contrato_id))
             conn.commit(); conn.close()
             flash("Contrato atualizado com sucesso.", "success")
             return redirect(url_for("detalhe_contrato", contrato_id=contrato_id))
@@ -1320,19 +1780,24 @@ def editar_contrato(contrato_id):
         conn, contrato["cnpj"], request.form.get("empresa_id") if request.method == "POST" else None
     )
     contrapartes = contrapartes_for_form(conn)
-    banco_id = banco_id_for_form(
+    banco_credito_id, banco_liquidacao_id = banco_ids_for_contrato_form(
         conn, contrato,
-        request.form.get("banco_id") if request.method == "POST" else None,
+        request.form.get("banco_credito_id") if request.method == "POST" else None,
+        request.form.get("banco_liquidacao_id") if request.method == "POST" else None,
     )
     clientes = clientes_for_form(conn)
     cliente_id = cliente_id_for_form(
         contrato,
         request.form.get("cliente_id") if request.method == "POST" else None,
     )
+    competencias = competencias_for_empresa(conn, empresa_id)
+    competencia_id = form_record_id(request.form.get("competencia_id"), contrato["competencia_id"] if "competencia_id" in contrato.keys() else None)
     conn.close()
     return render_template("contrato_form.html", contrato=contrato, resumo=resumo, empresas=empresas, empresa_id=empresa_id,
-                           contrapartes=contrapartes, banco_id=banco_id,
-                           clientes=clientes, cliente_id=cliente_id)
+                           contrapartes=contrapartes, banco_id=banco_credito_id,
+                           banco_credito_id=banco_credito_id, banco_liquidacao_id=banco_liquidacao_id,
+                           clientes=clientes, cliente_id=cliente_id,
+                           competencias=competencias, competencia_id=competencia_id)
 
 @app.route("/contrato/<int:contrato_id>/zerar-saldo", methods=["POST"])
 def zerar_saldo(contrato_id):
@@ -1587,15 +2052,18 @@ def nova_due():
             ensure_non_negative_balance(valor_original, "O valor original da DU-E não pode ser negativo.")
             conn = db()
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"))
+            empresa_id = form_record_id(f.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
+            data_due = parse_date(f.get("data_due")) or date.today().isoformat()
+            competencia_id = competencia_da_operacao(conn, f.get("competencia_id"), empresa_id, data_due)
             if conn.execute("SELECT 1 FROM dues WHERE chave_acesso=?", (chave,)).fetchone():
                 raise ValueError("A Chave de Acesso já está cadastrada.")
             conn.execute("""INSERT INTO dues
-                (chave_acesso,numero_due,cnpj,cliente,moeda,valor_original,status,created_at,observacao)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (chave_acesso,numero_due,cnpj,cliente,moeda,valor_original,status,created_at,observacao,data_due,competencia_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (chave,f["numero_due"].strip(),cnpj,f.get("cliente"),
                  f.get("moeda") or "USD",valor_original, status_from_balance(valor_original),
                  launch_timestamp(),
-                 f.get("observacao")))
+                 f.get("observacao"), data_due, competencia_id))
             conn.commit()
             flash("DU-E cadastrada com sucesso.", "success")
             return redirect(url_for("index"))
@@ -1608,8 +2076,13 @@ def nova_due():
                 conn.close()
     conn = db()
     empresas, empresa_id = empresas_for_form(conn, selected_id=request.form.get("empresa_id"))
+    competencias = competencias_for_empresa(conn, empresa_id)
+    competencia_id = form_record_id(request.form.get("competencia_id"))
+    if not competencia_id and empresa_id:
+        sugerida = sugerir_competencia(conn, empresa_id, request.form.get("data_due") or date.today().isoformat())
+        competencia_id = sugerida["id"] if sugerida else None
     conn.close()
-    return render_template("due_form.html", due=None, empresas=empresas, empresa_id=empresa_id)
+    return render_template("due_form.html", due=None, empresas=empresas, empresa_id=empresa_id, competencias=competencias, competencia_id=competencia_id)
 
 @app.route("/due/<int:due_id>/editar", methods=["GET", "POST"])
 def editar_due(due_id):
@@ -1629,13 +2102,16 @@ def editar_due(due_id):
                 "O valor original da DU-E não pode ficar abaixo do total utilizado."
             )
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"), due["cnpj"])
+            empresa_id = form_record_id(f.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
+            data_due = parse_date(f.get("data_due")) or due["data_due"] or date.today().isoformat()
+            competencia_id = competencia_da_operacao(conn, f.get("competencia_id"), empresa_id, data_due, due["competencia_id"] if "competencia_id" in due.keys() else None)
             if conn.execute("SELECT 1 FROM dues WHERE chave_acesso=? AND id<>?", (chave, due_id)).fetchone():
                 raise ValueError("A Chave de Acesso já está cadastrada.")
-            conn.execute("""UPDATE dues SET chave_acesso=?,numero_due=?,cnpj=?,cliente=?,moeda=?,valor_original=?,observacao=?
+            conn.execute("""UPDATE dues SET chave_acesso=?,numero_due=?,cnpj=?,cliente=?,moeda=?,valor_original=?,observacao=?,data_due=?,competencia_id=?
                             WHERE id=?""",
                          (chave, f["numero_due"].strip(), cnpj,
                           f.get("cliente"), f.get("moeda") or "USD", valor_original,
-                          f.get("observacao"), due_id))
+                          f.get("observacao"), data_due, competencia_id, due_id))
             update_due_status(conn, due_id)
             conn.commit(); conn.close()
             flash("DU-E atualizada com sucesso.", "success")
@@ -1647,15 +2123,15 @@ def editar_due(due_id):
     empresas, empresa_id = empresas_for_form(
         conn, due["cnpj"], request.form.get("empresa_id") if request.method == "POST" else None
     )
+    competencias = competencias_for_empresa(conn, empresa_id)
+    competencia_id = form_record_id(request.form.get("competencia_id"), due["competencia_id"] if "competencia_id" in due.keys() else None)
     conn.close()
-    return render_template("due_form.html", due=due, empresas=empresas, empresa_id=empresa_id)
+    return render_template("due_form.html", due=due, empresas=empresas, empresa_id=empresa_id, competencias=competencias, competencia_id=competencia_id)
 
-@app.route("/due/<int:due_id>")
-def due_detalhe(due_id):
-    conn=db()
+def carregar_detalhe_due(conn, due_id):
     due_row=conn.execute("SELECT * FROM dues WHERE id=?", (due_id,)).fetchone()
     if not due_row:
-        conn.close(); return "DU-E não encontrada",404
+        return None
     mov=conn.execute("""SELECT m.*,c.numero_contrato,c.moeda AS contrato_moeda
                        FROM due_movimentacoes m
                        LEFT JOIN contratos c ON c.id=m.contrato_id
@@ -1672,10 +2148,39 @@ def due_detalhe(due_id):
                                   AND c.valor_moeda-COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0)>?
                                ORDER BY c.numero_contrato""", (float(SALDO_TOLERANCE),)).fetchall()]
     utilizado=due_effect(conn, due_id)
-    conn.close()
     due = decorate_due({**dict(due_row), "utilizado": utilizado})
     saldo=due["saldo"]
+    return due, mov, vinc, contratos, utilizado, saldo
+
+@app.route("/due/<int:due_id>")
+def due_detalhe(due_id):
+    conn=db()
+    dados=carregar_detalhe_due(conn, due_id)
+    conn.close()
+    if not dados:
+        return "DU-E não encontrada",404
+    due, mov, vinc, contratos, utilizado, saldo = dados
     return render_template("due_detalhe.html", due=due, mov=mov, vinc=vinc, contratos=contratos,
+                           utilizado=utilizado, saldo=saldo)
+
+@app.route("/due/<int:due_id>/relatorio")
+def relatorio_due(due_id):
+    conn=db()
+    dados=carregar_detalhe_due(conn, due_id)
+    conn.close()
+    if not dados:
+        return "DU-E não encontrada",404
+    due, mov, vinc, contratos, utilizado, saldo = dados
+    historico=[]
+    saldo_parcial=decimal_value(due.get("valor_original"))
+    for item in reversed(mov):
+        valor=decimal_value(item["valor"])
+        if item["tipo"] in ("UTILIZACAO", "VINCULACAO"):
+            saldo_parcial-=valor
+        elif item["tipo"] == "DEVOLUCAO":
+            saldo_parcial+=valor
+        historico.append({"mov": item, "saldo": saldo_parcial})
+    return render_template("due_relatorio.html", due=due, vinc=vinc, historico=historico,
                            utilizado=utilizado, saldo=saldo)
 
 @app.route("/due/<int:due_id>/movimentacao", methods=["POST"])
@@ -1831,10 +2336,11 @@ def importar_contratos():
             return redirect(url_for("index"))
         conn = db()
         query = """INSERT INTO contratos
-            (numero_contrato,banco,data_contrato,cnpj,cliente,moeda,valor_moeda,taxa_cambio,valor_reais,status)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            (numero_contrato,banco,banco_credito,banco_liquidacao,data_contrato,cnpj,cliente,moeda,valor_moeda,taxa_cambio,valor_reais,status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(numero_contrato) DO UPDATE SET
-            banco=excluded.banco,data_contrato=excluded.data_contrato,cnpj=excluded.cnpj,cliente=excluded.cliente,
+            banco=excluded.banco,banco_credito=excluded.banco_credito,banco_liquidacao=excluded.banco_liquidacao,
+            data_contrato=excluded.data_contrato,cnpj=excluded.cnpj,cliente=excluded.cliente,
             moeda=excluded.moeda,valor_moeda=excluded.valor_moeda,taxa_cambio=excluded.taxa_cambio,
             valor_reais=excluded.valor_reais"""
         contrato_ids = []
@@ -1859,7 +2365,11 @@ def importar_contratos():
                             decimal_value(valor_moeda) - linked,
                             "valor_moeda não pode ficar abaixo do total já vinculado"
                         )
-                    conn.execute(query, (numero, val("banco"), parse_date(val("data_contrato")), val("cnpj"), val("cliente"),
+                    banco_credito = val("banco_credito") or val("banco")
+                    banco_liquidacao = val("banco_liquidacao") or banco_credito
+                    banco_credito = str(banco_credito).strip() if banco_credito is not None else None
+                    banco_liquidacao = str(banco_liquidacao).strip() if banco_liquidacao is not None else banco_credito
+                    conn.execute(query, (numero, banco_credito, banco_credito, banco_liquidacao, parse_date(val("data_contrato")), val("cnpj"), val("cliente"),
                                          str(val("moeda", "USD") or "USD").strip().upper(), float(valor_moeda),
                                          optional_number(val("taxa_cambio")),
                                          optional_number(val("valor_reais")),
@@ -1887,7 +2397,7 @@ def importar_contratos():
 @app.route("/contratos/modelo")
 def modelo_contratos():
     import pandas as pd
-    df=pd.DataFrame(columns=["numero_contrato","banco","data_contrato","cnpj","cliente","moeda","valor_moeda","taxa_cambio","valor_reais"])
+    df=pd.DataFrame(columns=["numero_contrato","banco_credito","banco_liquidacao","data_contrato","cnpj","cliente","moeda","valor_moeda","taxa_cambio","valor_reais"])
     out=io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df.to_excel(writer,index=False,sheet_name="Contratos")

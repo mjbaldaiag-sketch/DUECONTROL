@@ -171,6 +171,22 @@
     select.addEventListener('change', update);
     update();
   });
+  document.querySelectorAll('[data-competencia-select]').forEach((select) => {
+    const form = select.closest('form');
+    const empresa = form ? form.querySelector('select[name="empresa_id"]') : null;
+    if (!empresa) return;
+    const updateCompetencias = () => {
+      const empresaId = empresa.value;
+      [...select.options].forEach((option) => {
+        if (!option.dataset.competenciaEmpresa) return;
+        option.hidden = Boolean(empresaId) && option.dataset.competenciaEmpresa !== empresaId;
+      });
+      const selected = select.selectedOptions[0];
+      if (selected && selected.hidden) select.value = '';
+    };
+    empresa.addEventListener('change', updateCompetencias);
+    updateCompetencias();
+  });
   document.querySelectorAll('[data-money]').forEach((input) => {
     input.addEventListener('blur', () => formatMoney(input));
     input.addEventListener('change', () => formatMoney(input));
@@ -179,6 +195,20 @@
     input.addEventListener('blur', () => formatRate(input));
     input.addEventListener('change', () => formatRate(input));
   });
+
+  const bancoCredito = document.querySelector('[data-banco-credito]');
+  const bancoLiquidacao = document.querySelector('[data-banco-liquidacao]');
+  if (bancoCredito && bancoLiquidacao) {
+    let liquidacaoSegueCredito = !bancoLiquidacao.value || bancoLiquidacao.value === bancoCredito.value;
+    const sincronizarLiquidacao = () => {
+      if (liquidacaoSegueCredito) bancoLiquidacao.value = bancoCredito.value;
+    };
+    bancoCredito.addEventListener('change', sincronizarLiquidacao);
+    bancoLiquidacao.addEventListener('change', () => {
+      liquidacaoSegueCredito = !bancoLiquidacao.value || bancoLiquidacao.value === bancoCredito.value;
+    });
+    sincronizarLiquidacao();
+  }
 
   const contractSelect = document.querySelector('[data-contract-select]');
   if (contractSelect) {

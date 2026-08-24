@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="print-report">
+  <div class="report-actions">
+    <button class="btn" type="button" onclick="window.print()">Imprimir</button>
+    <a class="btn secondary" href="{{ url_for('detalhe_contrato', contrato_id=contrato.id) }}">Voltar</a>
+  </div>
+
+  <div class="report-title">
+    <h1>Relatório do contrato de câmbio</h1>
+    <p class="muted">Emitido em {{ now|date_br if now is defined else '-' }}</p>
+  </div>
+
+  <section class="report-section">
+    <h2>Identificação</h2>
+    <div class="report-data">
+      <div><span>Tipo da operação</span><strong>Não informado</strong></div>
+      <div><span>Número do contrato</span><strong>{{ contrato.numero_contrato or '-' }}</strong></div>
+      <div><span>Status</span><strong><span class="status {{ contrato.status|status_class }}">{{ contrato.status or '-' }}</span></strong></div>
+      <div><span>Empresa</span><strong>{{ contrato.empresa_apelido or contrato.empresa_razao_social or contrato.cnpj or '-' }}</strong></div>
+      <div><span>Cliente</span><strong>{{ contrato.cliente or '-' }}{% if contrato.cliente_pais %} — {{ contrato.cliente_pais|pais_nome }}{% endif %}</strong></div>
+      <div><span>CNPJ</span><strong>{{ contrato.cnpj or '-' }}</strong></div>
+      <div><span>Banco de Crédito</span><strong>{{ contrato.banco_credito or contrato.banco or '-' }}</strong></div>
+      <div><span>Banco de Liquidação</span><strong>{{ contrato.banco_liquidacao or contrato.banco_credito or contrato.banco or '-' }}</strong></div>
+      <div><span>Moeda</span><strong>{{ contrato.moeda or '-' }}</strong></div>
+      <div><span>Data do contrato</span><strong>{{ contrato.data_contrato|date_br or '-' }}</strong></div>
+    </div>
+  </section>
+
+  <section class="report-section">
+    <h2>Valores</h2>
+    <div class="report-data">
+      <div><span>Valor na moeda</span><strong>{{ contrato.valor_moeda|money }}</strong></div>
+      <div><span>Valor em reais</span><strong>{{ contrato.valor_reais|money if contrato.valor_reais is not none else '-' }}</strong></div>
+      <div><span>Taxa de câmbio</span><strong>{{ contrato.taxa_cambio|rate if contrato.taxa_cambio is not none else '-' }}</strong></div>
+      <div><span>Total vinculado</span><strong>{{ vinculado|money }}</strong></div>
+      <div><span>Saldo</span><strong>{{ saldo|money }}</strong></div>
+    </div>
+  </section>
+
+  <section class="report-section">
+    <h2>Observações</h2>
+    <div class="report-note">{{ contrato.observacao or '-' }}</div>
+  </section>
+
+  <section class="report-section">
+    <h2>Vínculos efetuados com DU-E</h2>
+    <table>
+      <thead><tr><th>DU-E</th><th>Chave de acesso</th><th>Data de lançamento</th><th>Cliente</th><th>Valor vinculado</th><th>Observação</th></tr></thead>
+      <tbody>
+        {% for v in vinculos %}
+        <tr>
+          <td>{{ v.numero_due or '-' }}</td>
+          <td>{{ v.chave_acesso or '-' }}</td>
+          <td>{{ v.data_lancamento|date_br or '-' }}</td>
+          <td>{{ v.cliente_due or '-' }}</td>
+          <td>{{ v.valor_movimentacao|money if v.valor_movimentacao is not none else v.valor_vinculado|money }}</td>
+          <td>{{ v.observacao or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="empty">Este contrato ainda não está vinculado a nenhuma DU-E.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</div>
+{% endblock %}

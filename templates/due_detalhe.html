@@ -1,6 +1,6 @@
 {% extends "base.html" %}{% block content %}
 <h1>DU-E {{due.numero_due}}</h1><p><b>DU-E:</b> {{due.numero_due}} &nbsp; <b>Chave de Acesso:</b> {{due.chave_acesso or 'Não informada (registro legado)'}} &nbsp; <b>Cliente:</b> {{due.cliente or '-'}} &nbsp; <b>Data de Lançamento:</b> {{due.created_at|date_br or '-'}} &nbsp; <b>Valor:</b> {{due.valor_original|money}} {{due.moeda}}</p>
-<div class="actions"><a class="btn" href="{{url_for('editar_due',due_id=due.id)}}">Editar DU-E</a></div>
+<div class="actions"><a class="btn" href="{{url_for('relatorio_due',due_id=due.id)}}" target="_blank" rel="noopener noreferrer">Emitir Relatório</a><a class="btn" href="{{url_for('editar_due',due_id=due.id)}}">Editar DU-E</a></div>
 <div class="cards"><div>Original<strong>{{due.valor_original|money}}</strong></div><div>Utilizado<strong>{{utilizado|money}}</strong></div><div>Saldo disponível<strong>{{saldo|money}}</strong></div><div>Status<strong><span class="status {{ due.status|status_class }}">{{ due.status }}</span></strong></div></div>
 <h2>Movimentações</h2><form method="post" action="{{url_for('movimentacao',due_id=due.id)}}" class="form inline-form">
 <input name="data_movimentacao" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" required><select name="tipo"><option>UTILIZACAO</option><option>DEVOLUCAO</option></select>

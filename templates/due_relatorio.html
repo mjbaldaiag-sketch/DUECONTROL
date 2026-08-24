@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="print-report">
+  <div class="report-actions">
+    <button class="btn" type="button" onclick="window.print()">Imprimir</button>
+    <a class="btn secondary" href="{{ url_for('due_detalhe', due_id=due.id) }}">Voltar</a>
+  </div>
+
+  <div class="report-title">
+    <h1>Relatório da DU-E</h1>
+    <p class="muted">Histórico de consumo e vinculações</p>
+  </div>
+
+  <section class="report-section">
+    <h2>Identificação</h2>
+    <div class="report-data">
+      <div><span>Número da DU-E</span><strong>{{ due.numero_due or '-' }}</strong></div>
+      <div><span>Chave de acesso</span><strong>{{ due.chave_acesso or '-' }}</strong></div>
+      <div><span>Status</span><strong><span class="status {{ due.status|status_class }}">{{ due.status or '-' }}</span></strong></div>
+      <div><span>Cliente</span><strong>{{ due.cliente or '-' }}</strong></div>
+      <div><span>Moeda</span><strong>{{ due.moeda or '-' }}</strong></div>
+      <div><span>Data de lançamento</span><strong>{{ due.created_at|date_br or '-' }}</strong></div>
+    </div>
+  </section>
+
+  <section class="report-section">
+    <h2>Resumo financeiro</h2>
+    <div class="report-data">
+      <div><span>Valor original</span><strong>{{ due.valor_original|money }}</strong></div>
+      <div><span>Total utilizado</span><strong>{{ utilizado|money }}</strong></div>
+      <div><span>Saldo disponível</span><strong>{{ saldo|money }}</strong></div>
+    </div>
+  </section>
+
+  <section class="report-section">
+    <h2>Histórico cronológico de consumo</h2>
+    <table>
+      <thead><tr><th>Data</th><th>Tipo</th><th>Contrato</th><th>Documento</th><th>Valor</th><th>Saldo após a movimentação</th><th>Observação</th></tr></thead>
+      <tbody>
+        {% for item in historico %}{% set m = item.mov %}
+        <tr>
+          <td>{{ m.data_movimentacao|date_br or '-' }}</td>
+          <td>{{ m.tipo or '-' }}</td>
+          <td>{{ m.numero_contrato or '-' }}</td>
+          <td>{{ m.documento or '-' }}</td>
+          <td>{{ m.valor|money }}</td>
+          <td>{{ item.saldo|money }}</td>
+          <td>{{ m.observacao or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="empty">Nenhuma movimentação registrada para esta DU-E.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="report-section">
+    <h2>Vínculos com contratos</h2>
+    <table>
+      <thead><tr><th>Contrato</th><th>Moeda</th><th>Valor vinculado</th><th>Observação</th></tr></thead>
+      <tbody>
+        {% for v in vinc %}
+        <tr><td>{{ v.numero_contrato or '-' }}</td><td>{{ v.moeda or '-' }}</td><td>{{ v.valor_calculado|money }}</td><td>{{ v.observacao or '-' }}</td></tr>
+        {% else %}
+        <tr><td colspan="4" class="empty">Nenhum vínculo efetuado com contrato.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</div>
+{% endblock %}
