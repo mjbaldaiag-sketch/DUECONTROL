@@ -16,6 +16,8 @@ class InvoiceFlowTests(unittest.TestCase):
         conn = app.db()
         conn.execute("INSERT INTO empresas (razao_social, cnpj, apelido) VALUES (?,?,?)",
                      ("Empresa Teste", "45765914000181", "Teste"))
+        conn.execute("INSERT INTO competencias (empresa_id, descricao, data_inicial, data_final) VALUES (?,?,?,?)",
+                     (1, "Agosto/2026", "2026-08-01", "2026-08-31"))
         conn.execute("INSERT INTO clientes (nome, pais) VALUES (?,?)", ("Cliente Teste", "US"))
         conn.execute("INSERT INTO contrapartes (nome) VALUES (?)", ("Banco Teste",))
         conn.execute("INSERT INTO dues (numero_due, chave_acesso, moeda, valor_original) VALUES (?,?,?,?)",
@@ -31,7 +33,7 @@ class InvoiceFlowTests(unittest.TestCase):
     def _create_invoice(self, number="INV-001", value="1000,00", commercial=None):
         data = {
             "empresa_id": "1", "numero_invoice": number, "tipo_documento": "COMMERCIAL_INVOICE",
-            "cliente_id": "1", "data_emissao": "01/08/2026", "moeda": "USD",
+            "competencia_id": "1", "cliente_id": "1", "data_emissao": "01/08/2026", "moeda": "USD",
             "valor_moeda": value,
         }
         if commercial is not None:
@@ -48,6 +50,52 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(app.invoice_status_from_totals(1000, 800, 0), app.INVOICE_STATUS_PARCIAL)
         self.assertEqual(app.invoice_status_from_totals(1000, 1000, 600), app.INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO)
         self.assertEqual(app.invoice_status_from_totals(1000, 1000, 1000), app.INVOICE_STATUS_LIQUIDADA)
+
+    def test_invoice_status_can_be_assigned_and_is_preserved_after_movements(self):
+        invoice_id = self._create_invoice()
+        response = self.client.post(f"/invoice/{invoice_id}/editar", data={
+            "empresa_id": "1", "numero_invoice": "INV-001", "tipo_documento": "COMMERCIAL_INVOICE",
+            "competencia_id": "1", "cliente_id": "1", "data_emissao": "01/08/2026", "moeda": "USD",
+            "valor_moeda": "1000,00", "status": "RECEBIDO AGUARDANDO CAMBIO",
+        })
+        self.assertEqual(response.status_code, 302)
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "1000,00",
+        })
+        conn = app.db()
+        invoice = conn.execute("SELECT status, status_manual FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+        self.assertEqual(invoice["status"], app.INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO)
+        self.assertEqual(invoice["status_manual"], 1)
+        conn.close()
+
+    def test_invoice_status_is_supported_by_excel_model_and_import(self):
+        import pandas as pd
+
+        model = pd.read_excel(BytesIO(self.client.get("/invoices/modelo").data))
+        self.assertIn("status", model.columns)
+        frame = pd.DataFrame([{
+            "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-STATUS-IMPORT",
+            "tipo_documento": "COMMERCIAL INVOICE", "competencia": "Agosto/2026",
+            "data_emissao": "01/08/2026", "moeda": "USD", "valor_invoice": "100,00",
+            "status": "LIQUIDADA",
+        }])
+        output = BytesIO()
+        frame.to_excel(output, index=False)
+        output.seek(0)
+        response = self.client.post("/invoices/importar", data={"arquivo": (output, "status.xlsx")},
+                                    content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("LIQUIDADA", response.get_data(as_text=True))
+        with self.client.session_transaction() as session:
+            token = session["invoice_import_stage"]
+        self.assertEqual(self.client.post("/invoices/importar/confirmar", data={"stage_token": token}).status_code, 302)
+        conn = app.db()
+        invoice = conn.execute(
+            "SELECT status, status_manual FROM invoices WHERE numero_invoice='INV-STATUS-IMPORT'"
+        ).fetchone()
+        self.assertEqual(invoice["status"], app.INVOICE_STATUS_LIQUIDADA)
+        self.assertEqual(invoice["status_manual"], 1)
+        conn.close()
 
     def test_schema_bootstrap_is_idempotent_and_preserves_existing_domains(self):
         conn = app.db()
@@ -74,7 +122,7 @@ class InvoiceFlowTests(unittest.TestCase):
         ))
         conn.close()
 
-    def test_schema_migrates_v1_to_v2_without_recreating_existing_contracts(self):
+    def test_schema_migrates_v1_to_v3_without_recreating_existing_contracts(self):
         migration_path = Path(tempfile.mktemp(prefix="duecontrol_invoice_migration_", suffix=".db"))
         previous_db = app.DB
         try:
@@ -126,7 +174,7 @@ class InvoiceFlowTests(unittest.TestCase):
 
             app.init_db()
             conn = app.db()
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertIsNotNone(conn.execute(
                 "SELECT id FROM invoices WHERE numero_invoice='INV-V1'"
             ).fetchone())
@@ -137,6 +185,9 @@ class InvoiceFlowTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM clientes").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM dues").fetchone()[0], 1)
             self.assertIn("contrato_comercial", {
+                row[1] for row in conn.execute("PRAGMA table_info(invoices)").fetchall()
+            })
+            self.assertIn("competencia_id", {
                 row[1] for row in conn.execute("PRAGMA table_info(invoices)").fetchall()
             })
             conn.close()
@@ -203,6 +254,7 @@ class InvoiceFlowTests(unittest.TestCase):
              "cliente_pais": "Brasil", "data_emissao": "01/08/2026", "moeda": "USD",
              "valor_invoice": "100,00"},
         ])
+        frame["competencia"] = "Agosto/2026"
         output = BytesIO()
         frame.to_excel(output, index=False)
         output.seek(0)
@@ -235,6 +287,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "tipo_documento": "COMMERCIAL INVOICE", "cliente": "  Novo   Cliente  ",
             "data_emissao": "01/08/2026", "moeda": "USD", "valor_invoice": "100,00",
         }])
+        frame["competencia"] = "Agosto/2026"
         output = BytesIO()
         frame.to_excel(output, index=False)
         output.seek(0)
@@ -405,6 +458,7 @@ class InvoiceFlowTests(unittest.TestCase):
              "contrato_comercial": "COM-SPLIT", "numero_contrato_cambio": "C-SPLIT-B",
              "valor_alocado": "600,00", "taxa_cambio": "5,10"},
         ])
+        frame["competencia"] = "Agosto/2026"
         output = BytesIO()
         frame.to_excel(output, index=False)
         output.seek(0)
@@ -450,6 +504,7 @@ class InvoiceFlowTests(unittest.TestCase):
              "contrato_comercial": "COM-GROUP", "numero_contrato_cambio": "C-GROUP",
              "valor_alocado": "200,00", "taxa_cambio": "5,10"},
         ])
+        frame["competencia"] = "Agosto/2026"
         output = BytesIO()
         frame.to_excel(output, index=False)
         output.seek(0)
@@ -479,6 +534,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "contrato_comercial": "COM-REPROCESSED", "numero_contrato": "C-GROUP",
             "valor_alocado": "250,00", "taxa_cambio": "5,10",
         }])
+        replacement["competencia"] = "Agosto/2026"
         replacement_output = BytesIO()
         replacement.to_excel(replacement_output, index=False)
         replacement_output.seek(0)
@@ -560,6 +616,7 @@ class InvoiceFlowTests(unittest.TestCase):
              "data_emissao": "01/08/2026", "moeda": "USD", "valor_invoice": "1000,00",
              "numero_contrato": "C-CONFLICT", "valor_alocado": "500,00", "taxa_cambio": "5,20"},
         ])
+        frame["competencia"] = "Agosto/2026"
         output = BytesIO()
         frame.to_excel(output, index=False)
         output.seek(0)
@@ -584,6 +641,7 @@ class InvoiceFlowTests(unittest.TestCase):
              "contrato_comercial": "COM-B", "numero_contrato_cambio": "C-COM-CONFLICT",
              "valor_alocado": "500,00", "taxa_cambio": "5,10"},
         ])
+        frame["competencia"] = "Agosto/2026"
         output = BytesIO()
         frame.to_excel(output, index=False)
         output.seek(0)
@@ -597,6 +655,100 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(conn.execute(
             "SELECT COUNT(*) FROM contratos WHERE numero_contrato='C-COM-CONFLICT'"
         ).fetchone()[0], 0)
+        conn.close()
+
+    def test_invoice_import_model_requires_competencia_and_removes_unused_columns(self):
+        import pandas as pd
+
+        response = self.client.get("/invoices/modelo")
+        self.assertEqual(response.status_code, 200)
+        model = pd.read_excel(BytesIO(response.data))
+        self.assertIn("competencia", model.columns)
+        self.assertNotIn("cliente_pais", model.columns)
+        self.assertNotIn("valor_alocado", model.columns)
+        rows = app.prepare_invoice_import_rows(pd.DataFrame([{
+            "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-MODEL-CHECK",
+            "tipo_documento": "COMMERCIAL INVOICE", "competencia": "Agosto/2026",
+            "valor_invoice": "100,00",
+        }]), pd)
+        self.assertNotIn("cliente_pais", rows[0])
+        self.assertNotIn("valor_alocado", rows[0])
+
+        frame = pd.DataFrame([{
+            "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-WITHOUT-COMPETENCE",
+            "tipo_documento": "COMMERCIAL INVOICE", "data_emissao": "01/08/2026",
+            "moeda": "USD", "valor_invoice": "100,00",
+        }])
+        output = BytesIO()
+        frame.to_excel(output, index=False)
+        output.seek(0)
+        response = self.client.post("/invoices/importar", data={"arquivo": (output, "missing-competence.xlsx")},
+                                    content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 302)
+        with self.client.session_transaction() as session:
+            self.assertNotIn("invoice_import_stage", session)
+
+    def test_invoice_import_associates_competence_by_period_and_preserves_invoice_only_model(self):
+        import pandas as pd
+
+        frame = pd.DataFrame([{
+            "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-COMPETENCE",
+            "tipo_documento": "COMMERCIAL INVOICE", "cliente": "Cliente Teste",
+            "contrato_comercial": "COM-001", "competencia": "08/2026",
+            "data_emissao": "10/08/2026", "moeda": "USD", "valor_invoice": "100,00",
+        }])
+        output = BytesIO()
+        frame.to_excel(output, index=False)
+        output.seek(0)
+        response = self.client.post("/invoices/importar", data={"arquivo": (output, "competence.xlsx")},
+                                    content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Competências não cadastradas", response.get_data(as_text=True))
+        with self.client.session_transaction() as session:
+            token = session["invoice_import_stage"]
+        response = self.client.post("/invoices/importar/confirmar", data={"stage_token": token})
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        invoice = conn.execute("SELECT competencia_id FROM invoices WHERE numero_invoice='INV-COMPETENCE'").fetchone()
+        self.assertEqual(invoice["competencia_id"], 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM contratos").fetchone()[0], 0)
+        conn.close()
+
+    def test_invoice_import_suggests_new_competence_by_company_and_creates_on_confirmation(self):
+        import pandas as pd
+
+        frame = pd.DataFrame([{
+            "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-NEW-COMPETENCE",
+            "tipo_documento": "COMMERCIAL INVOICE", "cliente": "Cliente Teste",
+            "competencia": "Janeiro/2032", "data_emissao": "01/01/2032",
+            "moeda": "USD", "valor_invoice": "100,00",
+        }])
+        output = BytesIO()
+        frame.to_excel(output, index=False)
+        output.seek(0)
+        response = self.client.post("/invoices/importar", data={"arquivo": (output, "new-competence.xlsx")},
+                                    content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        preview = response.get_data(as_text=True)
+        self.assertIn("Competências não cadastradas", preview)
+        self.assertIn("Janeiro/2032", preview)
+        with self.client.session_transaction() as session:
+            token = session["invoice_import_stage"]
+        response = self.client.post("/invoices/importar/confirmar", data={
+            "stage_token": token, "competencia_nova_confirmar_p1": "1",
+            "competencia_nova_descricao_p1": "Janeiro/2032",
+            "competencia_nova_data_inicial_p1": "01/01/2032",
+            "competencia_nova_data_final_p1": "31/01/2032",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        competence = conn.execute(
+            "SELECT id FROM competencias WHERE empresa_id=1 AND descricao='Janeiro/2032'"
+        ).fetchone()
+        self.assertIsNotNone(competence)
+        self.assertEqual(conn.execute(
+            "SELECT competencia_id FROM invoices WHERE numero_invoice='INV-NEW-COMPETENCE'"
+        ).fetchone()[0], competence["id"])
         conn.close()
 
 

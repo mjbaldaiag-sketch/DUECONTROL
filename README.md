@@ -32,7 +32,13 @@ Os contratos de câmbio são consolidados por número a partir das Invoices vinc
 
 ## Excel de Invoices
 
-Use "Baixar modelo Excel" na Gestão de Invoices. A planilha tem uma linha por alocação Invoice↔Contrato Câmbio, com `contrato_comercial` como referência da Invoice e `numero_contrato_cambio` para agrupar as Invoices no mesmo contrato financeiro.
+A coluna `status` é opcional para manter compatibilidade com planilhas antigas e aceita `AGUARDANDO RECEBIMENTO`, `RECEBIDO AGUARDANDO CAMBIO` ou `LIQUIDADA`. Quando preenchida, a atribuição é preservada no cadastro; quando vazia, a Invoice começa em `AGUARDANDO RECEBIMENTO`.
+
+Use "Baixar modelo Excel" na Gestão de Invoices. A planilha tem uma linha por Invoice e exige `competencia`. Os campos `cliente_pais` e `valor_alocado` não fazem parte do modelo: o país de um cliente novo é escolhido na prévia e os vínculos de câmbio são feitos no detalhe da Invoice.
+
+A competência é localizada por empresa, aceitando variações de descrição quando o período informado for compatível com uma competência cadastrada. Quando não houver competência exata, próxima ou pertinente à data da Invoice, a prévia sugere o cadastro de uma nova competência para a empresa, sem gravá-la até a confirmação.
+
+Planilhas antigas que ainda contenham `valor_alocado` continuam sendo aceitas somente para reprocessamento compatível; o modelo novo não gera essa coluna e não cria vínculos de câmbio sem ela.
 
 Invoices existentes são reprocessadas atualizando seus dados comerciais e substituindo somente suas alocações importadas; recebimentos e vínculos com DU-E são preservados.
 
