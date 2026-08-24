@@ -830,6 +830,19 @@ class InvoiceFlowTests(unittest.TestCase):
         with self.client.session_transaction() as session:
             self.assertNotIn("invoice_import_stage", session)
 
+    def test_invoice_import_accepts_proforma_invoice_type(self):
+        import pandas as pd
+
+        frame = pd.DataFrame([{
+            "empresa": "45.765.914/0001-81", "invoice": "INV-PROFORMA",
+            "tipo": "PROFORMA INVOICE", "competencia": "Agosto/2026",
+            "moeda": "USD", "valor_moeda": "100,00",
+        }])
+        frame.columns = app.normalize_invoice_import_columns(frame.columns)
+        rows = app.prepare_invoice_import_rows(frame, pd)
+
+        self.assertEqual(rows[0]["tipo_documento"], "PROFORMA")
+
     def test_invoice_import_associates_competence_by_period_and_preserves_invoice_only_model(self):
         import pandas as pd
 

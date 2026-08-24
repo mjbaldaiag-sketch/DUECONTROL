@@ -4609,7 +4609,8 @@ def normalize_invoice_type(value):
     text_value = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
     text_value = re.sub(r"[^A-Z0-9]+", "_", text_value.upper()).strip("_")
     return {
-        "PROFORMA": "PROFORMA", "COMMERCIAL_INVOICE": "COMMERCIAL_INVOICE",
+        "PROFORMA": "PROFORMA", "PROFORMA_INVOICE": "PROFORMA",
+        "COMMERCIAL_INVOICE": "COMMERCIAL_INVOICE",
         "COMMERCIAL": "COMMERCIAL_INVOICE", "SERVICE_INVOICE": "SERVICE_INVOICE",
         "SERVICE": "SERVICE_INVOICE", "DEBIT_NOTE": "DEBIT_NOTE", "DEBIT": "DEBIT_NOTE",
     }.get(text_value, text_value)
