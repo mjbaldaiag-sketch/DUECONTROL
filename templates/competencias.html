@@ -1,6 +1,6 @@
 {% extends "base.html" %}{% block content %}
 <div class="page-heading"><div><h1>Cadastro de Competências</h1><p class="muted">Gerencie os períodos de competência por empresa.</p></div><div class="actions"><a class="btn" href="#nova-competencia">+ Nova Competência</a><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div></div>
-<form method="post" class="form" id="nova-competencia">
+<form method="post" action="{{ url_for('editar_competencia', competencia_id=competencia.id) if competencia and competencia.id else url_for('cadastro_competencias') }}" class="form" id="nova-competencia">
   <h2>{{ 'Editar competência' if competencia and competencia.id else 'Nova competência' }}</h2>
   <label>Empresa*<select name="empresa_id" required><option value="">Selecione uma empresa</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if competencia and (competencia.empresa_id|string) == (empresa.id|string) else '' }}>{{ empresa.apelido or empresa.razao_social }} — {{ empresa.cnpj|cnpj }}</option>{% endfor %}</select></label>
   <label>Descrição*<input name="descricao" value="{{ competencia.descricao if competencia else '' }}" required></label>

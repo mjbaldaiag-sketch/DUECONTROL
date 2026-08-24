@@ -8,7 +8,7 @@
   <label>Cliente<input name="cliente" value="{{ request.args.get('cliente','') }}" placeholder="Nome do cliente"></label>
   <label>CNPJ<input name="cnpj" value="{{ request.args.get('cnpj','') }}"></label>
   <label>Moeda<select name="moeda"><option value="">Todas</option>{% for moeda in moedas %}<option value="{{ moeda }}" {{ 'selected' if request.args.get('moeda') == moeda else '' }}>{{ moeda }}</option>{% endfor %}</select></label>
-  <label>Status<select name="status"><option value="">Todos</option><option value="PENDENTE" {{ 'selected' if request.args.get('status') == 'PENDENTE' else '' }}>PENDENTE</option><option value="{{ status_concluido }}" {{ 'selected' if request.args.get('status') == status_concluido else '' }}>{{ status_concluido }}</option></select></label>
+  <label>Status<select name="status"><option value="">Todos</option><option value="PENDENTE" {{ 'selected' if request.args.get('status') == 'PENDENTE' else '' }}>PENDENTE</option><option value="{{ status_parcial }}" {{ 'selected' if request.args.get('status') == status_parcial else '' }}>{{ status_parcial }}</option><option value="{{ status_concluido }}" {{ 'selected' if request.args.get('status') == status_concluido else '' }}>{{ status_concluido }}</option></select></label>
   <label>Data de Lan&ccedil;amento inicial<input name="data_de" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ request.args.get('data_de','') }}"></label>
   <label>Data de Lan&ccedil;amento final<input name="data_ate" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ request.args.get('data_ate','') }}"></label>
   <label>Valor m&iacute;nimo<input name="valor_min" data-money inputmode="decimal" value="{{ request.args.get('valor_min','') }}"></label>

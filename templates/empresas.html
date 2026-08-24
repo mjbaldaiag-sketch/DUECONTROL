@@ -1,5 +1,5 @@
 {% extends "base.html" %}{% block content %}
-<div class="page-heading"><div><h1>Cadastrar minhas empresas</h1><p class="muted">Cadastre uma vez para reutilizar o CNPJ em DU-Es e contratos.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
+<div class="page-heading"><div><h1>Cadastrar minhas empresas</h1><p class="muted">Cadastre uma vez para reutilizar o CNPJ em DU-Es e Contratos Câmbio.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
 <form method="post" class="form company-form">
   <label>Razão Social*<input name="razao_social" required></label>
   <label>CNPJ*<input name="cnpj" data-cnpj maxlength="18" inputmode="numeric" placeholder="00.000.000/0000-00" required></label>

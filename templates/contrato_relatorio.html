@@ -8,7 +8,7 @@
   </div>
 
   <div class="report-title">
-    <h1>Relatório do contrato de câmbio</h1>
+    <h1>Relatório do Contrato Câmbio</h1>
     <p class="muted">Emitido em {{ now|date_br if now is defined else '-' }}</p>
   </div>
 
@@ -16,7 +16,7 @@
     <h2>Identificação</h2>
     <div class="report-data">
       <div><span>Tipo da operação</span><strong>Não informado</strong></div>
-      <div><span>Número do contrato</span><strong>{{ contrato.numero_contrato or '-' }}</strong></div>
+      <div><span>Número do Contrato Câmbio</span><strong>{{ contrato.numero_contrato or '-' }}</strong></div>
       <div><span>Status</span><strong><span class="status {{ contrato.status|status_class }}">{{ contrato.status or '-' }}</span></strong></div>
       <div><span>Empresa</span><strong>{{ contrato.empresa_apelido or contrato.empresa_razao_social or contrato.cnpj or '-' }}</strong></div>
       <div><span>Cliente</span><strong>{{ contrato.cliente or '-' }}{% if contrato.cliente_pais %} — {{ contrato.cliente_pais|pais_nome }}{% endif %}</strong></div>
@@ -24,7 +24,7 @@
       <div><span>Banco de Crédito</span><strong>{{ contrato.banco_credito or contrato.banco or '-' }}</strong></div>
       <div><span>Banco de Liquidação</span><strong>{{ contrato.banco_liquidacao or contrato.banco_credito or contrato.banco or '-' }}</strong></div>
       <div><span>Moeda</span><strong>{{ contrato.moeda or '-' }}</strong></div>
-      <div><span>Data do contrato</span><strong>{{ contrato.data_contrato|date_br or '-' }}</strong></div>
+      <div><span>Data do Contrato Câmbio</span><strong>{{ contrato.data_contrato|date_br or '-' }}</strong></div>
       <div><span>Data de recebimento</span><strong>{{ contrato.data_recebimento|date_br or '-' }}</strong></div>
       <div><span>Data de liquidação</span><strong>{{ contrato.data_liquidacao|date_br or '-' }}</strong></div>
     </div>
@@ -61,7 +61,7 @@
           <td>{{ v.observacao or '-' }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="6" class="empty">Este contrato ainda não está vinculado a nenhuma DU-E.</td></tr>
+        <tr><td colspan="6" class="empty">Este Contrato Câmbio ainda não está vinculado a nenhuma DU-E.</td></tr>
         {% endfor %}
       </tbody>
     </table>

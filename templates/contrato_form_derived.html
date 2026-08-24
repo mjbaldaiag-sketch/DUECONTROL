@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading"><div><h1>Editar Contrato Câmbio {{ contrato.numero_contrato }}</h1><p class="muted">O valor e a moeda são consolidados pelas Invoices vinculadas.</p></div><a class="btn secondary" href="{{ url_for('detalhe_contrato', contrato_id=contrato.id) }}">Voltar</a></div>
+<div class="detail-grid"><div><span>Valor consolidado</span><strong>{{ resumo.valor_moeda|money }} {{ contrato.moeda }}</strong></div><div><span>Vínculos diretos DU-E</span><strong>{{ resumo.vinculado|money }}</strong></div><div><span>Saldo operacional</span><strong>{{ resumo.saldo|money }}</strong></div></div>
+<form method="post" class="form">
+  <input type="hidden" name="derived_contract_form" value="1">
+  <label>Número do Contrato Câmbio*<input name="numero_contrato" value="{{ contrato.numero_contrato }}" required></label>
+  <label>Banco de liquidação<select name="banco_liquidacao_id"><option value="">Nenhum banco selecionado</option>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if contrato.banco_liquidacao_id == banco.id else '' }}>{{ banco.nome }}</option>{% endfor %}</select></label>
+  <label>Data de fechamento<input name="data_fechamento" data-date-br placeholder="dd/mm/aaaa" value="{{ contrato.data_fechamento|date_br if contrato.data_fechamento else '' }}"></label>
+  <label>Data de liquidação<input name="data_liquidacao" data-date-br placeholder="dd/mm/aaaa" value="{{ contrato.data_liquidacao|date_br if contrato.data_liquidacao else '' }}"></label>
+  <label>Taxa de câmbio<input name="taxa_cambio" data-rate value="{{ contrato.taxa_cambio|rate if contrato.taxa_cambio is not none else '' }}"></label>
+  <label>Observação<textarea name="contrato_observacao">{{ contrato.observacao or '' }}</textarea></label>
+  <div class="form-actions"><button>Salvar alterações</button><a class="btn secondary" href="{{ url_for('detalhe_contrato', contrato_id=contrato.id) }}">Cancelar</a></div>
+</form>
+{% endblock %}

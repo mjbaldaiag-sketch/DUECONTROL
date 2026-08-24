@@ -36,7 +36,7 @@
   <section class="report-section">
     <h2>Histórico cronológico de consumo</h2>
     <table>
-      <thead><tr><th>Data</th><th>Tipo</th><th>Contrato</th><th>Documento</th><th>Valor</th><th>Saldo após a movimentação</th><th>Observação</th></tr></thead>
+      <thead><tr><th>Data</th><th>Tipo</th><th>Contrato Câmbio</th><th>Documento</th><th>Valor</th><th>Saldo após a movimentação</th><th>Observação</th></tr></thead>
       <tbody>
         {% for item in historico %}{% set m = item.mov %}
         <tr>
@@ -56,14 +56,14 @@
   </section>
 
   <section class="report-section">
-    <h2>Vínculos com contratos</h2>
+    <h2>Vínculos com Contratos Câmbio</h2>
     <table>
-      <thead><tr><th>Contrato</th><th>Moeda</th><th>Valor vinculado</th><th>Observação</th></tr></thead>
+      <thead><tr><th>Contrato Câmbio</th><th>Moeda</th><th>Valor vinculado</th><th>Observação</th></tr></thead>
       <tbody>
         {% for v in vinc %}
         <tr><td>{{ v.numero_contrato or '-' }}</td><td>{{ v.moeda or '-' }}</td><td>{{ v.valor_calculado|money }}</td><td>{{ v.observacao or '-' }}</td></tr>
         {% else %}
-        <tr><td colspan="4" class="empty">Nenhum vínculo efetuado com contrato.</td></tr>
+        <tr><td colspan="4" class="empty">Nenhum vínculo efetuado com Contrato Câmbio.</td></tr>
         {% endfor %}
       </tbody>
     </table>
