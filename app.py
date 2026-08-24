@@ -1005,6 +1005,34 @@ def ensure_invoice_import_competencies(conn, rows, new_competency_overrides=None
             row["competencia_id"] = competencia_id
     return grouped
 
+def resolve_invoice_import_companies(conn, rows):
+    """Converte a coluna Empresa (CNPJ, razão social ou apelido) para CNPJ."""
+    companies = conn.execute("SELECT id, razao_social, apelido, cnpj FROM empresas ORDER BY id").fetchall()
+    for row in rows:
+        if row.get("cnpj"):
+            company = next((item for item in companies if item["cnpj"] == row["cnpj"]), None)
+            if not company:
+                raise ValueError(f"A empresa com CNPJ {row['cnpj']} não está cadastrada.")
+            row["empresa_id"] = company["id"]
+            continue
+        company_text = normalize_client_name_display(row.get("empresa"))
+        company_key = normalize_client_name_key(company_text)
+        candidates = [item for item in companies if company_key in {
+            normalize_client_name_key(item["razao_social"]),
+            normalize_client_name_key(item["apelido"]),
+        }]
+        if not candidates:
+            raise ValueError(
+                f"A empresa {company_text or '-'} não está cadastrada. "
+                "Informe o CNPJ ou o nome/apelido exatamente como cadastrado."
+            )
+        if len(candidates) > 1:
+            raise ValueError(f"A empresa {company_text} corresponde a mais de uma empresa cadastrada.")
+        company = candidates[0]
+        row["cnpj"] = company["cnpj"]
+        row["empresa_id"] = company["id"]
+    return rows
+
 @app.template_filter("pais_nome")
 def pais_nome(value):
     codigo = str(value or "").strip().upper()
@@ -4543,16 +4571,16 @@ def invoice_import_cell(record, columns, column, pandas, default=None):
 
 def normalize_invoice_import_columns(columns):
     aliases = {
-        "cnpj": "cnpj", "empresa": "cnpj", "numero_invoice": "numero_invoice",
+        "cnpj": "cnpj", "empresa": "empresa", "numero_invoice": "numero_invoice",
         "invoice": "numero_invoice", "numero_da_invoice": "numero_invoice",
         "tipo_documento": "tipo_documento", "tipo": "tipo_documento",
         "status": "status", "status_invoice": "status", "situacao": "status",
         "data_credito": "data_credito", "data_de_credito": "data_credito", "credito": "data_credito",
+        "banco_credito": "banco_credito", "banco_de_credito": "banco_credito",
         "cliente": "cliente", "nome_cliente": "cliente", "data_emissao": "data_emissao", "emissao": "data_emissao",
         "competencia": "competencia", "safra": "competencia", "periodo": "competencia",
         "descricao_competencia": "competencia", "competencia_descricao": "competencia",
-        # Aliases legados permanecem aceitos para não quebrar reprocessamentos antigos;
-        # não são mais incluídos no modelo nem na prévia atual.
+        # Aliases legados permanecem aceitos para não quebrar reprocessamentos antigos.
         "cliente_pais": "cliente_pais", "pais_cliente": "cliente_pais", "pais": "cliente_pais",
         "country": "cliente_pais",
         "moeda": "moeda", "valor_invoice": "valor_invoice", "valor_moeda": "valor_invoice",
@@ -4564,6 +4592,7 @@ def normalize_invoice_import_columns(columns):
         "data_fechamento": "data_fechamento", "data_do_fechamento": "data_fechamento",
         "data_liquidacao": "data_liquidacao", "data_de_liquidacao": "data_liquidacao",
         "taxa_cambio": "taxa_cambio", "taxa_de_cambio": "taxa_cambio",
+        "valor_brl": "valor_brl", "valor_em_brl": "valor_brl", "valor_reais": "valor_brl",
         "observacao": "observacao", "observacao_invoice": "observacao",
     }
     normalized = []
@@ -4586,17 +4615,24 @@ def normalize_invoice_type(value):
     }.get(text_value, text_value)
 
 def prepare_invoice_import_rows(df, pandas):
-    required = {"cnpj", "numero_invoice", "tipo_documento", "competencia", "valor_invoice"}
+    required = {"numero_invoice", "tipo_documento", "competencia", "valor_invoice"}
     missing = sorted(required - set(df.columns))
+    if "cnpj" not in df.columns and "empresa" not in df.columns:
+        missing.append("empresa/cnpj")
     if missing:
-        raise ValueError("O Excel precisa conter as colunas: " + ", ".join(sorted(required)) + ".")
+        raise ValueError("O Excel precisa conter as colunas: " + ", ".join(missing) + ".")
     rows = []
     invoice_groups = {}
     for line_number, (_, record) in enumerate(df.iterrows(), start=2):
         raw_values = {column: invoice_import_cell(record, df.columns, column, pandas) for column in df.columns}
         if not any(str(value or "").strip() for value in raw_values.values()):
             continue
-        cnpj = normalize_cnpj(raw_values.get("cnpj"))
+        raw_empresa = raw_values.get("empresa") if "empresa" in df.columns else raw_values.get("cnpj")
+        empresa = str(raw_empresa or "").strip()
+        if not empresa:
+            raise ValueError(f"Linha {line_number}: a empresa/CNPJ é obrigatória.")
+        digits_empresa = re.sub(r"\D", "", empresa)
+        cnpj = normalize_cnpj(empresa) if len(digits_empresa) == 14 else None
         numero = str(raw_values.get("numero_invoice") or "").strip()
         if not numero:
             raise ValueError(f"Linha {line_number}: o numero_invoice é obrigatório.")
@@ -4622,33 +4658,64 @@ def prepare_invoice_import_rows(df, pandas):
         if not competencia:
             raise ValueError(f"Linha {line_number}: competencia e obrigatoria.")
         contrato_comercial = normalize_contract_commercial(raw_values.get("contrato_comercial"))
-        # Essas colunas sairam do modelo atual. O caminho legado permite apenas
-        # reprocessar planilhas antigas que ainda trazem alocacoes de cambio.
-        importa_cambio = "valor_alocado" in df.columns
-        contrato = str(raw_values.get("numero_contrato_cambio") or "").strip() or None if importa_cambio else None
-        valor_alocado = optional_number(raw_values.get("valor_alocado")) if importa_cambio else None
-        if importa_cambio and contrato and (valor_alocado is None or decimal_value(valor_alocado) <= 0):
+        banco_credito = str(raw_values.get("banco_credito") or "").strip() or None
+        banco_liquidacao = str(raw_values.get("banco_liquidacao") or "").strip() or None
+        contrato = str(raw_values.get("numero_contrato_cambio") or "").strip() or None
+        valor_brl = optional_number(raw_values.get("valor_brl"))
+        importa_cambio = bool(
+            contrato or banco_liquidacao or raw_values.get("data_fechamento") is not None
+            or raw_values.get("data_liquidacao") is not None
+            or raw_values.get("taxa_cambio") is not None or valor_brl is not None
+            or "valor_alocado" in df.columns
+        )
+        valor_alocado = optional_number(raw_values.get("valor_alocado")) if "valor_alocado" in df.columns else None
+        if contrato and valor_alocado is None:
+            valor_alocado = valor_invoice
+        if importa_cambio and not contrato and any((banco_liquidacao, valor_brl, valor_alocado,
+                                                    raw_values.get("data_fechamento"),
+                                                    raw_values.get("data_liquidacao"),
+                                                    raw_values.get("taxa_cambio"))):
+            raise ValueError(f"Linha {line_number}: os dados de câmbio exigem numero_contrato_cambio.")
+        if contrato and (valor_alocado is None or decimal_value(valor_alocado) <= 0):
             raise ValueError(f"Linha {line_number}: valor_alocado é obrigatório quando há Contrato Câmbio.")
-        if importa_cambio and not contrato and valor_alocado not in (None, 0, 0.0):
-            raise ValueError(f"Linha {line_number}: valor_alocado exige numero_contrato_cambio.")
+        data_fechamento = parse_date(raw_values.get("data_fechamento"))
+        data_liquidacao = parse_date(raw_values.get("data_liquidacao"))
+        taxa_cambio = optional_number(raw_values.get("taxa_cambio"))
+        if data_fechamento and data_liquidacao and data_liquidacao < data_fechamento:
+            raise ValueError(f"Linha {line_number}: data_liquidacao não pode ser anterior à data_fechamento.")
+        if taxa_cambio is not None and decimal_value(taxa_cambio) <= 0:
+            raise ValueError(f"Linha {line_number}: taxa_cambio deve ser maior que zero.")
+        if valor_brl is not None and decimal_value(valor_brl) <= 0:
+            raise ValueError(f"Linha {line_number}: valor_brl deve ser maior que zero.")
+        if valor_brl is not None and taxa_cambio is None:
+            raise ValueError(f"Linha {line_number}: taxa_cambio é obrigatória quando valor_brl é informado.")
+        if valor_brl is not None and valor_alocado is not None and taxa_cambio is not None:
+            calculado_brl = decimal_value(valor_alocado) * decimal_value(taxa_cambio)
+            if abs(calculado_brl - decimal_value(valor_brl)) > Decimal("0.05"):
+                raise ValueError(f"Linha {line_number}: valor_brl não corresponde ao valor_moeda x taxa_cambio.")
         row = {
-            "row_id": f"r{line_number}", "source_row": line_number, "cnpj": cnpj,
+            "row_id": f"r{line_number}", "source_row": line_number, "empresa": empresa, "cnpj": cnpj,
             "numero_invoice": numero, "tipo_documento": tipo, "competencia": competencia,
             "cliente": normalize_client_name_display(raw_values.get("cliente")),
             "data_emissao": data_emissao, "moeda": moeda, "valor_invoice": float(valor_invoice),
             "contrato_comercial": contrato_comercial,
             "status": status, "status_provided": status_provided,
             "data_credito": data_credito, "data_credito_provided": data_credito_provided,
+            "banco_credito": banco_credito, "banco_liquidacao": banco_liquidacao,
             "numero_contrato_cambio": contrato,
+            "valor_brl": float(valor_brl) if valor_brl is not None else None,
+            "valor_alocado": float(valor_alocado) if valor_alocado is not None else None,
             "legacy_valor_alocado": float(valor_alocado) if valor_alocado is not None else None,
             "importa_cambio": importa_cambio,
-            "banco_liquidacao": str(raw_values.get("banco_liquidacao") or "").strip() or None,
-            "data_fechamento": parse_date(raw_values.get("data_fechamento")),
-            "data_liquidacao": parse_date(raw_values.get("data_liquidacao")),
-            "taxa_cambio": optional_number(raw_values.get("taxa_cambio")),
+            "data_fechamento": data_fechamento,
+            "data_liquidacao": data_liquidacao,
+            "taxa_cambio": taxa_cambio,
             "observacao": str(raw_values.get("observacao") or "").strip() or None,
         }
-        key = (cnpj, numero, tipo)
+        if not importa_cambio:
+            row.pop("valor_alocado", None)
+        company_key = cnpj or f"empresa:{normalize_client_name_key(empresa)}"
+        key = (company_key, numero, tipo)
         invoice_groups.setdefault(key, []).append(row)
         rows.append(row)
     if not rows:
@@ -4677,6 +4744,13 @@ def prepare_invoice_import_rows(df, pandas):
             for row in group:
                 row["data_credito"] = group_data_credito
                 row["data_credito_provided"] = True
+        credit_banks = {row["banco_credito"] for row in group if row.get("banco_credito")}
+        if len(credit_banks) > 1:
+            raise ValueError(f"Invoice {key[1]} possui bancos de crédito divergentes entre as linhas.")
+        if credit_banks:
+            group_banco_credito = credit_banks.pop()
+            for row in group:
+                row["banco_credito"] = group_banco_credito
         group_status = next((row["status"] for row in group if row.get("status_provided")), None)
         if group_status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO and not group_data_credito:
             raise ValueError(
@@ -4719,8 +4793,43 @@ def invoice_import_snapshot(row):
         "total_recebido", "total_cambio"
     )}
 
+def invoice_import_counterparty(conn, name, field_label):
+    name = str(name or "").strip()
+    if not name:
+        return None
+    counterparty = conn.execute(
+        "SELECT id, nome FROM contrapartes WHERE nome=? COLLATE NOCASE", (name,)
+    ).fetchone()
+    if not counterparty:
+        raise ValueError(f"O {field_label} {name} não está cadastrado em Configurações.")
+    return counterparty
+
+def apply_invoice_import_receipt(conn, invoice_id, row, status=None):
+    data_credito = row.get("data_credito")
+    banco_nome = row.get("banco_credito")
+    if banco_nome and not data_credito:
+        raise ValueError("banco_credito exige data_credito para registrar o recebimento.")
+    if not data_credito or status == INVOICE_STATUS_AGUARDANDO_RECEBIMENTO:
+        return
+    bank = invoice_import_counterparty(conn, banco_nome, "Banco de Crédito")
+    amount = decimal_value(row["valor_invoice"])
+    receipts = conn.execute(
+        "SELECT id, valor_moeda FROM recebimentos_invoice WHERE invoice_id=? ORDER BY id",
+        (invoice_id,)
+    ).fetchall()
+    total_received = sum((decimal_value(receipt["valor_moeda"]) for receipt in receipts), Decimal("0"))
+    if total_received >= amount - SALDO_TOLERANCE:
+        return
+    remaining = amount - total_received
+    conn.execute("""
+        INSERT INTO recebimentos_invoice
+            (invoice_id,banco_credito_id,data_credito,moeda,valor_moeda,documento,observacao)
+        VALUES (?,?,?,?,?,?,?)
+    """, (invoice_id, bank["id"] if bank else None, data_credito, row["moeda"], float(remaining), None, None))
+
 def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrides=None,
                               competency_overrides=None):
+    resolve_invoice_import_companies(conn, rows)
     ensure_invoice_import_clients(conn, rows, country_overrides=country_overrides)
     ensure_invoice_import_competencies(conn, rows, new_competency_overrides=competency_overrides)
     groups = {}
@@ -4792,7 +4901,11 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
                   first["contrato_comercial"], imported_status or INVOICE_STATUS_AGUARDANDO_RECEBIMENTO,
                   1 if status_provided else 0, imported_data_credito, first["observacao"]))
             invoice_id = cursor.lastrowid
-        allocation_total = sum((decimal_value(row.get("legacy_valor_alocado")) for row in group), Decimal("0"))
+        apply_invoice_import_receipt(conn, invoice_id, first, status=imported_status)
+        allocation_total = sum((decimal_value(
+            row.get("valor_alocado") if row.get("valor_alocado") is not None
+            else row.get("legacy_valor_alocado")
+        ) for row in group), Decimal("0"))
         summary_after_header = invoice_summary(conn, invoice_id)
         validate_invoice_balances(summary_after_header, replacement_cambio=allocation_total)
         allocation_by_contract = {}
@@ -4801,11 +4914,7 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
                 allocation_by_contract.setdefault(row["numero_contrato_cambio"], []).append(row)
         for numero, contract_rows in allocation_by_contract.items():
             first_contract = contract_rows[0]
-            bank = None
-            if first_contract["banco_liquidacao"]:
-                bank = conn.execute("SELECT id,nome FROM contrapartes WHERE nome=? COLLATE NOCASE", (first_contract["banco_liquidacao"],)).fetchone()
-                if not bank:
-                    raise ValueError(f"O Banco / Contraparte {first_contract['banco_liquidacao']} não está cadastrado.")
+            bank = invoice_import_counterparty(conn, first_contract["banco_liquidacao"], "Banco de Liquidação")
             metadata = {
                 "numero_contrato": numero, "banco_liquidacao_id": bank["id"] if bank else None,
                 "banco_liquidacao": bank["nome"] if bank else None,
@@ -4816,7 +4925,10 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
             }
             contract_id = contract_for_invoice(conn, {"moeda": first["moeda"]}, metadata)
             changed_contracts.add(contract_id)
-            amount = sum((decimal_value(row.get("legacy_valor_alocado")) for row in contract_rows), Decimal("0"))
+            amount = sum((decimal_value(
+                row.get("valor_alocado") if row.get("valor_alocado") is not None
+                else row.get("legacy_valor_alocado")
+            ) for row in contract_rows), Decimal("0"))
             conn.execute("""
                 INSERT INTO invoice_contrato_cambio(invoice_id,contrato_id,valor_alocado,observacao)
                 VALUES (?,?,?,?)
@@ -5258,6 +5370,7 @@ def importar_invoices():
         df.columns = normalize_invoice_import_columns(df.columns)
         rows = prepare_invoice_import_rows(df, pd)
         conn = db()
+        resolve_invoice_import_companies(conn, rows)
         client_suggestions = resolve_invoice_import_clients(conn, rows)
         competencia_suggestions = resolve_invoice_import_competencies(conn, rows)
         existing = invoice_identity_rows(conn, rows)
@@ -5353,8 +5466,10 @@ def cancelar_importacao_invoices():
 @app.route("/invoices/modelo")
 def modelo_invoices():
     import pandas as pd
-    columns = ["cnpj", "numero_invoice", "tipo_documento", "cliente", "contrato_comercial", "competencia",
-               "data_emissao", "moeda", "valor_invoice", "status", "data_credito", "observacao"]
+    columns = ["empresa", "invoice", "contrato_comercial", "competencia", "tipo",
+               "banco_credito", "banco_liquidacao", "contrato_cambio", "cliente", "emissao",
+               "data_credito", "data_fechamento", "data_liquidacao", "moeda", "valor_moeda",
+               "taxa_cambio", "valor_brl", "status"]
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame(columns=columns).to_excel(writer, index=False, sheet_name="Invoices")

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="page-heading"><div><h1>Gestão de Invoices</h1><p class="muted">{{ total }} Invoice(s) encontrada(s)</p></div><div class="actions"><a class="btn" href="{{ url_for('nova_invoice') }}">+ Nova Invoice</a><a class="btn secondary" href="{{ url_for('modelo_invoices') }}">Baixar modelo Excel</a></div></div>
-<div class="import-box"><form class="inline" action="{{ url_for('importar_invoices') }}" method="post" enctype="multipart/form-data"><input type="file" name="arquivo" accept=".xlsx,.xls" required><button>Importar Excel</button></form><span class="muted">Uma linha por Invoice. A competência é obrigatória; vínculos de câmbio são feitos no detalhe.</span></div>
+<div class="import-box"><form class="inline" action="{{ url_for('importar_invoices') }}" method="post" enctype="multipart/form-data"><input type="file" name="arquivo" accept=".xlsx,.xls" required><button>Importar Excel</button></form><span class="muted">Uma linha por Invoice. O modelo aceita recebimento e câmbio já fechado, com campos condicionais por status.</span></div>
 <form method="get" class="filters">
   <label>Invoice<input name="numero_invoice" value="{{ request.args.get('numero_invoice','') }}" placeholder="Número da Invoice"></label>
   <label>Contrato comercial<input name="contrato_comercial" value="{{ request.args.get('contrato_comercial','') }}" placeholder="Referência comercial"></label>

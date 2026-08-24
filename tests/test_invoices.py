@@ -143,6 +143,11 @@ class InvoiceFlowTests(unittest.TestCase):
         model = pd.read_excel(BytesIO(self.client.get("/invoices/modelo").data))
         self.assertIn("status", model.columns)
         self.assertIn("data_credito", model.columns)
+        for column in (
+            "empresa", "invoice", "tipo", "banco_credito", "banco_liquidacao", "contrato_cambio",
+            "data_fechamento", "data_liquidacao", "valor_moeda", "taxa_cambio", "valor_brl",
+        ):
+            self.assertIn(column, model.columns)
         frame = pd.DataFrame([{
             "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-STATUS-IMPORT",
             "tipo_documento": "COMMERCIAL INVOICE", "competencia": "Agosto/2026",
@@ -178,6 +183,61 @@ class InvoiceFlowTests(unittest.TestCase):
         }])
         with self.assertRaisesRegex(ValueError, "data_credito"):
             app.prepare_invoice_import_rows(frame, pd)
+
+    def test_invoice_import_registers_receipt_and_closed_exchange(self):
+        import pandas as pd
+
+        conn = app.db()
+        conn.execute("INSERT INTO contrapartes (nome) VALUES (?)", ("Banco Liquidação",))
+        conn.commit()
+        conn.close()
+        frame = pd.DataFrame([{
+            "Empresa": "Teste", "Invoice": "INV-FULL-IMPORT", "Contrato comercial": "COM-FULL",
+            "Competência": "Agosto/2026", "Tipo": "COMMERCIAL INVOICE", "Banco Crédito": "Banco Teste",
+            "Banco Liquidação": "Banco Liquidação", "Contrato Câmbio": "C-FULL",
+            "Cliente": "Cliente Teste", "Emissão": "01/08/2026", "Data Crédito": "10/08/2026",
+            "Data Fechamento": "11/08/2026", "Data Liquidação": "12/08/2026", "Moeda": "USD",
+            "Valor Moeda": "1000,00", "Taxa Câmbio": "5,10", "Valor BRL": "5100,00",
+            "Status": "LIQUIDADA",
+        }])
+        output = BytesIO()
+        frame.to_excel(output, index=False)
+        output.seek(0)
+        response = self.client.post("/invoices/importar", data={"arquivo": (output, "full-invoice.xlsx")},
+                                    content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        with self.client.session_transaction() as session:
+            token = session["invoice_import_stage"]
+        self.assertEqual(self.client.post("/invoices/importar/confirmar", data={"stage_token": token}).status_code, 302)
+
+        conn = app.db()
+        invoice = conn.execute(
+            "SELECT id, status, status_manual, data_credito FROM invoices WHERE numero_invoice='INV-FULL-IMPORT'"
+        ).fetchone()
+        self.assertEqual(invoice["status"], app.INVOICE_STATUS_LIQUIDADA)
+        self.assertEqual(invoice["status_manual"], 1)
+        self.assertEqual(invoice["data_credito"], "2026-08-10")
+        receipt = conn.execute(
+            "SELECT banco_credito_id, data_credito, valor_moeda FROM recebimentos_invoice WHERE invoice_id=?",
+            (invoice["id"],),
+        ).fetchone()
+        self.assertEqual((receipt["banco_credito_id"], receipt["data_credito"]), (1, "2026-08-10"))
+        self.assertEqual(app.Decimal(str(receipt["valor_moeda"])), app.Decimal("1000"))
+        contract = conn.execute(
+            "SELECT id, banco_liquidacao_id, data_fechamento, data_liquidacao, taxa_cambio, valor_moeda, valor_reais "
+            "FROM contratos WHERE numero_contrato='C-FULL'"
+        ).fetchone()
+        self.assertEqual(contract["banco_liquidacao_id"], 2)
+        self.assertEqual((contract["data_fechamento"], contract["data_liquidacao"]), ("2026-08-11", "2026-08-12"))
+        self.assertEqual(app.Decimal(str(contract["taxa_cambio"])), app.Decimal("5.1"))
+        self.assertEqual(app.Decimal(str(contract["valor_moeda"])), app.Decimal("1000"))
+        self.assertEqual(app.Decimal(str(contract["valor_reais"])), app.Decimal("5100"))
+        link = conn.execute(
+            "SELECT valor_alocado FROM invoice_contrato_cambio WHERE invoice_id=? AND contrato_id=?",
+            (invoice["id"], contract["id"]),
+        ).fetchone()
+        self.assertEqual(app.Decimal(str(link["valor_alocado"])), app.Decimal("1000"))
+        conn.close()
 
     def test_schema_bootstrap_is_idempotent_and_preserves_existing_domains(self):
         conn = app.db()
