@@ -61,10 +61,10 @@ class InvoiceFlowTests(unittest.TestCase):
 
         conn = app.db()
         conn.executemany(
-            "INSERT INTO recebimentos_invoice (invoice_id,data_credito,moeda,valor_moeda) VALUES (?,?,?,?)",
-            [(received_a, "2026-08-10", "USD", 1000),
-             (received_b, "2026-08-11", "USD", 700),
-             (settled, "2026-08-12", "USD", 50)],
+            "INSERT INTO recebimentos_invoice (invoice_id,banco_credito_id,data_credito,moeda,valor_moeda) VALUES (?,?,?,?,?)",
+            [(received_a, 1, "2026-08-10", "USD", 1000),
+             (received_b, 1, "2026-08-11", "USD", 700),
+             (settled, 1, "2026-08-12", "USD", 50)],
         )
         conn.executemany(
             "INSERT INTO contratos (numero_contrato,moeda,valor_moeda,status) VALUES (?,?,?,?)",
@@ -92,11 +92,11 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         html = response.get_data(as_text=True)
         self.assertIn("Total de Invoices Recebidas", html)
-        self.assertIn("US$ 1.750,00", html)
-        self.assertIn("US$ 750,00", html)
-        self.assertIn("US$ 1.300,00", html)
-        self.assertIn("US$ 400,00", html)
-        self.assertIn("US$ 600,00", html)
+        self.assertIn("USD 1.750,00", html)
+        self.assertIn("USD 750,00", html)
+        self.assertIn("USD 1.300,00", html)
+        self.assertIn("USD 400,00", html)
+        self.assertIn("USD 600,00", html)
         self.assertNotIn("INV-REPORT-EUR", html)
         self.assertEqual(html.count('data-copy-value='), 2)
         self.assertLess(html.index("Cliente B"), html.index("Cliente Teste"))
@@ -114,8 +114,16 @@ class InvoiceFlowTests(unittest.TestCase):
         )
         self.assertEqual(context["tables"][0]["total"], app.Decimal("1000"))
         self.assertEqual(context["tables"][1]["total"], app.Decimal("1300"))
-        self.assertIn("TOTAL                    US$ 1.000,00", context["tables"][0]["copy_text"])
-        self.assertIn("TOTAL                    US$ 1.300,00", context["tables"][1]["copy_text"])
+        self.assertIn("TOTAL                                         USD 1.000,00", context["tables"][0]["copy_text"])
+        self.assertIn("TOTAL                    USD 1.300,00", context["tables"][1]["copy_text"])
+        self.assertIn("<table", context["tables"][0]["copy_html"])
+        self.assertNotIn("RECEBIDO AGUARDANDO CÂMBIO", context["tables"][0]["copy_text"])
+        self.assertIn("Cliente / Trading        Banco                USD", context["tables"][0]["copy_text"])
+        self.assertIn("Banco", context["tables"][0]["copy_text"])
+        self.assertEqual(context["tables"][0]["rows"][0]["banco"], "Banco Teste")
+        self.assertIn("<thead", context["tables"][0]["copy_html"])
+        self.assertIn("background:#f4fbf5", context["tables"][0]["copy_html"])
+        self.assertIn("background:#fdf5f5", context["tables"][1]["copy_html"])
 
     def test_invoice_competencies_are_scoped_to_company_and_cross_company_selection_is_rejected(self):
         conn = app.db()

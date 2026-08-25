@@ -50,10 +50,18 @@
     copyToastTimer = setTimeout(() => copyToast.classList.remove('is-visible'), 2600);
   };
 
-  const copyText = async (text) => {
+  const copyText = async (text, html = '') => {
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
       try {
-        await navigator.clipboard.writeText(text);
+        if (html && window.ClipboardItem && typeof navigator.clipboard.write === 'function') {
+          const item = new ClipboardItem({
+            'text/plain': new Blob([text], { type: 'text/plain' }),
+            'text/html': new Blob([html], { type: 'text/html' }),
+          });
+          await navigator.clipboard.write([item]);
+        } else {
+          await navigator.clipboard.writeText(text);
+        }
         return;
       } catch (_) {
         // Tenta o fallback abaixo quando a permissão do Clipboard API falhar.
@@ -76,7 +84,7 @@
       const value = button.dataset.copyValue || '';
       if (!value) return;
       try {
-        await copyText(value);
+        await copyText(value, button.dataset.copyHtml || '');
         showCopyToast();
       } catch (_) {
         // O navegador pode bloquear a área de transferência sem interação segura.

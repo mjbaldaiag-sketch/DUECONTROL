@@ -1,7 +1,7 @@
 {% extends "base.html" %}{% block content %}
 <div class="page-heading"><div><h1>Gestão de Derivativos</h1><p class="muted">Acompanhe suas operações NDF e os próximos vencimentos.</p></div><a class="btn" href="{{ url_for('novo_ndf') }}">+ Nova NDF</a></div>
 
-<div class="cards"><div>NDFs ativas<strong>{{ resumo.ativas }}</strong></div><div>USD contratado<strong>US$ {{ resumo.usd_contratado|money }}</strong></div><div>USD a vencer<strong>US$ {{ resumo.usd_a_vencer|money }}</strong></div><div>Resultado estimado<strong>—</strong><span class="muted">Não calculado</span></div></div>
+<div class="cards"><div>NDFs ativas<strong>{{ resumo.ativas }}</strong></div><div>USD contratado<strong>USD {{ resumo.usd_contratado|money }}</strong></div><div>USD a vencer<strong>USD {{ resumo.usd_a_vencer|money }}</strong></div><div>Resultado estimado<strong>—</strong><span class="muted">Não calculado</span></div></div>
 
 <div class="actions"><a class="btn secondary" href="{{ url_for('lista_ndfs') }}">Listar NDFs</a><a class="btn secondary" href="{{ url_for('novo_ndf') }}">Cadastrar NDF</a><a class="btn secondary" href="{{ url_for('ptax') }}">PTAX</a></div>
 

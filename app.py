@@ -5,6 +5,7 @@ import re
 import unicodedata
 import secrets
 import tempfile
+from html import escape as html_escape
 from pathlib import Path
 from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, timedelta
@@ -4378,15 +4379,58 @@ def refresh_invoice_status(conn, invoice_id):
     return summary["status"]
 
 
-def invoice_report_copy_text(title, rows, total):
-    lines = [title, "", "Cliente / Trading        USD"]
+def invoice_report_copy_text(rows, total, variant):
+    include_bank = variant == "exchange"
+    lines = ["Cliente / Trading        Banco                USD" if include_bank else "Cliente / Trading        USD"]
     for row in rows:
-        lines.append(f"{row['cliente']:<24} US$ {money(row['valor'])}")
+        if include_bank:
+            lines.append(f"{row['cliente']:<24} {row['banco']:<20} USD {money(row['valor'])}")
+        else:
+            lines.append(f"{row['cliente']:<24} USD {money(row['valor'])}")
     lines.extend([
-        "--------------------------------",
-        f"{'TOTAL':<24} US$ {money(total)}",
+        "------------------------------------------------------------" if include_bank else "--------------------------------",
+        (f"{'TOTAL':<24} {'':<20} USD {money(total)}" if include_bank
+         else f"{'TOTAL':<24} USD {money(total)}"),
     ])
     return "\n".join(lines)
+
+
+def invoice_report_copy_html(rows, total, variant):
+    palettes = {
+        "exchange": {"header": "#dcefe1", "body": "#f4fbf5", "total": "#e8f5ea", "color": "#245c32"},
+        "awaiting": {"header": "#f8dfdf", "body": "#fdf5f5", "total": "#f9e9e9", "color": "#7a3030"},
+    }
+    palette = palettes[variant]
+    cell_style = "border:1px solid #d8e1e8;padding:8px;text-align:left;font-family:Arial,sans-serif;font-size:13px"
+    header_style = f"{cell_style};background:{palette['header']};color:{palette['color']};font-weight:600"
+    body_style = f"{cell_style};background:{palette['body']}"
+    total_style = f"{cell_style};background:{palette['total']};color:{palette['color']};font-weight:700"
+    lines = [
+        '<div style="font-family:Arial,sans-serif;color:#222">',
+        '<table style="border-collapse:collapse;width:100%;max-width:720px">',
+        f'<thead><tr><th style="{header_style}">Cliente / Trading</th>'
+        f'{f"<th style=\"{header_style}\">Banco</th>" if variant == "exchange" else ""}'
+        f'<th style="{header_style}">USD</th></tr></thead>',
+        '<tbody>',
+    ]
+    for row in rows:
+        bank_cell = (
+            f'<td style="{body_style}">{html_escape(str(row["banco"]))}</td>'
+            if variant == "exchange" else ""
+        )
+        lines.append(
+            f'<tr><td style="{body_style}">{html_escape(str(row["cliente"]))}</td>{bank_cell}'
+            f'<td style="{body_style}">USD {money(row["valor"])}</td></tr>'
+        )
+    lines.extend([
+        '</tbody>',
+        (f'<tfoot><tr><th style="{total_style}">TOTAL</th><th style="{total_style}"></th>'
+         f'<th style="{total_style}">USD {money(total)}</th></tr></tfoot>'
+         if variant == "exchange" else
+         f'<tfoot><tr><th style="{total_style}">TOTAL</th><th style="{total_style}">USD {money(total)}</th></tr></tfoot>'),
+        '</table></div>',
+    ])
+    return "".join(lines)
 
 
 def build_invoice_report_context():
@@ -4405,20 +4449,31 @@ def build_invoice_report_context():
         if summary and str(summary.get("moeda") or "").upper() == "USD"
     ]
 
-    def grouped_rows(status, value_key):
+    def grouped_rows(status, value_key, include_bank=False):
         grouped = {}
         for summary in summaries:
             if summary["status"] != status:
                 continue
             cliente = summary.get("cliente_nome") or "Não informado"
-            grouped[cliente] = grouped.get(cliente, Decimal("0")) + decimal_value(summary[value_key])
-        rows = [{"cliente": cliente, "valor": valor} for cliente, valor in grouped.items()]
+            if include_bank:
+                entry = grouped.setdefault(cliente, {"valor": Decimal("0"), "bancos": set()})
+                entry["valor"] += decimal_value(summary[value_key])
+                entry["bancos"].update(summary.get("bancos_credito") or [])
+            else:
+                grouped[cliente] = grouped.get(cliente, Decimal("0")) + decimal_value(summary[value_key])
+        if include_bank:
+            rows = [
+                {"cliente": cliente, "banco": ", ".join(sorted(entry["bancos"])) or "-", "valor": entry["valor"]}
+                for cliente, entry in grouped.items()
+            ]
+        else:
+            rows = [{"cliente": cliente, "valor": valor} for cliente, valor in grouped.items()]
         rows.sort(key=lambda row: (-row["valor"], row["cliente"].casefold()))
         total = sum((row["valor"] for row in rows), Decimal("0"))
         return rows, total
 
     recebido_aguardando_cambio, total_recebido_aguardando_cambio = grouped_rows(
-        INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, "saldo_cambio"
+        INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, "saldo_cambio", include_bank=True
     )
     aguardando_recebimento, total_aguardando_recebimento = grouped_rows(
         INVOICE_STATUS_AGUARDANDO_RECEBIMENTO, "saldo_recebimento"
@@ -4427,13 +4482,14 @@ def build_invoice_report_context():
     total_cambio = sum((decimal_value(summary["total_cambio"]) for summary in summaries), Decimal("0"))
 
     tables = [
-        {"title": "RECEBIDO AGUARDANDO CÂMBIO", "rows": recebido_aguardando_cambio,
+        {"title": "RECEBIDO AGUARDANDO CÂMBIO", "variant": "exchange", "rows": recebido_aguardando_cambio,
          "total": total_recebido_aguardando_cambio},
-        {"title": "AGUARDANDO RECEBIMENTO", "rows": aguardando_recebimento,
+        {"title": "AGUARDANDO RECEBIMENTO", "variant": "awaiting", "rows": aguardando_recebimento,
          "total": total_aguardando_recebimento},
     ]
     for table in tables:
-        table["copy_text"] = invoice_report_copy_text(table["title"], table["rows"], table["total"])
+        table["copy_text"] = invoice_report_copy_text(table["rows"], table["total"], table["variant"])
+        table["copy_html"] = invoice_report_copy_html(table["rows"], table["total"], table["variant"])
 
     return {
         "kpis": {
