@@ -243,6 +243,20 @@
     empresa.addEventListener('change', updateCompetencias);
     updateCompetencias();
   });
+  document.querySelectorAll('[data-client-resolution]').forEach((resolution) => {
+    const existing = resolution.querySelector('[data-client-existing]');
+    const country = resolution.querySelector('[data-client-country]');
+    const countrySelect = resolution.querySelector('[data-client-country-select]');
+    if (!existing || !country || !countrySelect) return;
+    const syncClientResolution = () => {
+      const existingSelected = Boolean(existing.value);
+      country.hidden = existingSelected;
+      countrySelect.disabled = existingSelected;
+      countrySelect.required = !existingSelected;
+    };
+    existing.addEventListener('change', syncClientResolution);
+    syncClientResolution();
+  });
   document.querySelectorAll('[data-invoice-status-select]').forEach((select) => {
     const form = select.closest('form');
     const creditDate = form ? form.querySelector('[data-invoice-credit-date]') : null;

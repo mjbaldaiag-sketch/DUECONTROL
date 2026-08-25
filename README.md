@@ -38,11 +38,11 @@ Use "Baixar modelo Excel" na Gestão de Invoices. A planilha tem uma linha por I
 
 A competência é localizada por empresa, aceitando variações de descrição quando o período informado for compatível com uma competência cadastrada. Quando não houver competência exata, próxima ou pertinente à data da Invoice, a prévia sugere o cadastro de uma nova competência para a empresa, sem gravá-la até a confirmação.
 
-Quando `data_credito` é informada, o importador registra o recebimento em USD; para uma Invoice com status `RECEBIDO AGUARDANDO CAMBIO`, a data é obrigatória. O `valor_brl` é validado contra `valor_moeda`/valor alocado e `taxa_cambio`, e os bancos informados precisam estar cadastrados em Configurações. Planilhas antigas que ainda contenham `valor_alocado` continuam sendo aceitas para reprocessamento compatível.
+Quando `data_credito` é informada, o importador registra o recebimento em USD; para uma Invoice com status `RECEBIDO AGUARDANDO CAMBIO`, a data é obrigatória. O `valor_brl` é validado contra `valor_moeda`/valor alocado e `taxa_cambio`. Se um banco informado não estiver cadastrado, a prévia apresenta a lista de bancos de Configurações para que o usuário faça o vínculo antes da confirmação. Planilhas antigas que ainda contenham `valor_alocado` continuam sendo aceitas para reprocessamento compatível.
 
 Invoices existentes são reprocessadas atualizando seus dados comerciais e substituindo somente suas alocações importadas; recebimentos e vínculos com DU-E são preservados.
 
-O importador normaliza nomes de clientes por acentos, caixa, pontuação e espaços e associa o cadastro existente quando a correspondência é segura. Para clientes não reconhecidos, a prévia solicita o País e sugere o cadastro; a Invoice só é gravada após a confirmação.
+O importador normaliza nomes de clientes por acentos, caixa, pontuação e espaços e associa o cadastro existente quando a correspondência é segura. Para clientes não reconhecidos, a prévia permite escolher um cliente já cadastrado para normalizar o vínculo ou informar o País e confirmar um novo cadastro; a Invoice só é gravada após a confirmação.
 
 ## Excel legado de contratos
 

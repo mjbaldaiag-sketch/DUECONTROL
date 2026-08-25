@@ -58,8 +58,8 @@
 
     <section data-report-section="periodos" data-title="Fechamentos por período">
       <h2>Fechamentos por período — {{ agrupamento_label }}</h2>
-      <table><thead><tr><th>Período</th><th>Moeda</th><th>Operações</th><th>Volume</th><th>Taxa ponderada</th><th>Resultado acumulado</th><th>Resultado (R$)</th></tr></thead><tbody>
-        {% for item in periodos %}<tr><td>{{ item.rotulo }}</td><td>{{ item.moeda }}</td><td>{{ item.resumo.contratos }}</td><td>{{ item.resumo.volume|money }}</td><td>{{ item.resumo.taxa_ponderada|rate if item.resumo.taxa_ponderada is not none else '-' }}</td><td>{{ item.resumo.resultado_acumulado|money if item.resumo.resultado_acumulado is not none else '-' }}</td><td>{{ item.resumo.resultado|money if item.resumo.resultado is not none else '-' }}</td></tr>{% else %}<tr><td colspan="7">Nenhum registro de Contrato Câmbio encontrado.</td></tr>{% endfor %}
+      <table><thead><tr><th>Período</th><th>Moeda</th><th>Operações</th><th>Volume</th><th>Taxa ponderada</th><th>Resultado (R$)</th><th>Resultado acumulado</th></tr></thead><tbody>
+        {% for item in periodos %}<tr><td>{{ item.rotulo }}</td><td>{{ item.moeda }}</td><td>{{ item.resumo.contratos }}</td><td>{{ item.resumo.volume|money }}</td><td>{{ item.resumo.taxa_ponderada|rate if item.resumo.taxa_ponderada is not none else '-' }}</td><td>{{ item.resumo.resultado|money if item.resumo.resultado is not none else '-' }}</td><td>{{ item.resumo.resultado_acumulado|money if item.resumo.resultado_acumulado is not none else '-' }}</td></tr>{% else %}<tr><td colspan="7">Nenhum registro de Contrato Câmbio encontrado.</td></tr>{% endfor %}
       </tbody></table>
     </section>
 

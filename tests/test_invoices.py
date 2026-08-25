@@ -463,6 +463,88 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(invoice["cliente_id"], invoice["client_id"])
         conn.close()
 
+    def test_invoice_import_can_replace_unknown_client_with_existing_client(self):
+        import pandas as pd
+
+        frame = pd.DataFrame([{
+            "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-EXISTING-CLIENT",
+            "tipo_documento": "COMMERCIAL INVOICE", "cliente": "Nome divergente",
+            "data_emissao": "01/08/2026", "moeda": "USD", "valor_invoice": "100,00",
+            "competencia": "Agosto/2026",
+        }])
+        output = BytesIO()
+        frame.to_excel(output, index=False)
+        output.seek(0)
+        response = self.client.post("/invoices/importar", data={"arquivo": (output, "existing-client.xlsx")},
+                                    content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        preview = response.get_data(as_text=True)
+        self.assertIn('name="cliente_existente_c1"', preview)
+        self.assertIn("Cliente Teste", preview)
+        with self.client.session_transaction() as session:
+            token = session["invoice_import_stage"]
+        response = self.client.post("/invoices/importar/confirmar", data={
+            "stage_token": token, "cliente_existente_c1": "1",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM clientes").fetchone()[0], 1)
+        invoice = conn.execute("""
+            SELECT i.cliente_id, c.id AS client_id, c.nome
+            FROM invoices i JOIN clientes c ON c.id=i.cliente_id
+            WHERE i.numero_invoice='INV-EXISTING-CLIENT'
+        """).fetchone()
+        self.assertEqual(invoice["cliente_id"], invoice["client_id"])
+        self.assertEqual(invoice["nome"], "Cliente Teste")
+        conn.close()
+
+    def test_invoice_import_suggests_registered_bank_for_credit_and_liquidation(self):
+        import pandas as pd
+
+        frame = pd.DataFrame([{
+            "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-BANK-SUGGESTION",
+            "tipo_documento": "COMMERCIAL INVOICE", "cliente": "Cliente Teste",
+            "data_emissao": "01/08/2026", "data_credito": "02/08/2026",
+            "banco_credito": "BTG", "numero_contrato_cambio": "C-BANK-SUGGESTION",
+            "banco_liquidacao": "C6 BANK", "valor_alocado": "100,00",
+            "taxa_cambio": "5,00", "moeda": "USD", "valor_moeda": "100,00",
+            "status": "RECEBIDO AGUARDANDO CAMBIO", "competencia": "Agosto/2026",
+        }])
+        output = BytesIO()
+        frame.to_excel(output, index=False)
+        output.seek(0)
+        response = self.client.post("/invoices/importar", data={"arquivo": (output, "bank-suggestion.xlsx")},
+                                    content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        preview = response.get_data(as_text=True)
+        self.assertIn("Bancos não identificados", preview)
+        self.assertIn("Banco de Crédito informado: BTG", preview)
+        self.assertNotIn("Banco de CrÃ©dito informado", preview)
+        self.assertIn('name="banco_existente_b1"', preview)
+        self.assertIn('name="banco_existente_b2"', preview)
+        self.assertIn("Banco Teste", preview)
+        with self.client.session_transaction() as session:
+            token = session["invoice_import_stage"]
+        response = self.client.post("/invoices/importar/confirmar", data={
+            "stage_token": token, "banco_existente_b1": "1", "banco_existente_b2": "1",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        receipt = conn.execute("""
+            SELECT r.banco_credito_id
+            FROM recebimentos_invoice r JOIN invoices i ON i.id=r.invoice_id
+            WHERE i.numero_invoice='INV-BANK-SUGGESTION'
+        """).fetchone()
+        contract = conn.execute("""
+            SELECT c.banco_liquidacao_id
+            FROM contratos c JOIN invoice_contrato_cambio v ON v.contrato_id=c.id
+            JOIN invoices i ON i.id=v.invoice_id
+            WHERE i.numero_invoice='INV-BANK-SUGGESTION'
+        """).fetchone()
+        self.assertEqual(receipt["banco_credito_id"], 1)
+        self.assertEqual(contract["banco_liquidacao_id"], 1)
+        conn.close()
+
     def test_receipts_exchange_and_contract_grouping(self):
         invoice_id = self._create_invoice()
         for value in ("800,00", "200,00"):
@@ -830,6 +912,38 @@ class InvoiceFlowTests(unittest.TestCase):
         with self.client.session_transaction() as session:
             self.assertNotIn("invoice_import_stage", session)
 
+    def test_invoice_import_recovers_leading_zero_from_numeric_cnpj(self):
+        import pandas as pd
+
+        conn = app.db()
+        conn.execute("INSERT INTO empresas (razao_social, cnpj, apelido) VALUES (?,?,?)",
+                     ("Empresa CNPJ com zero", "04171382000177", "Empresa Zero"))
+        conn.execute("INSERT INTO competencias (empresa_id, descricao, data_inicial, data_final) VALUES (?,?,?,?)",
+                     (2, "Agosto/2026", "2026-08-01", "2026-08-31"))
+        conn.commit()
+        conn.close()
+
+        frame = pd.DataFrame([{
+            # Simula a célula numérica do Excel: o zero inicial é removido.
+            "empresa": 4171382000177, "invoice": "INV-CNPJ-ZERO",
+            "tipo": "COMMERCIAL INVOICE", "competencia": "Agosto/2026",
+            "moeda": "USD", "valor_moeda": "100,00",
+        }])
+        output = BytesIO()
+        frame.to_excel(output, index=False)
+        output.seek(0)
+        response = self.client.post("/invoices/importar", data={"arquivo": (output, "numeric-cnpj.xlsx")},
+                                    content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("não está cadastrada", response.get_data(as_text=True))
+        with self.client.session_transaction() as session:
+            token = session["invoice_import_stage"]
+        self.assertEqual(self.client.post("/invoices/importar/confirmar", data={"stage_token": token}).status_code, 302)
+        conn = app.db()
+        invoice = conn.execute("SELECT empresa_id FROM invoices WHERE numero_invoice='INV-CNPJ-ZERO'").fetchone()
+        self.assertEqual(invoice["empresa_id"], 2)
+        conn.close()
+
     def test_invoice_import_accepts_proforma_invoice_type(self):
         import pandas as pd
 
@@ -905,6 +1019,75 @@ class InvoiceFlowTests(unittest.TestCase):
             "SELECT competencia_id FROM invoices WHERE numero_invoice='INV-NEW-COMPETENCE'"
         ).fetchone()[0], competence["id"])
         conn.close()
+
+    def test_invoice_export_preserves_filters_and_includes_related_data(self):
+        import pandas as pd
+
+        invoice_id = self._create_invoice(number="INV-EXPORT-A", value="500,00")
+        self._create_invoice(number="INV-EXPORT-B", value="250,00")
+        conn = app.db()
+        conn.execute("""
+            INSERT INTO recebimentos_invoice
+                (invoice_id,banco_credito_id,data_credito,moeda,valor_moeda,documento,observacao)
+            VALUES (?,?,?,?,?,?,?)
+        """, (invoice_id, 1, "2026-08-10", "USD", 500, "DOC-EXP", "Recebimento exportado"))
+        conn.execute("""
+            INSERT INTO contratos
+                (numero_contrato,banco_liquidacao,data_fechamento,data_liquidacao,moeda,
+                 taxa_cambio,valor_moeda,valor_reais,status,observacao)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, ("C-EXPORT", "Banco Teste", "2026-08-11", "2026-08-12", "USD",
+              5.1, 500, 2550, "CONCLUIDO", "Contrato exportado"))
+        contrato_id = conn.execute("SELECT id FROM contratos WHERE numero_contrato='C-EXPORT'").fetchone()[0]
+        conn.execute("""
+            INSERT INTO invoice_contrato_cambio(invoice_id,contrato_id,valor_alocado,observacao)
+            VALUES (?,?,?,?)
+        """, (invoice_id, contrato_id, 500, "Cambio exportado"))
+        due_id = conn.execute("SELECT id FROM dues WHERE numero_due='DUE-001'").fetchone()[0]
+        conn.execute("""
+            INSERT INTO due_invoice(due_id,invoice_id,valor_vinculado,observacao)
+            VALUES (?,?,?,?)
+        """, (due_id, invoice_id, 500, "DU-E exportada"))
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/invoices/exportar?numero_invoice=INV-EXPORT-A")
+        self.assertEqual(response.status_code, 200)
+        workbook = pd.ExcelFile(BytesIO(response.data))
+        self.assertEqual(workbook.sheet_names, ["Invoices", "Recebimentos", "Cambios", "DU-Es"])
+        invoices = pd.read_excel(BytesIO(response.data), sheet_name="Invoices")
+        receipts = pd.read_excel(BytesIO(response.data), sheet_name="Recebimentos")
+        changes = pd.read_excel(BytesIO(response.data), sheet_name="Cambios")
+        dues = pd.read_excel(BytesIO(response.data), sheet_name="DU-Es")
+        self.assertEqual(len(invoices), 1)
+        self.assertEqual(invoices.iloc[0]["Numero da Invoice"], "INV-EXPORT-A")
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(len(dues), 1)
+        self.assertIn("Saldo de recebimento", invoices.columns)
+        self.assertIn("Banco de credito", receipts.columns)
+        self.assertIn("Taxa de cambio", changes.columns)
+        self.assertIn("Chave de acesso", dues.columns)
+
+    def test_contract_list_filters_by_partial_contract_number(self):
+        conn = app.db()
+        conn.executemany(
+            "INSERT INTO contratos(numero_contrato,cnpj,moeda,valor_moeda) VALUES (?,?,?,?)",
+            [("C-ABC-001", "45765914000181", "USD", 100),
+             ("C-ABC-002", "45765914000181", "USD", 200),
+             ("C-XYZ-001", "45765914000181", "USD", 300)],
+        )
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/contratos?numero_contrato=ABC")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn('name="numero_contrato"', html)
+        self.assertIn('value="ABC"', html)
+        self.assertIn("C-ABC-001", html)
+        self.assertIn("C-ABC-002", html)
+        self.assertNotIn("C-XYZ-001", html)
 
 
 if __name__ == "__main__":

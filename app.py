@@ -681,6 +681,26 @@ def normalize_cnpj(value):
         raise ValueError("Informe um CNPJ válido no formato 00.000.000/0000-00.")
     return digits
 
+def normalize_import_cnpj(value):
+    """Normaliza CNPJs vindos do Excel, inclusive números sem zeros à esquerda."""
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+    # O Excel costuma converter CNPJs para número e o pandas pode expor o
+    # valor como ``1234567890123.0``. Remova apenas a parte decimal nula.
+    if re.fullmatch(r"\d+\.0+", text_value):
+        text_value = text_value.split(".", 1)[0]
+    if not re.fullmatch(r"[\d\s./-]+", text_value):
+        return None
+    digits = re.sub(r"\D", "", text_value)
+    if len(digits) < 14:
+        # CNPJs iniciados por zero perdem esse(s) zero(s) quando a célula é
+        # numérica. O preenchimento só é aceito se o CNPJ passar a validação.
+        digits = digits.zfill(14)
+    return normalize_cnpj(digits)
+
 def format_cnpj(value):
     digits = re.sub(r"\D", "", str(value or ""))
     if len(digits) != 14:
@@ -1133,9 +1153,10 @@ def resolve_invoice_import_clients(conn, rows):
         })
     return suggestions
 
-def ensure_invoice_import_clients(conn, rows, country_overrides=None):
-    """Resolve clientes e cria somente os novos confirmados na prévia."""
+def ensure_invoice_import_clients(conn, rows, country_overrides=None, client_overrides=None):
+    """Resolve clientes, usando a seleção da prévia ou criando os novos confirmados."""
     country_overrides = country_overrides or {}
+    client_overrides = client_overrides or {}
     groups = {}
     for row in rows:
         if row.get("cliente"):
@@ -1143,6 +1164,20 @@ def ensure_invoice_import_clients(conn, rows, country_overrides=None):
                 row["cliente"], row.get("cliente_pais")), []).append(row)
     for key, group in groups.items():
         first = group[0]
+        selected_client_id = client_overrides.get(key)
+        if selected_client_id not in (None, ""):
+            try:
+                selected_client_id = int(selected_client_id)
+            except (TypeError, ValueError):
+                raise ValueError("O cliente selecionado na prévia é inválido.")
+            client = conn.execute("SELECT id, nome, pais FROM clientes WHERE id=?",
+                                  (selected_client_id,)).fetchone()
+            if not client:
+                raise ValueError("O cliente selecionado na prévia não foi encontrado.")
+            for row in group:
+                row["cliente_id"] = client["id"]
+                row["cliente"] = client["nome"]
+            continue
         country = country_overrides.get(key) or first.get("cliente_pais")
         client, _ = resolve_import_client(conn, first["cliente"], country)
         if not client:
@@ -1160,6 +1195,7 @@ def ensure_invoice_import_clients(conn, rows, country_overrides=None):
                 raise ValueError(f"Não foi possível associar ou cadastrar o cliente {first['cliente']}.")
         for row in group:
             row["cliente_id"] = client["id"]
+            row["cliente"] = client["nome"]
     return groups
 
 def clientes_for_form(conn):
@@ -1690,7 +1726,10 @@ def index():
 def contratos_filtros(args):
     empresa_id = form_record_id(args.get("empresa_id"))
     competencia_id = form_record_id(args.get("competencia_id"))
+    numero_contrato = (args.get("numero_contrato") or "").strip()
     where, params = [], []
+    if numero_contrato:
+        where.append("c.numero_contrato LIKE ?"); params.append(f"%{numero_contrato}%")
     if empresa_id:
         where.append("e.id=?"); params.append(empresa_id)
     if competencia_id:
@@ -3368,13 +3407,62 @@ def excluir_dues_lote():
         conn.close()
     return redirect_batch_result("consulta_dues")
 
+def write_excel_model_orientations(writer, conn, pandas):
+    """Adiciona ao modelo uma lista de referência para preenchimento do Excel."""
+    banks = [row["nome"] for row in conn.execute(
+        "SELECT nome FROM contrapartes ORDER BY nome"
+    ).fetchall()]
+    clients = [row["nome"] for row in conn.execute(
+        "SELECT nome FROM clientes ORDER BY nome, pais"
+    ).fetchall()]
+    companies = conn.execute("""
+        SELECT cnpj
+        FROM empresas
+        ORDER BY cnpj
+    """).fetchall()
+    company_cnpjs = [format_cnpj(row["cnpj"]) for row in companies]
+    competencies = [row["descricao"] for row in conn.execute("""
+        SELECT descricao
+        FROM competencias
+        ORDER BY data_inicial DESC, descricao
+    """).fetchall()]
+
+    orientations = pandas.DataFrame({
+        "BANCOS": pandas.Series(banks),
+        "CLIENTES": pandas.Series(clients),
+        "STATUS": pandas.Series(INVOICE_STATUS_OPTIONS),
+        "CNPJ": pandas.Series(company_cnpjs),
+        "COMPETENCIAS": pandas.Series(competencies),
+    })
+    orientations.to_excel(writer, index=False, sheet_name="Orientações")
+
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    worksheet = writer.book["Orientações"]
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1769AA")
+        cell.alignment = Alignment(horizontal="center")
+    for column in worksheet.columns:
+        letter = get_column_letter(column[0].column)
+        width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 14), 45)
+        worksheet.column_dimensions[letter].width = width
+
 @app.route("/dues/modelo")
 def modelo_dues():
     import pandas as pd
     df = pd.DataFrame(columns=["numero_due", "chave_acesso", "cnpj", "cliente", "moeda", "valor_original"])
     out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="DU-Es")
+    conn = db()
+    try:
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="DU-Es")
+            write_excel_model_orientations(writer, conn, pd)
+    finally:
+        conn.close()
     out.seek(0)
     return send_file(out, as_attachment=True, download_name="modelo_dues.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -4632,8 +4720,7 @@ def prepare_invoice_import_rows(df, pandas):
         empresa = str(raw_empresa or "").strip()
         if not empresa:
             raise ValueError(f"Linha {line_number}: a empresa/CNPJ é obrigatória.")
-        digits_empresa = re.sub(r"\D", "", empresa)
-        cnpj = normalize_cnpj(empresa) if len(digits_empresa) == 14 else None
+        cnpj = normalize_import_cnpj(empresa)
         numero = str(raw_values.get("numero_invoice") or "").strip()
         if not numero:
             raise ValueError(f"Linha {line_number}: o numero_invoice é obrigatório.")
@@ -4805,6 +4892,52 @@ def invoice_import_counterparty(conn, name, field_label):
         raise ValueError(f"O {field_label} {name} não está cadastrado em Configurações.")
     return counterparty
 
+def invoice_import_bank_key(field, name):
+    return f"{field}|{normalize_client_name_key(name)}"
+
+def resolve_invoice_import_banks(conn, rows, bank_overrides=None):
+    """Valida bancos na previa e aplica o vinculo escolhido pelo usuario."""
+    preview = bank_overrides is None
+    bank_overrides = bank_overrides or {}
+    counterparties = conn.execute("SELECT id, nome FROM contrapartes ORDER BY nome").fetchall()
+    fields = (("banco_credito", "Banco de Cr\u00e9dito"), ("banco_liquidacao", "Banco de Liquida\u00e7\u00e3o"))
+    suggestions = []
+    suggestions_by_key = {}
+    for row in rows:
+        for field, field_label in fields:
+            name = str(row.get(field) or "").strip() or None
+            if not name:
+                continue
+            counterparty = next((item for item in counterparties
+                                 if item["nome"].casefold() == name.casefold()), None)
+            if not counterparty:
+                key = invoice_import_bank_key(field, name)
+                selected_id = bank_overrides.get(key)
+                if selected_id in (None, ""):
+                    if preview:
+                        suggestion = suggestions_by_key.get(key)
+                        if not suggestion:
+                            suggestion = {
+                                "suggestion_id": f"b{len(suggestions) + 1}", "key": key,
+                                "nome": name, "tipo": field_label, "linhas": [],
+                            }
+                            suggestions_by_key[key] = suggestion
+                            suggestions.append(suggestion)
+                        suggestion["linhas"].append(row["source_row"])
+                        continue
+                    raise ValueError(
+                        f"O {field_label} n\u00e3o est\u00e1 cadastrado. Selecione um banco na pr\u00e9via."
+                    )
+                try:
+                    selected_id = int(selected_id)
+                except (TypeError, ValueError):
+                    raise ValueError(f"O banco selecionado para {name} \u00e9 inv\u00e1lido.")
+                counterparty = next((item for item in counterparties if item["id"] == selected_id), None)
+                if not counterparty:
+                    raise ValueError(f"O banco selecionado para {name} n\u00e3o foi encontrado.")
+            row[field] = counterparty["nome"]
+    return suggestions
+
 def apply_invoice_import_receipt(conn, invoice_id, row, status=None):
     data_credito = row.get("data_credito")
     banco_nome = row.get("banco_credito")
@@ -4829,9 +4962,11 @@ def apply_invoice_import_receipt(conn, invoice_id, row, status=None):
     """, (invoice_id, bank["id"] if bank else None, data_credito, row["moeda"], float(remaining), None, None))
 
 def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrides=None,
-                              competency_overrides=None):
+                              competency_overrides=None, client_overrides=None, bank_overrides=None):
     resolve_invoice_import_companies(conn, rows)
-    ensure_invoice_import_clients(conn, rows, country_overrides=country_overrides)
+    resolve_invoice_import_banks(conn, rows, bank_overrides=bank_overrides)
+    ensure_invoice_import_clients(conn, rows, country_overrides=country_overrides,
+                                  client_overrides=client_overrides)
     ensure_invoice_import_competencies(conn, rows, new_competency_overrides=competency_overrides)
     groups = {}
     for row in rows:
@@ -4946,45 +5081,57 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
         refresh_invoice_status(conn, invoice_id)
     return {"inserted": inserted, "updated": updated, "invoices": len(changed_invoices)}
 
-@app.route("/invoices")
-def lista_invoices():
-    filters = {key: value for key, value in request.args.items() if key not in {"sort", "direction", "page"} and value}
+def invoice_filter_query(args):
     where, params = [], []
-    if request.args.get("numero_invoice"):
-        where.append("i.numero_invoice LIKE ?"); params.append(f"%{request.args['numero_invoice'].strip()}%")
-    if request.args.get("contrato_comercial"):
-        where.append("i.contrato_comercial LIKE ?"); params.append(f"%{request.args['contrato_comercial'].strip()}%")
-    if request.args.get("tipo_documento"):
-        where.append("i.tipo_documento=?"); params.append(request.args["tipo_documento"].strip().upper())
-    if request.args.get("empresa_id"):
-        where.append("i.empresa_id=?"); params.append(form_record_id(request.args["empresa_id"]))
-    if request.args.get("cliente_id"):
-        where.append("i.cliente_id=?"); params.append(form_record_id(request.args["cliente_id"]))
-    if request.args.get("competencia_id"):
-        where.append("i.competencia_id=?"); params.append(form_record_id(request.args["competencia_id"]))
-    if request.args.get("moeda"):
-        where.append("i.moeda=?"); params.append(request.args["moeda"].strip().upper())
-    if request.args.get("status"):
+    if args.get("numero_invoice"):
+        where.append("i.numero_invoice LIKE ?"); params.append(f"%{args['numero_invoice'].strip()}%")
+    if args.get("contrato_comercial"):
+        where.append("i.contrato_comercial LIKE ?"); params.append(f"%{args['contrato_comercial'].strip()}%")
+    if args.get("tipo_documento"):
+        where.append("i.tipo_documento=?"); params.append(args["tipo_documento"].strip().upper())
+    if args.get("empresa_id"):
+        where.append("i.empresa_id=?"); params.append(form_record_id(args["empresa_id"]))
+    if args.get("cliente_id"):
+        where.append("i.cliente_id=?"); params.append(form_record_id(args["cliente_id"]))
+    if args.get("competencia_id"):
+        where.append("i.competencia_id=?"); params.append(form_record_id(args["competencia_id"]))
+    if args.get("moeda"):
+        where.append("i.moeda=?"); params.append(args["moeda"].strip().upper())
+    if args.get("status"):
         try:
-            status_filter = normalize_invoice_status(request.args["status"])
+            status_filter = normalize_invoice_status(args["status"])
             where.append("i.status=?"); params.append(status_filter)
         except ValueError:
             flash("Status de Invoice invalido.", "danger")
     try:
-        if request.args.get("data_de"):
-            where.append("i.data_emissao>=?"); params.append(parse_date(request.args["data_de"]))
-        if request.args.get("data_ate"):
-            where.append("i.data_emissao<=?"); params.append(parse_date(request.args["data_ate"]))
+        if args.get("data_de"):
+            where.append("i.data_emissao>=?"); params.append(parse_date(args["data_de"]))
+        if args.get("data_ate"):
+            where.append("i.data_emissao<=?"); params.append(parse_date(args["data_ate"]))
     except ValueError as exc:
         flash(str(exc), "danger")
     clause = " WHERE " + " AND ".join(where) if where else ""
-    sort_fields = {"numero_invoice": "i.numero_invoice", "contrato_comercial": "i.contrato_comercial",
-                   "tipo_documento": "i.tipo_documento",
-                   "competencia_id": "i.competencia_id", "data_emissao": "i.data_emissao", "moeda": "i.moeda", "valor_moeda": "i.valor_moeda",
-                   "status": "i.status"}
-    sort = request.args.get("sort", "data_emissao")
+    return clause, params
+
+
+def invoice_sorting(args):
+    sort_fields = {
+        "numero_invoice": "i.numero_invoice", "contrato_comercial": "i.contrato_comercial",
+        "tipo_documento": "i.tipo_documento", "competencia_id": "i.competencia_id",
+        "data_emissao": "i.data_emissao", "moeda": "i.moeda", "valor_moeda": "i.valor_moeda",
+        "status": "i.status",
+    }
+    sort = args.get("sort", "data_emissao")
     sort = sort if sort in sort_fields else "data_emissao"
-    direction = "ASC" if request.args.get("direction", "desc").lower() == "asc" else "DESC"
+    direction = "ASC" if args.get("direction", "desc").lower() == "asc" else "DESC"
+    return sort_fields, sort, direction
+
+
+@app.route("/invoices")
+def lista_invoices():
+    filters = {key: value for key, value in request.args.items() if key not in {"sort", "direction", "page"} and value}
+    clause, params = invoice_filter_query(request.args)
+    sort_fields, sort, direction = invoice_sorting(request.args)
     try:
         page = max(1, int(request.args.get("page", 1)))
     except ValueError:
@@ -5019,6 +5166,283 @@ def lista_invoices():
                            filters=filters, empresas=empresas, clientes=clientes, competencias=competencias, moedas=moedas,
                            invoice_statuses=INVOICE_STATUS_LABELS, sort=sort, direction=direction,
                            sort_links=sort_links, previous_args=previous_args, next_args=next_args)
+
+
+@app.route("/invoices/exportar")
+def exportar_invoices():
+    import pandas as pd
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    conn = db()
+    for row in conn.execute("SELECT id FROM invoices").fetchall():
+        refresh_invoice_status(conn, row["id"])
+    conn.commit()
+
+    clause, params = invoice_filter_query(request.args)
+    sort_fields, sort, direction = invoice_sorting(request.args)
+    rows = conn.execute(f"""
+        SELECT i.id
+        FROM invoices i {clause}
+        ORDER BY {sort_fields[sort]} {direction}, i.id DESC
+    """, params).fetchall()
+    invoice_ids = [row["id"] for row in rows]
+    invoices = [invoice_summary(conn, invoice_id) for invoice_id in invoice_ids]
+    invoices = [invoice for invoice in invoices if invoice]
+    invoice_by_id = {invoice["id"]: invoice for invoice in invoices}
+
+    receipts = []
+    changes = []
+    due_links = []
+    if invoice_ids:
+        placeholders = ",".join("?" for _ in invoice_ids)
+        receipts = conn.execute(f"""
+            SELECT r.id AS recebimento_id, r.invoice_id, r.banco_credito_id,
+                   r.data_credito, r.moeda, r.valor_moeda, r.documento,
+                   r.observacao, r.created_at AS recebimento_criado_em,
+                   i.numero_invoice, i.tipo_documento, i.data_emissao,
+                   i.moeda AS invoice_moeda, i.valor_moeda AS invoice_valor_moeda,
+                   e.id AS empresa_id, e.cnpj AS empresa_cnpj,
+                   e.razao_social AS empresa_razao_social, e.apelido AS empresa_apelido,
+                   cl.id AS cliente_id, cl.nome AS cliente_nome, cl.pais AS cliente_pais,
+                   cp.nome AS banco_credito_nome
+            FROM recebimentos_invoice r
+            JOIN invoices i ON i.id=r.invoice_id
+            JOIN empresas e ON e.id=i.empresa_id
+            LEFT JOIN clientes cl ON cl.id=i.cliente_id
+            LEFT JOIN contrapartes cp ON cp.id=r.banco_credito_id
+            WHERE r.invoice_id IN ({placeholders})
+            ORDER BY i.numero_invoice, r.data_credito, r.id
+        """, invoice_ids).fetchall()
+        changes = conn.execute(f"""
+            SELECT v.id AS vinculo_id, v.invoice_id, v.contrato_id,
+                   v.valor_alocado, v.observacao AS vinculo_observacao,
+                   v.created_at AS vinculo_criado_em,
+                   i.numero_invoice, i.tipo_documento, i.data_emissao,
+                   i.moeda AS invoice_moeda, i.valor_moeda AS invoice_valor_moeda,
+                   e.id AS empresa_id, e.cnpj AS empresa_cnpj,
+                   e.razao_social AS empresa_razao_social, e.apelido AS empresa_apelido,
+                   cl.id AS cliente_id, cl.nome AS cliente_nome, cl.pais AS cliente_pais,
+                   c.id AS contrato_registro_id, c.numero_contrato, c.banco_liquidacao_id,
+                   c.banco, c.banco_id, c.banco_credito, c.banco_liquidacao,
+                   c.data_contrato, c.data_recebimento, c.data_fechamento,
+                   c.data_liquidacao, c.cnpj AS contrato_cnpj,
+                   c.cliente AS contrato_cliente, c.cliente_id AS contrato_cliente_id,
+                   c.moeda AS contrato_moeda, c.valor_moeda AS contrato_valor_moeda,
+                   c.taxa_cambio AS contrato_taxa_cambio, c.valor_reais AS contrato_valor_reais,
+                   c.status AS contrato_status, c.saldo_zerado_manual,
+                   c.observacao AS contrato_observacao, c.competencia_id AS contrato_competencia_id,
+                   c.created_at AS contrato_criado_em,
+                   COALESCE((SELECT SUM(x.valor_alocado)
+                             FROM invoice_contrato_cambio x
+                             WHERE x.contrato_id=c.id), 0) AS contrato_total_alocado
+            FROM invoice_contrato_cambio v
+            JOIN invoices i ON i.id=v.invoice_id
+            JOIN empresas e ON e.id=i.empresa_id
+            LEFT JOIN clientes cl ON cl.id=i.cliente_id
+            JOIN contratos c ON c.id=v.contrato_id
+            WHERE v.invoice_id IN ({placeholders})
+            ORDER BY i.numero_invoice, c.numero_contrato, v.id
+        """, invoice_ids).fetchall()
+        due_links = conn.execute(f"""
+            SELECT di.id AS vinculo_id, di.invoice_id, di.due_id,
+                   di.valor_vinculado, di.observacao AS vinculo_observacao,
+                   di.created_at AS vinculo_criado_em,
+                   i.numero_invoice, i.tipo_documento, i.data_emissao,
+                   i.moeda AS invoice_moeda, i.valor_moeda AS invoice_valor_moeda,
+                   e.id AS empresa_id, e.cnpj AS empresa_cnpj,
+                   e.razao_social AS empresa_razao_social, e.apelido AS empresa_apelido,
+                   cl.id AS cliente_id, cl.nome AS cliente_nome, cl.pais AS cliente_pais,
+                   d.numero_due, d.chave_acesso, d.data_due,
+                   d.cnpj AS due_cnpj, d.cliente AS due_cliente,
+                   d.moeda AS due_moeda, d.valor_original AS due_valor_original,
+                   d.status AS due_status, d.observacao AS due_observacao,
+                   d.created_at AS due_criado_em, d.competencia_id AS due_competencia_id,
+                   comp.descricao AS due_competencia_descricao
+            FROM due_invoice di
+            JOIN invoices i ON i.id=di.invoice_id
+            JOIN empresas e ON e.id=i.empresa_id
+            LEFT JOIN clientes cl ON cl.id=i.cliente_id
+            JOIN dues d ON d.id=di.due_id
+            LEFT JOIN competencias comp ON comp.id=d.competencia_id
+            WHERE di.invoice_id IN ({placeholders})
+                   ORDER BY i.numero_invoice, d.numero_due, di.id
+        """, invoice_ids).fetchall()
+        due_usage = {
+            row["due_id"]: decimal_value(due_effect(conn, row["due_id"]))
+            for row in due_links
+        }
+    else:
+        due_usage = {}
+    conn.close()
+
+    date_fields = {
+        "data_emissao", "data_credito", "competencia_data_inicial", "competencia_data_final",
+        "created_at", "recebimento_criado_em", "vinculo_criado_em", "contrato_criado_em",
+        "data_contrato", "data_recebimento", "data_fechamento", "data_liquidacao",
+        "due_data_due", "due_criado_em",
+    }
+    date_list_fields = {"datas_credito", "datas_fechamento", "datas_liquidacao"}
+
+    def excel_value(value, field=None):
+        if value is None:
+            return None
+        if field in date_fields:
+            return date_br(value)
+        if field in date_list_fields:
+            return "; ".join(date_br(item) for item in value if date_br(item))
+        if isinstance(value, (list, tuple, set)):
+            return "; ".join(str(item) for item in value if item)
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, bool):
+            return "Sim" if value else "Nao"
+        return value
+
+    def mapped_row(item, fields):
+        data = dict(item)
+        return {label: excel_value(data.get(key), key) for key, label in fields}
+
+    invoice_fields = [
+        ("id", "ID"), ("empresa_id", "Empresa ID"), ("empresa_cnpj", "Empresa - CNPJ"),
+        ("empresa_razao_social", "Empresa - Razao social"), ("empresa_apelido", "Empresa - Apelido"),
+        ("numero_invoice", "Numero da Invoice"), ("tipo_documento", "Tipo"),
+        ("contrato_comercial", "Contrato comercial"), ("competencia_id", "Competencia ID"),
+        ("competencia_descricao", "Competencia"), ("competencia_data_inicial", "Competencia - inicio"),
+        ("competencia_data_final", "Competencia - fim"), ("cliente_id", "Cliente ID"),
+        ("cliente_nome", "Cliente"), ("cliente_pais", "Pais do cliente"),
+        ("data_emissao", "Data de emissao"), ("data_credito", "Data de credito"),
+        ("moeda", "Moeda"), ("valor_moeda", "Valor da Invoice"), ("total_recebido", "Total recebido"),
+        ("saldo_recebimento", "Saldo de recebimento"), ("total_cambio", "Total de cambio"),
+        ("saldo_cambio", "Saldo sem cambio"), ("taxa_cambio_media", "Taxa media de cambio"),
+        ("valor_brl", "Valor BRL"), ("status", "Status"), ("status_manual", "Status manual"),
+        ("bancos_credito", "Bancos de credito"), ("bancos_liquidacao", "Bancos de liquidacao"),
+        ("contratos_numeros", "Contratos de cambio"), ("datas_credito", "Datas de credito"),
+        ("datas_fechamento", "Datas de fechamento"), ("datas_liquidacao", "Datas de liquidacao"),
+        ("observacao", "Observacao"), ("created_at", "Criado em"),
+    ]
+    invoice_data = []
+    for invoice in invoices:
+        item = dict(invoice)
+        item["tipo_documento"] = invoice_type_label(item["tipo_documento"])
+        item["status"] = INVOICE_STATUS_LABELS.get(item["status"], item["status"])
+        item["status_manual"] = bool(item["status_manual"])
+        invoice_data.append(mapped_row(item, invoice_fields))
+
+    receipt_fields = [
+        ("recebimento_id", "Recebimento ID"), ("invoice_id", "Invoice ID"),
+        ("numero_invoice", "Numero da Invoice"), ("tipo_documento", "Tipo"),
+        ("empresa_id", "Empresa ID"), ("empresa_cnpj", "Empresa - CNPJ"),
+        ("empresa_razao_social", "Empresa - Razao social"), ("empresa_apelido", "Empresa - Apelido"),
+        ("cliente_id", "Cliente ID"), ("cliente_nome", "Cliente"), ("cliente_pais", "Pais do cliente"),
+        ("data_emissao", "Data de emissao"), ("invoice_moeda", "Moeda da Invoice"),
+        ("invoice_valor_moeda", "Valor da Invoice"), ("banco_credito_id", "Banco credito ID"),
+        ("banco_credito_nome", "Banco de credito"), ("data_credito", "Data de credito"),
+        ("moeda", "Moeda do recebimento"), ("valor_moeda", "Valor recebido"),
+        ("documento", "Documento"), ("observacao", "Observacao"),
+        ("recebimento_criado_em", "Recebimento criado em"), ("invoice_status", "Status da Invoice"),
+    ]
+    receipt_data = []
+    for row in receipts:
+        item = dict(row)
+        invoice = invoice_by_id.get(item["invoice_id"])
+        item["tipo_documento"] = invoice_type_label(item["tipo_documento"])
+        item["invoice_status"] = INVOICE_STATUS_LABELS.get(invoice["status"]) if invoice else None
+        receipt_data.append(mapped_row(item, receipt_fields))
+
+    change_fields = [
+        ("vinculo_id", "Vinculo ID"), ("invoice_id", "Invoice ID"),
+        ("numero_invoice", "Numero da Invoice"), ("tipo_documento", "Tipo"),
+        ("empresa_id", "Empresa ID"), ("empresa_cnpj", "Empresa - CNPJ"),
+        ("empresa_razao_social", "Empresa - Razao social"), ("empresa_apelido", "Empresa - Apelido"),
+        ("cliente_id", "Cliente ID"), ("cliente_nome", "Cliente"), ("cliente_pais", "Pais do cliente"),
+        ("data_emissao", "Data de emissao"), ("invoice_moeda", "Moeda da Invoice"),
+        ("invoice_valor_moeda", "Valor da Invoice"), ("contrato_id", "Contrato ID"),
+        ("numero_contrato", "Numero do Contrato Cambio"), ("banco_liquidacao_id", "Banco liquidacao ID"),
+        ("banco", "Banco legado"), ("banco_id", "Banco credito ID"),
+        ("banco_credito", "Banco de credito"), ("banco_liquidacao", "Banco de liquidacao"),
+        ("data_contrato", "Data do contrato"), ("data_recebimento", "Data de recebimento"),
+        ("data_fechamento", "Data de fechamento"), ("data_liquidacao", "Data de liquidacao"),
+        ("contrato_cnpj", "Contrato - CNPJ"), ("contrato_cliente", "Contrato - Cliente"),
+        ("contrato_cliente_id", "Contrato - Cliente ID"), ("contrato_moeda", "Moeda do contrato"),
+        ("contrato_valor_moeda", "Valor do contrato"), ("contrato_taxa_cambio", "Taxa de cambio"),
+        ("contrato_valor_reais", "Valor do contrato em reais"), ("valor_alocado", "Valor alocado"),
+        ("contrato_total_alocado", "Total alocado no contrato"), ("contrato_saldo", "Saldo do contrato"),
+        ("contrato_status", "Status do contrato"), ("saldo_zerado_manual", "Saldo zerado manualmente"),
+        ("contrato_competencia_id", "Contrato - Competencia ID"),
+        ("vinculo_observacao", "Observacao do vinculo"), ("contrato_observacao", "Observacao do contrato"),
+        ("vinculo_criado_em", "Vinculo criado em"), ("contrato_criado_em", "Contrato criado em"),
+        ("invoice_status", "Status da Invoice"),
+    ]
+    change_data = []
+    for row in changes:
+        item = dict(row)
+        invoice = invoice_by_id.get(item["invoice_id"])
+        item["tipo_documento"] = invoice_type_label(item["tipo_documento"])
+        item["invoice_status"] = INVOICE_STATUS_LABELS.get(invoice["status"]) if invoice else None
+        item["contrato_saldo"] = Decimal("0") if item["saldo_zerado_manual"] else contract_balance(
+            item["contrato_valor_moeda"], item["contrato_total_alocado"]
+        )
+        item["contrato_status"] = item["contrato_status"] or ""
+        item["saldo_zerado_manual"] = bool(item["saldo_zerado_manual"])
+        change_data.append(mapped_row(item, change_fields))
+
+    due_fields = [
+        ("vinculo_id", "Vinculo ID"), ("invoice_id", "Invoice ID"), ("due_id", "DU-E ID"),
+        ("numero_invoice", "Numero da Invoice"), ("tipo_documento", "Tipo"),
+        ("empresa_id", "Empresa ID"), ("empresa_cnpj", "Empresa - CNPJ"),
+        ("empresa_razao_social", "Empresa - Razao social"), ("empresa_apelido", "Empresa - Apelido"),
+        ("cliente_id", "Cliente ID"), ("cliente_nome", "Cliente"), ("cliente_pais", "Pais do cliente"),
+        ("data_emissao", "Data de emissao"), ("invoice_moeda", "Moeda da Invoice"),
+        ("invoice_valor_moeda", "Valor da Invoice"), ("numero_due", "Numero da DU-E"),
+        ("chave_acesso", "Chave de acesso"), ("due_data_due", "Data da DU-E"),
+        ("due_cnpj", "DU-E - CNPJ"), ("due_cliente", "DU-E - Cliente"),
+        ("due_moeda", "Moeda da DU-E"), ("due_valor_original", "Valor original da DU-E"),
+        ("due_utilizado", "Total utilizado na DU-E"), ("due_saldo", "Saldo da DU-E"),
+        ("due_status", "Status da DU-E"), ("due_competencia_id", "DU-E - Competencia ID"),
+        ("due_competencia_descricao", "DU-E - Competencia"), ("valor_vinculado", "Valor vinculado"),
+        ("vinculo_observacao", "Observacao do vinculo"), ("due_observacao", "Observacao da DU-E"),
+        ("vinculo_criado_em", "Vinculo criado em"), ("due_criado_em", "DU-E criada em"),
+        ("invoice_status", "Status da Invoice"),
+    ]
+    due_data = []
+    for row in due_links:
+        item = dict(row)
+        invoice = invoice_by_id.get(item["invoice_id"])
+        item["tipo_documento"] = invoice_type_label(item["tipo_documento"])
+        item["invoice_status"] = INVOICE_STATUS_LABELS.get(invoice["status"]) if invoice else None
+        item["due_utilizado"] = due_usage.get(item["due_id"], Decimal("0"))
+        item["due_saldo"] = due_balance(item["due_valor_original"], item["due_utilizado"])
+        due_data.append(mapped_row(item, due_fields))
+
+    invoice_columns = [label for _, label in invoice_fields]
+    receipt_columns = [label for _, label in receipt_fields]
+    change_columns = [label for _, label in change_fields]
+    due_columns = [label for _, label in due_fields]
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        sheets = [
+            ("Invoices", invoice_data, invoice_columns),
+            ("Recebimentos", receipt_data, receipt_columns),
+            ("Cambios", change_data, change_columns),
+            ("DU-Es", due_data, due_columns),
+        ]
+        for sheet_name, data, columns in sheets:
+            pd.DataFrame(data, columns=columns).to_excel(writer, index=False, sheet_name=sheet_name)
+        for worksheet in writer.book.worksheets:
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1769AA")
+                cell.alignment = Alignment(horizontal="center")
+            for column in worksheet.columns:
+                letter = get_column_letter(column[0].column)
+                width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 12), 45)
+                worksheet.column_dimensions[letter].width = width
+    output.seek(0)
+    return send_file(output, as_attachment=True, download_name="invoices_exportacao.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 @app.route("/invoice/nova", methods=["GET", "POST"])
 def nova_invoice():
@@ -5372,6 +5796,7 @@ def importar_invoices():
         rows = prepare_invoice_import_rows(df, pd)
         conn = db()
         resolve_invoice_import_companies(conn, rows)
+        bank_suggestions = resolve_invoice_import_banks(conn, rows)
         client_suggestions = resolve_invoice_import_clients(conn, rows)
         competencia_suggestions = resolve_invoice_import_competencies(conn, rows)
         existing = invoice_identity_rows(conn, rows)
@@ -5379,11 +5804,14 @@ def importar_invoices():
         for key, item in existing.items():
             snapshots["|".join(map(str, key))] = invoice_import_snapshot(item)
         payload = {"version": 1, "rows": rows, "existing_by_key": snapshots,
+                   "bank_suggestions": bank_suggestions,
                    "client_suggestions": client_suggestions,
                    "competencia_suggestions": competencia_suggestions}
         save_invoice_stage(payload)
         return render_template("invoice_import_preview.html", groups=invoice_import_preview_context(payload),
                                client_suggestions=client_suggestions, countries=CLIENTE_PAISES_ORDENADOS,
+                               clientes=clientes_for_form(conn),
+                               bank_suggestions=bank_suggestions, contrapartes=contrapartes_for_form(conn),
                                competencia_suggestions=competencia_suggestions,
                                total_rows=len(rows), stage_token=session.get("invoice_import_stage"), error=None)
     except ValueError as exc:
@@ -5411,9 +5839,32 @@ def confirmar_importacao_invoices():
                 continue
             selected_rows.extend(group["rows"])
         country_overrides = {}
+        client_overrides = {}
+        bank_overrides = {}
+        selected_bank_keys = {
+            invoice_import_bank_key(field, row.get(field))
+            for row in selected_rows
+            for field in ("banco_credito", "banco_liquidacao")
+            if row.get(field)
+        }
+        for suggestion in payload.get("bank_suggestions", []):
+            if suggestion["key"] not in selected_bank_keys:
+                continue
+            selected_bank_id = request.form.get(f"banco_existente_{suggestion['suggestion_id']}")
+            if not selected_bank_id:
+                raise ValueError(
+                    f"Selecione um banco cadastrado para {suggestion['nome']} ({suggestion['tipo']})."
+                )
+            bank_overrides[suggestion["key"]] = selected_bank_id
+            suggestion["contraparte_id"] = selected_bank_id
         selected_client_keys = {row.get("cliente_import_key") for row in selected_rows}
         for suggestion in payload.get("client_suggestions", []):
             if suggestion["key"] not in selected_client_keys:
+                continue
+            selected_client_id = request.form.get(f"cliente_existente_{suggestion['suggestion_id']}")
+            if selected_client_id:
+                client_overrides[suggestion["key"]] = selected_client_id
+                suggestion["cliente_existente_id"] = selected_client_id
                 continue
             country = normalize_import_client_country(
                 request.form.get(f"cliente_novo_pais_{suggestion['suggestion_id']}") or suggestion.get("pais")
@@ -5423,6 +5874,7 @@ def confirmar_importacao_invoices():
                     f"Informe o País para o novo cliente sugerido {suggestion['nome']}."
                 )
             country_overrides[suggestion["key"]] = country
+            suggestion["cliente_novo_pais"] = country
         competency_overrides = {}
         selected_competency_keys = {row.get("competencia_import_key") for row in selected_rows}
         for suggestion in payload.get("competencia_suggestions", []):
@@ -5440,7 +5892,8 @@ def confirmar_importacao_invoices():
             }
         result = apply_invoice_import_rows(
             conn, selected_rows, country_overrides=country_overrides,
-            competency_overrides=competency_overrides,
+            client_overrides=client_overrides,
+            competency_overrides=competency_overrides, bank_overrides=bank_overrides,
         )
         conn.commit(); remove_invoice_stage(request.form.get("stage_token"))
         flash(f"Importação concluída: {result['inserted']} Invoice(s) inserida(s) e {result['updated']} atualizada(s).", "success")
@@ -5451,6 +5904,9 @@ def confirmar_importacao_invoices():
         if payload is not None:
             return render_template("invoice_import_preview.html", groups=invoice_import_preview_context(payload),
                                    client_suggestions=payload.get("client_suggestions", []),
+                                   clientes=clientes_for_form(conn),
+                                   bank_suggestions=payload.get("bank_suggestions", []),
+                                   contrapartes=contrapartes_for_form(conn),
                                    competencia_suggestions=payload.get("competencia_suggestions", []),
                                    countries=CLIENTE_PAISES_ORDENADOS, total_rows=len(payload["rows"]),
                                    stage_token=session.get("invoice_import_stage"), error=message), 400
@@ -5472,8 +5928,13 @@ def modelo_invoices():
                "data_credito", "data_fechamento", "data_liquidacao", "moeda", "valor_moeda",
                "taxa_cambio", "valor_brl", "status"]
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(columns=columns).to_excel(writer, index=False, sheet_name="Invoices")
+    conn = db()
+    try:
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            pd.DataFrame(columns=columns).to_excel(writer, index=False, sheet_name="Invoices")
+            write_excel_model_orientations(writer, conn, pd)
+    finally:
+        conn.close()
     output.seek(0)
     return send_file(output, as_attachment=True, download_name="modelo_invoices.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

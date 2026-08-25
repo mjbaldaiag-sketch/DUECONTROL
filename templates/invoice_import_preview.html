@@ -5,6 +5,22 @@
 <form method="post" action="{{ url_for('confirmar_importacao_invoices') }}" class="import-preview-form">
   <input type="hidden" name="stage_token" value="{{ stage_token }}">
   <section class="import-preview-section"><h2>Status</h2><p class="muted">O status informado no Excel será atribuído à Invoice. Quando a coluna estiver vazia, será usado AGUARDANDO RECEBIMENTO. Para RECEBIDO AGUARDANDO CAMBIO, a coluna data_credito é obrigatória.</p>{% for group in groups %}<p><strong>{{ group.key[1] }}</strong>: {{ group.rows[0].status|invoice_status_label if group.rows[0].status else 'AGUARDANDO RECEBIMENTO' }} · Data do crédito: {{ group.rows[0].data_credito|date_br or '-' }}</p>{% endfor %}</section>
+{% if bank_suggestions %}
+<section class="import-client-suggestions import-bank-suggestions">
+  <h2>Bancos não identificados</h2>
+  <p class="muted">Selecione na lista o banco cadastrado que deve ser vinculado a cada banco informado no Excel.</p>
+  {% for suggestion in bank_suggestions %}
+  {% set contraparte_id = suggestion.contraparte_id or '' %}
+  <div class="import-client-suggestion bank-resolution">
+    <div><strong>{{ suggestion.tipo }} informado: {{ suggestion.nome }}</strong><small>Linhas: {{ suggestion.linhas|join(', ') }}</small></div>
+    <label>Banco cadastrado<select name="banco_existente_{{ suggestion.suggestion_id }}">
+      <option value="">Selecione um banco</option>
+      {% for contraparte in contrapartes %}<option value="{{ contraparte.id }}" {{ 'selected' if contraparte_id|string == contraparte.id|string else '' }}>{{ contraparte.nome }}</option>{% endfor %}
+    </select></label>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
 {% if competencia_suggestions %}
 <section class="import-client-suggestions import-competency-suggestions">
   <h2>Competências não cadastradas</h2>
@@ -20,7 +36,27 @@
   {% endfor %}
 </section>
 {% endif %}
-{% if client_suggestions %}<section class="import-client-suggestions"><h2>Clientes não identificados</h2><p class="muted">Confira as sugestões abaixo. Clientes já cadastrados são associados automaticamente ignorando diferenças de acentos, caixa, pontuação e espaços.</p>{% for suggestion in client_suggestions %}<div class="import-client-suggestion"><div><strong>Cliente novo sugerido: {{ suggestion.nome }}</strong><small>Linhas: {{ suggestion.linhas|join(', ') }}{% if suggestion.candidatos %}<br>Correspondência próxima: {% for candidato in suggestion.candidatos %}{{ candidato.nome }} ({{ candidato.pais|pais_nome }}){% if not loop.last %}; {% endif %}{% endfor %}{% endif %}</small></div><label>País do cliente<select name="cliente_novo_pais_{{ suggestion.suggestion_id }}" required><option value="">Selecione um país</option>{% for codigo, nome_pais in countries %}<option value="{{ codigo }}" {{ 'selected' if suggestion.pais == codigo else '' }}>{{ nome_pais }}</option>{% endfor %}</select></label></div>{% endfor %}</section>{% endif %}
+{% if client_suggestions %}
+<section class="import-client-suggestions">
+  <h2>Clientes não identificados</h2>
+  <p class="muted">Escolha um cliente já cadastrado para normalizar a importação ou confirme o cadastro de um novo cliente.</p>
+  {% for suggestion in client_suggestions %}
+  {% set cliente_existente_id = suggestion.cliente_existente_id or '' %}
+  <div class="import-client-suggestion client-resolution" data-client-resolution>
+    <div>
+      <strong>Cliente novo sugerido: {{ suggestion.nome }}</strong>
+      <small>Linhas: {{ suggestion.linhas|join(', ') }}{% if suggestion.candidatos %}<br>Correspondência próxima: {% for candidato in suggestion.candidatos %}{{ candidato.nome }} ({{ candidato.pais|pais_nome }}){% if not loop.last %}; {% endif %}{% endfor %}{% endif %}</small>
+    </div>
+    <label>Usar cliente já cadastrado<select name="cliente_existente_{{ suggestion.suggestion_id }}" data-client-existing>
+      <option value="">Nenhum — cadastrar cliente novo</option>
+      {% for cliente in clientes %}<option value="{{ cliente.id }}" {{ 'selected' if cliente_existente_id|string == cliente.id|string else '' }}>{{ cliente.nome }} — {{ cliente.pais|pais_nome }}</option>{% endfor %}
+    </select></label>
+    <label data-client-country{% if cliente_existente_id %} hidden{% endif %}>País do cliente<select name="cliente_novo_pais_{{ suggestion.suggestion_id }}" data-client-country-select><option value="">Selecione um país</option>{% for codigo, nome_pais in countries %}<option value="{{ codigo }}" {{ 'selected' if (suggestion.cliente_novo_pais or suggestion.pais) == codigo else '' }}>{{ nome_pais }}</option>{% endfor %}</select></label>
+    <small class="muted">Ao escolher um cliente existente, o país acima será ignorado e o nome cadastrado será usado na Invoice.</small>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
   {% for group in groups %}{% set key = group.key %}<section class="import-conflict"><h2>{{ key[1] }} — {{ key[2]|invoice_type_label }}</h2><p class="muted">{{ group.rows|length }} linha(s), CNPJ {{ key[0] }} · Cliente: {{ group.rows[0].cliente or '-' }} · Contrato comercial: {{ group.rows[0].contrato_comercial or '-' }} · Competência: {{ group.rows[0].competencia }}</p><div class="table-wrap"><table class="compact-table"><thead><tr><th>Linha</th><th>Banco Crédito</th><th>Banco Liquidação</th><th>Contrato Câmbio</th><th>Cliente</th><th>Emissão</th><th>Data Crédito</th><th>Fechamento</th><th>Liquidação</th><th>Moeda</th><th>Valor Moeda</th><th>Taxa Câmbio</th><th>Valor BRL</th><th>Status</th></tr></thead><tbody>{% for row in group.rows %}<tr><td>{{ row.source_row }}</td><td>{{ row.banco_credito or '-' }}</td><td>{{ row.banco_liquidacao or '-' }}</td><td>{{ row.numero_contrato_cambio or '-' }}</td><td>{{ row.cliente or '-' }}</td><td>{{ row.data_emissao|date_br or '-' }}</td><td>{{ row.data_credito|date_br or '-' }}</td><td>{{ row.data_fechamento|date_br or '-' }}</td><td>{{ row.data_liquidacao|date_br or '-' }}</td><td>{{ row.moeda }}</td><td>{{ row.valor_invoice|money }}</td><td>{{ row.taxa_cambio|rate if row.taxa_cambio is not none else '-' }}</td><td>{{ row.valor_brl|money if row.valor_brl is not none else '-' }}</td><td>{{ row.status|invoice_status_label if row.status else 'AGUARDANDO RECEBIMENTO' }}</td></tr>{% endfor %}</tbody></table></div>{% if group.existing %}<fieldset class="import-choice"><legend>Invoice já existente</legend><label><input type="radio" name="existing_action_{{ group.group_id }}" value="update" checked> Atualizar a Invoice</label><label><input type="radio" name="existing_action_{{ group.group_id }}" value="discard"> Descartar este grupo</label></fieldset>{% endif %}</section>{% endfor %}
   <div class="form-actions"><button type="submit">Confirmar importação</button></div>
 </form>
