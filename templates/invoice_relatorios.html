@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading">
+  <div><h1>Relatórios de Invoices</h1><p class="muted">Consolidado de invoices em USD por Cliente / Trading.</p></div>
+  <a class="btn secondary" href="{{ url_for('lista_invoices') }}">Voltar às Invoices</a>
+</div>
+
+<section class="report-section">
+  <h2>Indicadores</h2>
+  <div class="summary-cards invoice-report-kpis">
+    <div class="kpi-blue"><span>Total de Invoices Recebidas</span><strong>US$ {{ kpis.total_recebido|money }}</strong></div>
+    <div class="kpi-green"><span>Total Fechamento de Câmbio</span><strong>US$ {{ kpis.total_cambio|money }}</strong></div>
+    <div class="kpi-yellow"><span>Total de Invoices Aguardando Recebimento</span><strong>US$ {{ kpis.total_aguardando_recebimento|money }}</strong></div>
+  </div>
+</section>
+
+{% for table in tables %}
+<section class="report-section">
+  <div class="section-heading">
+    <h2>{{ table.title }}</h2>
+    <button type="button" class="copy-data-btn" data-copy-value="{{ table.copy_text }}" aria-label="Copiar tabela {{ table.title }}"><span aria-hidden="true">&#x27e7;</span></button>
+  </div>
+  <div class="table-wrap">
+    <table class="compact-table invoice-report-table">
+      <thead><tr><th>Cliente / Trading</th><th>USD</th></tr></thead>
+      <tbody>
+        {% for row in table.rows %}
+        <tr><td>{{ row.cliente }}</td><td>US$ {{ row.valor|money }}</td></tr>
+        {% else %}
+        <tr><td colspan="2" class="empty">Nenhuma Invoice encontrada.</td></tr>
+        {% endfor %}
+      </tbody>
+      <tfoot><tr><th>TOTAL</th><th>US$ {{ table.total|money }}</th></tr></tfoot>
+    </table>
+  </div>
+</section>
+{% endfor %}
+{% endblock %}

@@ -4377,6 +4377,73 @@ def refresh_invoice_status(conn, invoice_id):
                          (summary["status"], data_credito, invoice_id))
     return summary["status"]
 
+
+def invoice_report_copy_text(title, rows, total):
+    lines = [title, "", "Cliente / Trading        USD"]
+    for row in rows:
+        lines.append(f"{row['cliente']:<24} US$ {money(row['valor'])}")
+    lines.extend([
+        "--------------------------------",
+        f"{'TOTAL':<24} US$ {money(total)}",
+    ])
+    return "\n".join(lines)
+
+
+def build_invoice_report_context():
+    conn = db()
+    try:
+        invoice_ids = [row["id"] for row in conn.execute("SELECT id FROM invoices").fetchall()]
+        for invoice_id in invoice_ids:
+            refresh_invoice_status(conn, invoice_id)
+        conn.commit()
+        summaries = [invoice_summary(conn, invoice_id) for invoice_id in invoice_ids]
+    finally:
+        conn.close()
+
+    summaries = [
+        summary for summary in summaries
+        if summary and str(summary.get("moeda") or "").upper() == "USD"
+    ]
+
+    def grouped_rows(status, value_key):
+        grouped = {}
+        for summary in summaries:
+            if summary["status"] != status:
+                continue
+            cliente = summary.get("cliente_nome") or "Não informado"
+            grouped[cliente] = grouped.get(cliente, Decimal("0")) + decimal_value(summary[value_key])
+        rows = [{"cliente": cliente, "valor": valor} for cliente, valor in grouped.items()]
+        rows.sort(key=lambda row: (-row["valor"], row["cliente"].casefold()))
+        total = sum((row["valor"] for row in rows), Decimal("0"))
+        return rows, total
+
+    recebido_aguardando_cambio, total_recebido_aguardando_cambio = grouped_rows(
+        INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, "saldo_cambio"
+    )
+    aguardando_recebimento, total_aguardando_recebimento = grouped_rows(
+        INVOICE_STATUS_AGUARDANDO_RECEBIMENTO, "saldo_recebimento"
+    )
+    total_recebido = sum((decimal_value(summary["total_recebido"]) for summary in summaries), Decimal("0"))
+    total_cambio = sum((decimal_value(summary["total_cambio"]) for summary in summaries), Decimal("0"))
+
+    tables = [
+        {"title": "RECEBIDO AGUARDANDO CÂMBIO", "rows": recebido_aguardando_cambio,
+         "total": total_recebido_aguardando_cambio},
+        {"title": "AGUARDANDO RECEBIMENTO", "rows": aguardando_recebimento,
+         "total": total_aguardando_recebimento},
+    ]
+    for table in tables:
+        table["copy_text"] = invoice_report_copy_text(table["title"], table["rows"], table["total"])
+
+    return {
+        "kpis": {
+            "total_recebido": total_recebido,
+            "total_cambio": total_cambio,
+            "total_aguardando_recebimento": total_aguardando_recebimento,
+        },
+        "tables": tables,
+    }
+
 def validate_invoice_balances(summary, extra_recebido=0, extra_cambio=0,
                               replacement_recebido=None, replacement_cambio=None):
     valor = decimal_value(summary["valor_moeda"])
@@ -5166,6 +5233,11 @@ def lista_invoices():
                            filters=filters, empresas=empresas, clientes=clientes, competencias=competencias, moedas=moedas,
                            invoice_statuses=INVOICE_STATUS_LABELS, sort=sort, direction=direction,
                            sort_links=sort_links, previous_args=previous_args, next_args=next_args)
+
+
+@app.route("/invoices/relatorios")
+def relatorios_invoices():
+    return render_template("invoice_relatorios.html", **build_invoice_report_context())
 
 
 @app.route("/invoices/exportar")

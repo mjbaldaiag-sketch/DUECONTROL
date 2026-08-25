@@ -30,10 +30,10 @@ class InvoiceFlowTests(unittest.TestCase):
         app.DB = self.previous_db
         self.db_path.unlink(missing_ok=True)
 
-    def _create_invoice(self, number="INV-001", value="1000,00", commercial=None):
+    def _create_invoice(self, number="INV-001", value="1000,00", commercial=None, client_id=1, currency="USD"):
         data = {
             "empresa_id": "1", "numero_invoice": number, "tipo_documento": "COMMERCIAL_INVOICE",
-            "competencia_id": "1", "cliente_id": "1", "data_emissao": "01/08/2026", "moeda": "USD",
+            "competencia_id": "1", "cliente_id": str(client_id), "data_emissao": "01/08/2026", "moeda": currency,
             "valor_moeda": value,
         }
         if commercial is not None:
@@ -44,6 +44,78 @@ class InvoiceFlowTests(unittest.TestCase):
         invoice = conn.execute("SELECT * FROM invoices WHERE numero_invoice=?", (number,)).fetchone()
         conn.close()
         return invoice["id"]
+
+    def test_invoice_report_consolidates_real_status_balances_and_copy_payloads(self):
+        conn = app.db()
+        conn.execute("INSERT INTO clientes (nome, pais) VALUES (?,?)", ("Cliente B", "BR"))
+        client_b_id = conn.execute("SELECT id FROM clientes WHERE nome=?", ("Cliente B",)).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        self._create_invoice(number="INV-REPORT-A", value="1000,00")
+        self._create_invoice(number="INV-REPORT-B", value="300,00", client_id=client_b_id)
+        received_a = self._create_invoice(number="INV-REPORT-C", value="1000,00")
+        received_b = self._create_invoice(number="INV-REPORT-D", value="700,00", client_id=client_b_id)
+        settled = self._create_invoice(number="INV-REPORT-E", value="50,00")
+        self._create_invoice(number="INV-REPORT-EUR", value="900,00", currency="EUR")
+
+        conn = app.db()
+        conn.executemany(
+            "INSERT INTO recebimentos_invoice (invoice_id,data_credito,moeda,valor_moeda) VALUES (?,?,?,?)",
+            [(received_a, "2026-08-10", "USD", 1000),
+             (received_b, "2026-08-11", "USD", 700),
+             (settled, "2026-08-12", "USD", 50)],
+        )
+        conn.executemany(
+            "INSERT INTO contratos (numero_contrato,moeda,valor_moeda,status) VALUES (?,?,?,?)",
+            [("C-REPORT-A", "USD", 600, "CONCLUIDO"),
+             ("C-REPORT-B", "USD", 100, "CONCLUIDO"),
+             ("C-REPORT-C", "USD", 50, "CONCLUIDO")],
+        )
+        contracts = conn.execute(
+            "SELECT id FROM contratos WHERE numero_contrato LIKE 'C-REPORT-%' ORDER BY numero_contrato"
+        ).fetchall()
+        conn.executemany(
+            "INSERT INTO invoice_contrato_cambio (invoice_id,contrato_id,valor_alocado) VALUES (?,?,?)",
+            [(received_a, contracts[0][0], 600),
+             (received_b, contracts[1][0], 100),
+             (settled, contracts[2][0], 50)],
+        )
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/invoices")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("/invoices/relatorios", response.get_data(as_text=True))
+
+        response = self.client.get("/invoices/relatorios")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn("Total de Invoices Recebidas", html)
+        self.assertIn("US$ 1.750,00", html)
+        self.assertIn("US$ 750,00", html)
+        self.assertIn("US$ 1.300,00", html)
+        self.assertIn("US$ 400,00", html)
+        self.assertIn("US$ 600,00", html)
+        self.assertNotIn("INV-REPORT-EUR", html)
+        self.assertEqual(html.count('data-copy-value='), 2)
+        self.assertLess(html.index("Cliente B"), html.index("Cliente Teste"))
+        self.assertIn("RECEBIDO AGUARDANDO CÂMBIO", html)
+        self.assertIn("AGUARDANDO RECEBIMENTO", html)
+
+        context = app.build_invoice_report_context()
+        self.assertEqual(
+            [row["cliente"] for row in context["tables"][0]["rows"]],
+            ["Cliente B", "Cliente Teste"],
+        )
+        self.assertEqual(
+            [row["cliente"] for row in context["tables"][1]["rows"]],
+            ["Cliente Teste", "Cliente B"],
+        )
+        self.assertEqual(context["tables"][0]["total"], app.Decimal("1000"))
+        self.assertEqual(context["tables"][1]["total"], app.Decimal("1300"))
+        self.assertIn("TOTAL                    US$ 1.000,00", context["tables"][0]["copy_text"])
+        self.assertIn("TOTAL                    US$ 1.300,00", context["tables"][1]["copy_text"])
 
     def test_invoice_competencies_are_scoped_to_company_and_cross_company_selection_is_rejected(self):
         conn = app.db()
