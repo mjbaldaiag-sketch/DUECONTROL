@@ -92,6 +92,17 @@
     });
   });
 
+  document.querySelectorAll('[data-report-details-toggle]').forEach((button) => {
+    const target = document.getElementById(button.dataset.reportDetailsTarget);
+    if (!target) return;
+    button.addEventListener('click', () => {
+      const expanded = button.getAttribute('aria-expanded') === 'true';
+      target.hidden = expanded;
+      button.setAttribute('aria-expanded', String(!expanded));
+      button.textContent = expanded ? 'Detalhes' : 'Ocultar detalhes';
+    });
+  });
+
   const sortableNumber = (value) => {
     const text = String(value || '').trim();
     if (!text) return null;

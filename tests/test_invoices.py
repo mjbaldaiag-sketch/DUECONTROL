@@ -92,6 +92,8 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         html = response.get_data(as_text=True)
         self.assertIn("Total de Invoices Recebidas", html)
+        self.assertIn('/invoices/relatorios/imprimir', html)
+        self.assertIn("Imprimir / PDF", html)
         self.assertIn("USD 1.750,00", html)
         self.assertIn("USD 750,00", html)
         self.assertIn("USD 1.300,00", html)
@@ -124,6 +126,97 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertIn("<thead", context["tables"][0]["copy_html"])
         self.assertIn("background:#f4fbf5", context["tables"][0]["copy_html"])
         self.assertIn("background:#fdf5f5", context["tables"][1]["copy_html"])
+
+    def test_invoice_report_detail_groups_preserve_values_for_banks_and_statuses(self):
+        conn = app.db()
+        conn.execute("INSERT INTO contrapartes (nome) VALUES (?)", ("Banco Dois",))
+        bank_two_id = conn.execute("SELECT id FROM contrapartes WHERE nome=?", ("Banco Dois",)).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        awaiting_without_receipt = self._create_invoice("INV-DETAIL-AWAITING", "120,00")
+        awaiting_partial = self._create_invoice("INV-DETAIL-PARTIAL", "500,00")
+        received_multi_bank = self._create_invoice("INV-DETAIL-MULTI-BANK", "1000,00")
+
+        conn = app.db()
+        conn.executemany(
+            "INSERT INTO recebimentos_invoice (invoice_id,banco_credito_id,data_credito,moeda,valor_moeda) VALUES (?,?,?,?,?)",
+            [(awaiting_partial, 1, "2026-08-10", "USD", 200),
+             (received_multi_bank, 1, "2026-08-11", "USD", 400),
+             (received_multi_bank, bank_two_id, "2026-08-12", "USD", 600)],
+        )
+        conn.commit()
+        conn.close()
+
+        context = app.build_invoice_report_context()
+        exchange = context["tables"][0]
+        awaiting = context["tables"][1]
+
+        self.assertEqual(len(exchange["detail_groups"]), 1)
+        exchange_bank = exchange["detail_groups"][0]
+        self.assertEqual(exchange_bank["banco"], "Banco Dois, Banco Teste")
+        self.assertEqual(exchange_bank["subtotal"], app.Decimal("1000"))
+        exchange_invoices = exchange_bank["empresas"][0]["clientes"][0]["invoices"]
+        self.assertEqual([(row["numero"], row["valor"]) for row in exchange_invoices],
+                         [("INV-DETAIL-MULTI-BANK", app.Decimal("1000"))])
+        self.assertEqual(exchange["total"], app.Decimal("1000"))
+
+        awaiting_groups = {group["banco"]: group for group in awaiting["detail_groups"]}
+        self.assertEqual(set(awaiting_groups), {"-", "Banco Teste"})
+        self.assertEqual(awaiting_groups["-"]["subtotal"], app.Decimal("120"))
+        self.assertEqual(awaiting_groups["Banco Teste"]["subtotal"], app.Decimal("300"))
+        self.assertEqual(
+            [(row["numero"], row["valor"]) for row in awaiting_groups["-"]["empresas"][0]["clientes"][0]["invoices"]],
+            [("INV-DETAIL-AWAITING", app.Decimal("120"))],
+        )
+        self.assertEqual(
+            [(row["numero"], row["valor"]) for row in awaiting_groups["Banco Teste"]["empresas"][0]["clientes"][0]["invoices"]],
+            [("INV-DETAIL-PARTIAL", app.Decimal("300"))],
+        )
+        self.assertEqual(awaiting["total"], app.Decimal("420"))
+
+        response = self.client.get("/invoices/relatorios")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertEqual(html.count("data-report-details-toggle"), 2)
+        self.assertIn('id="invoice-report-details-exchange"', html)
+        self.assertIn('id="invoice-report-details-awaiting"', html)
+        self.assertIn('aria-expanded="false"', html)
+        self.assertIn("BANCO: Banco Dois, Banco Teste", html)
+        self.assertIn("BANCO: -", html)
+        self.assertIn("INVOICE INV-DETAIL-MULTI-BANK", html)
+        self.assertIn("INVOICE INV-DETAIL-AWAITING", html)
+        self.assertNotIn("CÃ", html)
+
+    def test_invoice_report_print_view_renders_expanded_html_and_portrait_print_css(self):
+        self._create_invoice("INV-PRINT-AWAITING", "120,00")
+
+        response = self.client.get("/invoices/relatorios/imprimir")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.content_type.startswith("text/html"))
+        html = response.get_data(as_text=True)
+        self.assertIn("Imprimir / Salvar PDF", html)
+        self.assertIn("window.print()", html)
+        self.assertNotIn("data-report-details-toggle", html)
+        self.assertNotIn(" hidden", html)
+        self.assertEqual(html.count("invoice-report-detail-table"), 2)
+        self.assertIn("Banco → Empresa → Cliente → Invoice", html)
+        self.assertIn("BANCO: -", html)
+        self.assertIn("INVOICE INV-PRINT-AWAITING", html)
+        self.assertIn("invoice-detail-spacer", html)
+        self.assertIn("invoice-detail-row--bank", html)
+        self.assertIn("invoice-detail-row--company", html)
+        self.assertIn("invoice-detail-row--client", html)
+
+        css_response = self.client.get("/static/style.css")
+        try:
+            css = css_response.get_data(as_text=True)
+        finally:
+            css_response.close()
+        self.assertIn("@page invoice-report{size:A4 portrait", css)
+        self.assertIn("#dcecff", css)
+        self.assertIn("#eee5f7", css)
+        self.assertIn("#fff7d6", css)
 
     def test_invoice_competencies_are_scoped_to_company_and_cross_company_selection_is_rejected(self):
         conn = app.db()

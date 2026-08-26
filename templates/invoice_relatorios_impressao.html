@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="print-report invoice-report-print">
+  <div class="report-actions">
+    <button class="btn" type="button" onclick="window.print()">Imprimir / Salvar PDF</button>
+    <a class="btn secondary" href="{{ url_for('relatorios_invoices') }}">Voltar ao relatório</a>
+  </div>
+
+  <div class="report-title">
+    <h1>Relatórios de Invoices</h1>
+    <p class="muted">Consolidado de invoices em USD por Cliente / Trading.</p>
+  </div>
+
+  <section class="report-section">
+    <h2>Indicadores</h2>
+    <div class="summary-cards invoice-report-kpis">
+      <div class="kpi-blue"><span>Total de Invoices Recebidas</span><strong>USD {{ kpis.total_recebido|money }}</strong></div>
+      <div class="kpi-green"><span>Total Fechamento de Câmbio</span><strong>USD {{ kpis.total_cambio|money }}</strong></div>
+      <div class="kpi-yellow"><span>Total de Invoices Aguardando Recebimento</span><strong>USD {{ kpis.total_aguardando_recebimento|money }}</strong></div>
+    </div>
+  </section>
+
+  {% for table in tables %}
+  <section class="report-section">
+    <div class="section-heading"><h2>{{ table.title }}</h2></div>
+    <div class="report-details invoice-report-detail invoice-report-detail--print">
+      {% include "_invoice_report_detail.html" %}
+    </div>
+  </section>
+  {% endfor %}
+</div>
+{% endblock %}

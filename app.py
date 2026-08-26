@@ -4472,10 +4472,62 @@ def build_invoice_report_context():
         total = sum((row["valor"] for row in rows), Decimal("0"))
         return rows, total
 
+    def hierarchical_rows(status, value_key):
+        grouped = {}
+        for summary in summaries:
+            if summary["status"] != status:
+                continue
+            banco = ", ".join(sorted(summary.get("bancos_credito") or [])) or "-"
+            empresa = summary.get("empresa_apelido") or summary.get("empresa_razao_social") or "Não informado"
+            cliente = summary.get("cliente_nome") or "Não informado"
+            amount = decimal_value(summary[value_key])
+
+            banco_group = grouped.setdefault(banco, {"banco": banco, "subtotal": Decimal("0"), "empresas": {}})
+            empresa_key = summary.get("empresa_id") or empresa
+            empresa_group = banco_group["empresas"].setdefault(
+                empresa_key, {"empresa": empresa, "subtotal": Decimal("0"), "clientes": {}}
+            )
+            cliente_group = empresa_group["clientes"].setdefault(
+                cliente, {"cliente": cliente, "subtotal": Decimal("0"), "invoices": []}
+            )
+            invoice = {
+                "id": summary["id"],
+                "numero": summary["numero_invoice"],
+                "valor": amount,
+            }
+            cliente_group["invoices"].append(invoice)
+            cliente_group["subtotal"] += amount
+            empresa_group["subtotal"] += amount
+            banco_group["subtotal"] += amount
+
+        def by_subtotal(item):
+            label = item.get("banco") or item.get("empresa") or item.get("cliente") or ""
+            return (-item["subtotal"], label.casefold())
+
+        result = []
+        for banco_group in sorted(grouped.values(), key=by_subtotal):
+            empresas = []
+            for empresa_group in sorted(banco_group["empresas"].values(), key=by_subtotal):
+                clientes = []
+                for cliente_group in sorted(empresa_group["clientes"].values(), key=by_subtotal):
+                    cliente_group["invoices"].sort(key=lambda item: str(item["numero"]).casefold())
+                    clientes.append(cliente_group)
+                empresa_group["clientes"] = clientes
+                empresas.append(empresa_group)
+            banco_group["empresas"] = empresas
+            result.append(banco_group)
+        return result
+
     recebido_aguardando_cambio, total_recebido_aguardando_cambio = grouped_rows(
         INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, "saldo_cambio", include_bank=True
     )
+    recebido_aguardando_cambio_detalhes = hierarchical_rows(
+        INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, "saldo_cambio"
+    )
     aguardando_recebimento, total_aguardando_recebimento = grouped_rows(
+        INVOICE_STATUS_AGUARDANDO_RECEBIMENTO, "saldo_recebimento"
+    )
+    aguardando_recebimento_detalhes = hierarchical_rows(
         INVOICE_STATUS_AGUARDANDO_RECEBIMENTO, "saldo_recebimento"
     )
     total_recebido = sum((decimal_value(summary["total_recebido"]) for summary in summaries), Decimal("0"))
@@ -4483,9 +4535,9 @@ def build_invoice_report_context():
 
     tables = [
         {"title": "RECEBIDO AGUARDANDO CÂMBIO", "variant": "exchange", "rows": recebido_aguardando_cambio,
-         "total": total_recebido_aguardando_cambio},
+         "total": total_recebido_aguardando_cambio, "detail_groups": recebido_aguardando_cambio_detalhes},
         {"title": "AGUARDANDO RECEBIMENTO", "variant": "awaiting", "rows": aguardando_recebimento,
-         "total": total_aguardando_recebimento},
+         "total": total_aguardando_recebimento, "detail_groups": aguardando_recebimento_detalhes},
     ]
     for table in tables:
         table["copy_text"] = invoice_report_copy_text(table["rows"], table["total"], table["variant"])
@@ -5294,6 +5346,11 @@ def lista_invoices():
 @app.route("/invoices/relatorios")
 def relatorios_invoices():
     return render_template("invoice_relatorios.html", **build_invoice_report_context())
+
+
+@app.route("/invoices/relatorios/imprimir")
+def relatorios_invoices_imprimir():
+    return render_template("invoice_relatorios_impressao.html", **build_invoice_report_context())
 
 
 @app.route("/invoices/exportar")
