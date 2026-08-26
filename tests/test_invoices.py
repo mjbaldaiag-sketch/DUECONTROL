@@ -251,6 +251,7 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertIn("#dcecff", css)
         self.assertIn("#eee5f7", css)
         self.assertIn("#fff7d6", css)
+        self.assertIn(".invoice-report-company-table th:last-child,.invoice-report-company-table td:last-child{text-align:right}", css)
         self.assertIn("size:A4 portrait", css)
         self.assertIn(".invoice-report-print .invoice-detail-spacer td", css)
 
