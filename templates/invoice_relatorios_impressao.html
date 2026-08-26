@@ -1,32 +1,37 @@
-{% extends "base.html" %}
-{% block content %}
-<div class="print-report invoice-report-print">
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ table.title }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<main class="print-report invoice-report-print">
   <div class="report-actions">
     <button class="btn" type="button" onclick="window.print()">Imprimir / Salvar PDF</button>
     <a class="btn secondary" href="{{ url_for('relatorios_invoices') }}">Voltar ao relatório</a>
   </div>
 
-  <div class="report-title">
-    <h1>Relatórios de Invoices</h1>
-    <p class="muted">Consolidado de invoices em USD por Cliente / Trading.</p>
+  <div class="invoice-report-print-title">{{ table.title }}</div>
+
+  <div class="table-wrap invoice-print-summary">
+    <table class="compact-table invoice-report-table invoice-report-table--{{ table.variant }}">
+      <thead><tr><th>Cliente / Trading</th>{% if table.variant == 'exchange' %}<th>Banco</th>{% endif %}<th>USD</th></tr></thead>
+      <tbody>
+        {% for row in table.rows %}
+        <tr><td>{{ row.cliente }}</td>{% if table.variant == 'exchange' %}<td>{{ row.banco }}</td>{% endif %}<td>USD {{ row.valor|money }}</td></tr>
+        {% else %}
+        <tr><td colspan="{{ 3 if table.variant == 'exchange' else 2 }}" class="empty">Nenhuma Invoice encontrada.</td></tr>
+        {% endfor %}
+      </tbody>
+      <tfoot><tr><th>TOTAL</th>{% if table.variant == 'exchange' %}<th></th>{% endif %}<th>USD {{ table.total|money }}</th></tr></tfoot>
+    </table>
   </div>
 
-  <section class="report-section">
-    <h2>Indicadores</h2>
-    <div class="summary-cards invoice-report-kpis">
-      <div class="kpi-blue"><span>Total de Invoices Recebidas</span><strong>USD {{ kpis.total_recebido|money }}</strong></div>
-      <div class="kpi-green"><span>Total Fechamento de Câmbio</span><strong>USD {{ kpis.total_cambio|money }}</strong></div>
-      <div class="kpi-yellow"><span>Total de Invoices Aguardando Recebimento</span><strong>USD {{ kpis.total_aguardando_recebimento|money }}</strong></div>
-    </div>
-  </section>
-
-  {% for table in tables %}
-  <section class="report-section">
-    <div class="section-heading"><h2>{{ table.title }}</h2></div>
-    <div class="report-details invoice-report-detail invoice-report-detail--print">
-      {% include "_invoice_report_detail.html" %}
-    </div>
-  </section>
-  {% endfor %}
-</div>
-{% endblock %}
+  <div class="report-details invoice-report-detail invoice-report-detail--print">
+    {% include "_invoice_report_detail.html" %}
+  </div>
+</main>
+</body>
+</html>

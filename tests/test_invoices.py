@@ -92,7 +92,8 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         html = response.get_data(as_text=True)
         self.assertIn("Total de Invoices Recebidas", html)
-        self.assertIn('/invoices/relatorios/imprimir', html)
+        self.assertIn('/invoices/relatorios/imprimir/exchange', html)
+        self.assertIn('/invoices/relatorios/imprimir/awaiting', html)
         self.assertIn("Imprimir / PDF", html)
         self.assertIn("USD 1.750,00", html)
         self.assertIn("USD 750,00", html)
@@ -159,6 +160,7 @@ class InvoiceFlowTests(unittest.TestCase):
         exchange_invoices = exchange_bank["empresas"][0]["clientes"][0]["invoices"]
         self.assertEqual([(row["numero"], row["valor"]) for row in exchange_invoices],
                          [("INV-DETAIL-MULTI-BANK", app.Decimal("1000"))])
+        self.assertEqual(exchange["empresa_totals"], [{"empresa": "Teste", "valor": app.Decimal("1000")}])
         self.assertEqual(exchange["total"], app.Decimal("1000"))
 
         awaiting_groups = {group["banco"]: group for group in awaiting["detail_groups"]}
@@ -173,6 +175,7 @@ class InvoiceFlowTests(unittest.TestCase):
             [(row["numero"], row["valor"]) for row in awaiting_groups["Banco Teste"]["empresas"][0]["clientes"][0]["invoices"]],
             [("INV-DETAIL-PARTIAL", app.Decimal("300"))],
         )
+        self.assertEqual(awaiting["empresa_totals"], [{"empresa": "Teste", "valor": app.Decimal("420")}])
         self.assertEqual(awaiting["total"], app.Decimal("420"))
 
         response = self.client.get("/invoices/relatorios")
@@ -186,12 +189,23 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertIn("BANCO: -", html)
         self.assertIn("INVOICE INV-DETAIL-MULTI-BANK", html)
         self.assertIn("INVOICE INV-DETAIL-AWAITING", html)
+        self.assertEqual(html.count("invoice-report-company-table"), 2)
+        self.assertIn("<th>EMPRESA</th><th>USD</th>", html)
         self.assertNotIn("CÃ", html)
 
     def test_invoice_report_print_view_renders_expanded_html_and_portrait_print_css(self):
         self._create_invoice("INV-PRINT-AWAITING", "120,00")
+        received_invoice = self._create_invoice("INV-PRINT-EXCHANGE", "80,00")
 
-        response = self.client.get("/invoices/relatorios/imprimir")
+        conn = app.db()
+        conn.execute(
+            "INSERT INTO recebimentos_invoice (invoice_id,banco_credito_id,data_credito,moeda,valor_moeda) VALUES (?,?,?,?,?)",
+            (received_invoice, 1, "2026-08-20", "USD", 80),
+        )
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/invoices/relatorios/imprimir/awaiting")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.content_type.startswith("text/html"))
         html = response.get_data(as_text=True)
@@ -199,14 +213,34 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertIn("window.print()", html)
         self.assertNotIn("data-report-details-toggle", html)
         self.assertNotIn(" hidden", html)
-        self.assertEqual(html.count("invoice-report-detail-table"), 2)
-        self.assertIn("Banco → Empresa → Cliente → Invoice", html)
+        self.assertEqual(html.count("invoice-report-detail-table"), 1)
+        self.assertNotIn("summary-cards", html)
+        self.assertNotIn("<h1", html)
+        self.assertNotIn("<h2", html)
+        self.assertIn("Banco / Empresa / Cliente / Invoice", html)
+        self.assertIn("<div class=\"invoice-report-print-title\">AGUARDANDO RECEBIMENTO</div>", html)
+        self.assertEqual(html.count("invoice-report-company-table"), 1)
+        self.assertIn("<th>EMPRESA</th><th>USD</th>", html)
         self.assertIn("BANCO: -", html)
         self.assertIn("INVOICE INV-PRINT-AWAITING", html)
+        self.assertNotIn("INVOICE INV-PRINT-EXCHANGE", html)
         self.assertIn("invoice-detail-spacer", html)
         self.assertIn("invoice-detail-row--bank", html)
         self.assertIn("invoice-detail-row--company", html)
         self.assertIn("invoice-detail-row--client", html)
+
+        response = self.client.get("/invoices/relatorios/imprimir/exchange")
+        self.assertEqual(response.status_code, 200)
+        exchange_html = response.get_data(as_text=True)
+        self.assertEqual(exchange_html.count("invoice-report-detail-table"), 1)
+        self.assertNotIn("summary-cards", exchange_html)
+        self.assertNotIn("<h1", exchange_html)
+        self.assertNotIn("<h2", exchange_html)
+        self.assertIn("<div class=\"invoice-report-print-title\">RECEBIDO AGUARDANDO CÂMBIO</div>", exchange_html)
+        self.assertEqual(exchange_html.count("invoice-report-company-table"), 1)
+        self.assertIn("<th>EMPRESA</th><th>USD</th>", exchange_html)
+        self.assertIn("INVOICE INV-PRINT-EXCHANGE", exchange_html)
+        self.assertNotIn("INVOICE INV-PRINT-AWAITING", exchange_html)
 
         css_response = self.client.get("/static/style.css")
         try:
@@ -217,6 +251,8 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertIn("#dcecff", css)
         self.assertIn("#eee5f7", css)
         self.assertIn("#fff7d6", css)
+        self.assertIn("size:A4 portrait", css)
+        self.assertIn(".invoice-report-print .invoice-detail-spacer td", css)
 
     def test_invoice_competencies_are_scoped_to_company_and_cross_company_selection_is_rejected(self):
         conn = app.db()

@@ -1,6 +1,21 @@
+{% if not print_mode|default(false) %}
 <div class="invoice-report-detail-heading">
   <strong>Detalhamento hierárquico</strong>
   <span class="muted">Banco → Empresa → Cliente → Invoice</span>
+</div>
+{% endif %}
+<div class="table-wrap">
+  <table class="compact-table invoice-report-table invoice-report-table--{{ table.variant }} invoice-report-company-table">
+    <thead><tr><th>EMPRESA</th><th>USD</th></tr></thead>
+    <tbody>
+      {% for empresa in table.empresa_totals %}
+      <tr><td>{{ empresa.empresa }}</td><td>USD {{ empresa.valor|money }}</td></tr>
+      {% else %}
+      <tr><td colspan="2" class="empty">Nenhuma Empresa encontrada.</td></tr>
+      {% endfor %}
+    </tbody>
+    <tfoot><tr><th>TOTAL</th><th>USD {{ table.total|money }}</th></tr></tfoot>
+  </table>
 </div>
 <div class="table-wrap">
   <table class="compact-table invoice-report-table invoice-report-table--{{ table.variant }} invoice-report-detail-table">

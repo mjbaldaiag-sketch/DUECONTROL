@@ -4485,7 +4485,7 @@ def build_invoice_report_context():
             banco_group = grouped.setdefault(banco, {"banco": banco, "subtotal": Decimal("0"), "empresas": {}})
             empresa_key = summary.get("empresa_id") or empresa
             empresa_group = banco_group["empresas"].setdefault(
-                empresa_key, {"empresa": empresa, "subtotal": Decimal("0"), "clientes": {}}
+                empresa_key, {"empresa": empresa, "empresa_id": empresa_key, "subtotal": Decimal("0"), "clientes": {}}
             )
             cliente_group = empresa_group["clientes"].setdefault(
                 cliente, {"cliente": cliente, "subtotal": Decimal("0"), "invoices": []}
@@ -4518,26 +4518,42 @@ def build_invoice_report_context():
             result.append(banco_group)
         return result
 
+    def company_rows(detail_groups):
+        grouped = {}
+        for banco_group in detail_groups:
+            for empresa_group in banco_group["empresas"]:
+                empresa = empresa_group["empresa"]
+                empresa_key = empresa_group.get("empresa_id") or empresa
+                entry = grouped.setdefault(empresa_key, {"empresa": empresa, "valor": Decimal("0")})
+                entry["valor"] += empresa_group["subtotal"]
+        rows = list(grouped.values())
+        rows.sort(key=lambda row: (-row["valor"], row["empresa"].casefold()))
+        return rows
+
     recebido_aguardando_cambio, total_recebido_aguardando_cambio = grouped_rows(
         INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, "saldo_cambio", include_bank=True
     )
     recebido_aguardando_cambio_detalhes = hierarchical_rows(
         INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, "saldo_cambio"
     )
+    recebido_aguardando_cambio_empresas = company_rows(recebido_aguardando_cambio_detalhes)
     aguardando_recebimento, total_aguardando_recebimento = grouped_rows(
         INVOICE_STATUS_AGUARDANDO_RECEBIMENTO, "saldo_recebimento"
     )
     aguardando_recebimento_detalhes = hierarchical_rows(
         INVOICE_STATUS_AGUARDANDO_RECEBIMENTO, "saldo_recebimento"
     )
+    aguardando_recebimento_empresas = company_rows(aguardando_recebimento_detalhes)
     total_recebido = sum((decimal_value(summary["total_recebido"]) for summary in summaries), Decimal("0"))
     total_cambio = sum((decimal_value(summary["total_cambio"]) for summary in summaries), Decimal("0"))
 
     tables = [
         {"title": "RECEBIDO AGUARDANDO CÂMBIO", "variant": "exchange", "rows": recebido_aguardando_cambio,
-         "total": total_recebido_aguardando_cambio, "detail_groups": recebido_aguardando_cambio_detalhes},
+         "total": total_recebido_aguardando_cambio, "detail_groups": recebido_aguardando_cambio_detalhes,
+         "empresa_totals": recebido_aguardando_cambio_empresas},
         {"title": "AGUARDANDO RECEBIMENTO", "variant": "awaiting", "rows": aguardando_recebimento,
-         "total": total_aguardando_recebimento, "detail_groups": aguardando_recebimento_detalhes},
+         "total": total_aguardando_recebimento, "detail_groups": aguardando_recebimento_detalhes,
+         "empresa_totals": aguardando_recebimento_empresas},
     ]
     for table in tables:
         table["copy_text"] = invoice_report_copy_text(table["rows"], table["total"], table["variant"])
@@ -5348,9 +5364,22 @@ def relatorios_invoices():
     return render_template("invoice_relatorios.html", **build_invoice_report_context())
 
 
+def _render_invoice_report_print(variant):
+    context = build_invoice_report_context()
+    table = next((item for item in context["tables"] if item["variant"] == variant), None)
+    if not table:
+        return "Categoria de relatório inválida.", 404
+    return render_template("invoice_relatorios_impressao.html", table=table, print_mode=True)
+
+
 @app.route("/invoices/relatorios/imprimir")
 def relatorios_invoices_imprimir():
-    return render_template("invoice_relatorios_impressao.html", **build_invoice_report_context())
+    return _render_invoice_report_print("exchange")
+
+
+@app.route("/invoices/relatorios/imprimir/<variant>")
+def relatorios_invoices_imprimir_categoria(variant):
+    return _render_invoice_report_print(variant)
 
 
 @app.route("/invoices/exportar")

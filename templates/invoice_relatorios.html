@@ -2,7 +2,7 @@
 {% block content %}
 <div class="page-heading">
   <div><h1>Relatórios de Invoices</h1><p class="muted">Consolidado de invoices em USD por Cliente / Trading.</p></div>
-  <div class="actions"><a class="btn secondary" href="{{ url_for('relatorios_invoices_imprimir') }}" target="_blank" rel="noopener">Imprimir / PDF</a><a class="btn secondary" href="{{ url_for('lista_invoices') }}">Voltar às Invoices</a></div>
+  <a class="btn secondary" href="{{ url_for('lista_invoices') }}">Voltar às Invoices</a>
 </div>
 
 <section class="report-section">
@@ -21,6 +21,7 @@
     <div class="report-section-actions">
       <button type="button" class="copy-data-btn" data-copy-value="{{ table.copy_text }}" data-copy-html="{{ table.copy_html }}" aria-label="Copiar tabela {{ table.title }}"><span class="copy-icon" aria-hidden="true"><svg viewBox="0 0 20 20" focusable="false"><rect x="6" y="6" width="10" height="10" rx="1"></rect><path d="M4 14H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path></svg></span></button>
       <button type="button" class="btn secondary report-details-toggle" data-report-details-toggle data-report-details-target="invoice-report-details-{{ table.variant }}" aria-expanded="false" aria-controls="invoice-report-details-{{ table.variant }}">Detalhes</button>
+      <a class="btn secondary report-print-btn" href="{{ url_for('relatorios_invoices_imprimir_categoria', variant=table.variant) }}" target="_blank" rel="noopener" aria-label="Imprimir {{ table.title }}">Imprimir / PDF</a>
     </div>
   </div>
   <div class="table-wrap">
