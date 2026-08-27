@@ -15,20 +15,6 @@
 
   <div class="invoice-report-print-title">{{ table.title }}</div>
 
-  <div class="table-wrap invoice-print-summary">
-    <table class="compact-table invoice-report-table invoice-report-table--{{ table.variant }}">
-      <thead><tr><th>Cliente / Trading</th>{% if table.variant == 'exchange' %}<th>Banco</th>{% endif %}<th>USD</th></tr></thead>
-      <tbody>
-        {% for row in table.rows %}
-        <tr><td>{{ row.cliente }}</td>{% if table.variant == 'exchange' %}<td>{{ row.banco }}</td>{% endif %}<td>USD {{ row.valor|money }}</td></tr>
-        {% else %}
-        <tr><td colspan="{{ 3 if table.variant == 'exchange' else 2 }}" class="empty">Nenhuma Invoice encontrada.</td></tr>
-        {% endfor %}
-      </tbody>
-      <tfoot><tr><th>TOTAL</th>{% if table.variant == 'exchange' %}<th></th>{% endif %}<th>USD {{ table.total|money }}</th></tr></tfoot>
-    </table>
-  </div>
-
   <div class="report-details invoice-report-detail invoice-report-detail--print">
     {% include "_invoice_report_detail.html" %}
   </div>

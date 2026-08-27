@@ -1,14 +1,28 @@
 {% extends "base.html" %}{% block content %}
-<div class="page-heading"><div><h1>Cadastrar clientes</h1><p class="muted">Cadastre clientes para reutilizar nos NDFs.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
-<form method="post" class="form">
+{% set editando = cliente_em_edicao is not none %}
+<div class="page-heading"><div><h1>{{ 'Editar cliente' if editando else 'Cadastrar clientes' }}</h1><p class="muted">Cadastre clientes para reutilizar nas Invoices, Contratos Câmbio e NDFs.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
+<form method="post" action="{{ url_for('editar_cliente', cliente_id=cliente_em_edicao.id) if editando else url_for('cadastro_clientes') }}" class="form">
   <label>Nome*<input name="nome" value="{{ nome|default('') }}" required></label>
   <label>Buscar país<input type="search" id="filtro-pais" placeholder="Digite para filtrar" autocomplete="off" aria-controls="pais-select"></label>
   <label>País*<select name="pais" id="pais-select" required><option value="">Selecione um país</option>{% for codigo, nome_pais in paises %}<option value="{{ codigo }}" {{ 'selected' if pais_selecionado == codigo else '' }}>{{ nome_pais }}</option>{% endfor %}</select></label>
-  <div class="form-actions"><button>Cadastrar cliente</button><a class="btn secondary" href="{{ url_for('configuracoes') }}">Cancelar</a></div>
+  <div class="form-actions"><button>{{ 'Salvar alterações' if editando else 'Cadastrar cliente' }}</button><a class="btn secondary" href="{{ url_for('cadastro_clientes') }}">Cancelar</a></div>
 </form>
+
 <h2>Clientes cadastrados</h2>
-<div class="table-wrap"><table><thead><tr><th>Nome</th><th>País</th></tr></thead><tbody>
-{% for cliente in clientes %}<tr><td>{{ cliente.nome }}</td><td>{{ cliente.pais|pais_nome }}</td></tr>{% else %}<tr><td colspan="2" class="empty">Nenhum cliente cadastrado.</td></tr>{% endfor %}
+<div class="table-wrap"><table><thead><tr><th>Nome</th><th>País</th><th>Vínculos</th><th>Ações</th></tr></thead><tbody>
+{% for cliente in clientes %}<tr id="cliente-{{ cliente.id }}"><td>{{ cliente.nome }}</td><td>{{ cliente.pais|pais_nome }}</td><td class="client-links-cell">
+  {% if cliente.total_vinculos %}
+  <details>
+    <summary>{{ cliente.total_vinculos }} vínculo(s)</summary>
+    <div class="client-links">
+      {% if cliente.vinculos.invoices %}<div><strong>Invoices ({{ cliente.vinculos.invoices|length }})</strong><ul>{% for invoice in cliente.vinculos.invoices %}<li><a href="{{ url_for('detalhe_invoice', invoice_id=invoice.id) }}">{{ invoice.numero_invoice }}</a> <small>{{ invoice.tipo_documento|invoice_type_label }}</small></li>{% endfor %}</ul></div>{% endif %}
+      {% if cliente.vinculos.contratos %}<div><strong>Contratos Câmbio ({{ cliente.vinculos.contratos|length }})</strong><ul>{% for contrato in cliente.vinculos.contratos %}<li><a href="{{ url_for('detalhe_contrato', contrato_id=contrato.id) }}">{{ contrato.numero_contrato }}</a></li>{% endfor %}</ul></div>{% endif %}
+      {% if cliente.vinculos.ndfs %}<div><strong>NDFs ({{ cliente.vinculos.ndfs|length }})</strong><ul>{% for ndf in cliente.vinculos.ndfs %}<li><a href="{{ url_for('detalhe_ndf', ndf_id=ndf.id) }}">{{ ndf.numero_operacao }}</a></li>{% endfor %}</ul></div>{% endif %}
+    </div>
+  </details>
+  {% else %}<span class="muted">Sem vínculos</span>{% endif %}
+</td><td class="row-actions"><a href="{{ url_for('editar_cliente', cliente_id=cliente.id) }}">Editar</a>{% if cliente.total_vinculos == 0 %}<form method="post" action="{{ url_for('excluir_cliente', cliente_id=cliente.id) }}" onsubmit="return confirm('Excluir este cliente?');"><button class="link-danger" type="submit">Excluir</button></form>{% else %}<span class="muted" title="Remova os vínculos antes de excluir">Exclusão bloqueada</span>{% endif %}</td></tr>
+{% else %}<tr><td colspan="4" class="empty">Nenhum cliente cadastrado.</td></tr>{% endfor %}
 </tbody></table></div>
 <script>
 (() => {

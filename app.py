@@ -498,6 +498,9 @@ def init_db():
         conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_dues_chave_acesso
                        ON dues(chave_acesso)
                        WHERE chave_acesso IS NOT NULL AND chave_acesso <> ''""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_cliente ON invoices(cliente_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_contratos_cliente ON contratos(cliente_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ndfs_cliente ON ndfs(cliente_id)")
         movimentacao_columns = {row[1] for row in conn.execute("PRAGMA table_info(due_movimentacoes)")}
         if "contrato_id" not in movimentacao_columns:
             conn.execute("ALTER TABLE due_movimentacoes ADD COLUMN contrato_id INTEGER")
@@ -531,6 +534,13 @@ def money(v):
         return f"{float(v or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "0,00"
+
+@app.template_filter("percent")
+def percent(v):
+    try:
+        return f"{float(v or 0):,.0f}%".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return "0%"
 
 @app.template_filter("rate")
 def rate(v):
@@ -1254,6 +1264,59 @@ def clientes_for_form(conn):
         FROM clientes
         ORDER BY nome, pais
     """).fetchall()
+
+def cliente_form_data(form, conn, current_id=None):
+    nome = normalize_client_name_display(form.get("nome"))
+    if not nome:
+        raise ValueError("O nome do cliente é obrigatório.")
+    pais = normalize_pais(form.get("pais"))
+    query = "SELECT id, nome FROM clientes WHERE pais=?"
+    params = [pais]
+    if current_id is not None:
+        query += " AND id<>?"
+        params.append(current_id)
+    existing_clients = conn.execute(query, params).fetchall()
+    if any(normalize_client_name_key(client["nome"]) == normalize_client_name_key(nome)
+           for client in existing_clients):
+        raise ValueError("Já existe um cliente equivalente cadastrado para este país.")
+    return {"nome": nome, "pais": pais}
+
+def cliente_vinculos(conn, cliente_id):
+    invoices = conn.execute("""
+        SELECT id, numero_invoice, tipo_documento
+        FROM invoices
+        WHERE cliente_id=?
+        ORDER BY numero_invoice, id
+    """, (cliente_id,)).fetchall()
+    contratos = conn.execute("""
+        SELECT DISTINCT c.id, c.numero_contrato
+        FROM contratos c
+        LEFT JOIN invoice_contrato_cambio v ON v.contrato_id=c.id
+        LEFT JOIN invoices i ON i.id=v.invoice_id
+        WHERE c.cliente_id=? OR i.cliente_id=?
+        ORDER BY c.numero_contrato, c.id
+    """, (cliente_id, cliente_id)).fetchall()
+    ndfs = conn.execute("""
+        SELECT id, numero_operacao
+        FROM ndfs
+        WHERE cliente_id=?
+        ORDER BY numero_operacao, id
+    """, (cliente_id,)).fetchall()
+    return {"invoices": invoices, "contratos": contratos, "ndfs": ndfs}
+
+def clientes_com_vinculos(conn):
+    clientes = conn.execute("""
+        SELECT id, nome, pais
+        FROM clientes
+        ORDER BY nome, pais
+    """).fetchall()
+    result = []
+    for cliente in clientes:
+        item = dict(cliente)
+        item["vinculos"] = cliente_vinculos(conn, cliente["id"])
+        item["total_vinculos"] = sum(len(registros) for registros in item["vinculos"].values())
+        result.append(item)
+    return result
 
 def contrapartes_for_form(conn):
     return conn.execute("""
@@ -3045,16 +3108,90 @@ def cadastro_clientes():
         except ValueError as exc:
             conn.rollback()
             flash(str(exc), "danger")
-    clientes = conn.execute("""
-        SELECT id, nome, pais
-        FROM clientes
-        ORDER BY nome, pais
-    """).fetchall()
+    clientes = clientes_com_vinculos(conn)
     conn.close()
     return render_template(
         "clientes.html", clientes=clientes, paises=CLIENTE_PAISES_ORDENADOS,
-        nome=nome, pais_selecionado=pais_selecionado,
+        nome=nome, pais_selecionado=pais_selecionado, cliente_em_edicao=None,
     )
+
+@app.route("/configuracoes/clientes/<int:cliente_id>/editar", methods=["GET", "POST"])
+def editar_cliente(cliente_id):
+    conn = db()
+    cliente = conn.execute(
+        "SELECT id, nome, pais FROM clientes WHERE id=?", (cliente_id,)
+    ).fetchone()
+    if not cliente:
+        conn.close()
+        return "Cliente não encontrado", 404
+
+    nome = normalize_client_name_display(request.form.get("nome")) if request.method == "POST" else cliente["nome"]
+    pais_selecionado = request.form.get("pais") if request.method == "POST" else cliente["pais"]
+    if request.method == "POST":
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            data = cliente_form_data(request.form, conn, current_id=cliente_id)
+            conn.execute(
+                "UPDATE clientes SET nome=?, pais=? WHERE id=?",
+                (data["nome"], data["pais"], cliente_id),
+            )
+            conn.execute(
+                "UPDATE contratos SET cliente=? WHERE cliente_id=?",
+                (data["nome"], cliente_id),
+            )
+            conn.commit()
+            conn.close()
+            flash("Cliente atualizado com sucesso.", "success")
+            return redirect(url_for("cadastro_clientes"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe um cliente cadastrado com este nome e país.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+        except sqlite3.Error:
+            conn.rollback()
+            flash("Não foi possível atualizar o cliente.", "danger")
+
+    clientes = clientes_com_vinculos(conn)
+    conn.close()
+    return render_template(
+        "clientes.html", clientes=clientes, paises=CLIENTE_PAISES_ORDENADOS,
+        nome=nome, pais_selecionado=pais_selecionado, cliente_em_edicao=cliente,
+    )
+
+@app.route("/configuracoes/clientes/<int:cliente_id>/excluir", methods=["POST"])
+def excluir_cliente(cliente_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cliente = conn.execute(
+            "SELECT id FROM clientes WHERE id=?", (cliente_id,)
+        ).fetchone()
+        if not cliente:
+            conn.rollback()
+            return "Cliente não encontrado", 404
+
+        vinculos = cliente_vinculos(conn, cliente_id)
+        total_vinculos = sum(len(registros) for registros in vinculos.values())
+        if total_vinculos:
+            conn.rollback()
+            flash(
+                "Não é possível excluir este cliente porque existem "
+                f"{total_vinculos} vínculo(s) com Invoice, Contrato ou NDF.",
+                "danger",
+            )
+            return redirect(url_for("cadastro_clientes") + f"#cliente-{cliente_id}")
+
+        conn.execute("DELETE FROM clientes WHERE id=?", (cliente_id,))
+        conn.commit()
+        flash("Cliente excluído com sucesso.", "success")
+    except sqlite3.Error:
+        conn.rollback()
+        flash("Não foi possível excluir o cliente.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("cadastro_clientes"))
 
 @app.route("/configuracoes/contrapartes", methods=["GET", "POST"])
 def cadastro_contrapartes():
