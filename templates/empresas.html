@@ -1,13 +1,15 @@
 {% extends "base.html" %}{% block content %}
-<div class="page-heading"><div><h1>Cadastrar minhas empresas</h1><p class="muted">Cadastre uma vez para reutilizar o CNPJ em DU-Es e Contratos Câmbio.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
-<form method="post" class="form company-form">
-  <label>Razão Social*<input name="razao_social" required></label>
-  <label>CNPJ*<input name="cnpj" data-cnpj maxlength="18" inputmode="numeric" placeholder="00.000.000/0000-00" required></label>
-  <label>Apelido<input name="apelido" placeholder="Como deseja identificar a empresa"></label>
-  <div class="form-actions"><button>Cadastrar empresa</button><a class="btn secondary" href="{{ url_for('configuracoes') }}">Cancelar</a></div>
+<div class="page-heading"><div><h1>Cadastrar minhas empresas</h1><p class="muted">Cadastre uma vez para reutilizar o CNPJ em DU-Es e Contratos C&acirc;mbio.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configura&ccedil;&otilde;es</a></div>
+<form method="post" action="{{ url_for('editar_empresa', empresa_id=empresa_em_edicao.id) if empresa_em_edicao else url_for('cadastro_empresas') }}" class="form company-form">
+  <h2>{{ 'Editar empresa' if empresa_em_edicao else 'Nova empresa' }}</h2>
+  <label>Raz&atilde;o Social*<input name="razao_social" value="{{ form_values.razao_social }}" required></label>
+  <label>CNPJ*<input name="cnpj" value="{{ form_values.cnpj|cnpj if form_values.cnpj else '' }}" data-cnpj maxlength="18" inputmode="numeric" placeholder="00.000.000/0000-00" required></label>
+  <label>Apelido<input name="apelido" value="{{ form_values.apelido }}" placeholder="Como deseja identificar a empresa"></label>
+  <label>Prioridade<input name="prioridade" type="number" min="1" step="1" inputmode="numeric" value="{{ form_values.prioridade }}" placeholder="1, 2, 3..."><small class="muted">Menor n&uacute;mero aparece primeiro nos relat&oacute;rios.</small></label>
+  <div class="form-actions"><button>{{ 'Salvar altera&ccedil;&otilde;es' if empresa_em_edicao else 'Cadastrar empresa' }}</button>{% if empresa_em_edicao %}<a class="btn secondary" href="{{ url_for('cadastro_empresas') }}">Cancelar</a>{% else %}<a class="btn secondary" href="{{ url_for('configuracoes') }}">Cancelar</a>{% endif %}</div>
 </form>
 <h2>Empresas cadastradas</h2>
-<div class="table-wrap"><table><tr><th>Razão Social</th><th>CNPJ</th><th>Apelido</th></tr>
-{% for empresa in empresas %}<tr><td>{{ empresa.razao_social }}</td><td>{{ empresa.cnpj|cnpj }}</td><td>{{ empresa.apelido or '-' }}</td></tr>{% else %}<tr><td colspan="3" class="empty">Nenhuma empresa cadastrada.</td></tr>{% endfor %}
+<div class="table-wrap"><table><tr><th>Raz&atilde;o Social</th><th>CNPJ</th><th>Apelido</th><th>Prioridade</th><th>A&ccedil;&otilde;es</th></tr>
+{% for empresa in empresas %}<tr><td>{{ empresa.razao_social }}</td><td>{{ empresa.cnpj|cnpj }}</td><td>{{ empresa.apelido or '-' }}</td><td>{{ empresa.prioridade or '-' }}</td><td><a href="{{ url_for('editar_empresa', empresa_id=empresa.id) }}">Editar</a></td></tr>{% else %}<tr><td colspan="5" class="empty">Nenhuma empresa cadastrada.</td></tr>{% endfor %}
 </table></div>
 {% endblock %}

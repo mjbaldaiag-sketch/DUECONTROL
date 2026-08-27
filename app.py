@@ -174,6 +174,7 @@ def init_db():
         razao_social TEXT NOT NULL,
         cnpj TEXT NOT NULL UNIQUE,
         apelido TEXT,
+        prioridade INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -435,6 +436,12 @@ def init_db():
             conn.execute("ALTER TABLE invoices ADD COLUMN data_credito TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_contrato_comercial ON invoices(contrato_comercial)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_competencia ON invoices(competencia_id)")
+        empresa_columns = {row[1] for row in conn.execute("PRAGMA table_info(empresas)")}
+        if "prioridade" not in empresa_columns:
+            conn.execute("ALTER TABLE empresas ADD COLUMN prioridade INTEGER")
+        # Registros antigos recebem uma ordem estável, sem exigir recadastro.
+        conn.execute("UPDATE empresas SET prioridade=id WHERE prioridade IS NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_empresas_prioridade ON empresas(prioridade, id)")
         for invoice in conn.execute("SELECT id, status FROM invoices").fetchall():
             try:
                 normalized_status = normalize_invoice_status(
@@ -712,12 +719,54 @@ def format_cnpj(value):
 def cnpj_filter(value):
     return format_cnpj(value)
 
+def empresa_order_sql(alias=None):
+    """Retorna a ordenação única usada para exibir empresas.
+
+    Prioridades nulas ficam depois das configuradas e, em qualquer empate,
+    o ID mantém a ordem determinística sem recorrer ao nome.
+    """
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"CASE WHEN {prefix}prioridade IS NULL THEN 1 ELSE 0 END, "
+        f"{prefix}prioridade ASC, {prefix}id ASC"
+    )
+
+def parse_empresa_prioridade(value):
+    text_value = "" if value is None else str(value).strip()
+    if not text_value:
+        return None
+    if not re.fullmatch(r"[1-9]\d*", text_value):
+        raise ValueError("A prioridade deve ser um número inteiro maior que zero.")
+    prioridade = int(text_value)
+    if prioridade > 2147483647:
+        raise ValueError("A prioridade informada é muito grande.")
+    return prioridade
+
+def proxima_prioridade_empresa(conn, exclude_id=None):
+    query = "SELECT COALESCE(MAX(prioridade), 0) + 1 FROM empresas"
+    params = []
+    if exclude_id is not None:
+        query = "SELECT COALESCE(MAX(prioridade), 0) + 1 FROM empresas WHERE id<>?"
+        params.append(exclude_id)
+    return conn.execute(query, params).fetchone()[0]
+
+def empresa_form_data(form, conn, current=None):
+    razao_social = (form.get("razao_social") or "").strip()
+    if not razao_social:
+        raise ValueError("A Razao Social e obrigatoria.")
+    cnpj = normalize_cnpj(form.get("cnpj"))
+    apelido = (form.get("apelido") or "").strip() or None
+    prioridade = parse_empresa_prioridade(form.get("prioridade"))
+    if prioridade is None:
+        prioridade = proxima_prioridade_empresa(conn, current["id"] if current else None)
+    return {"razao_social": razao_social, "cnpj": cnpj,
+            "apelido": apelido, "prioridade": prioridade}
+
 def empresas_for_form(conn, current_cnpj=None, selected_id=None):
     empresas = conn.execute("""
-        SELECT id, razao_social, cnpj, apelido
+        SELECT id, razao_social, cnpj, apelido, prioridade
         FROM empresas
-        ORDER BY CASE WHEN TRIM(COALESCE(apelido, '')) <> '' THEN 0 ELSE 1 END,
-                 apelido, razao_social
+        ORDER BY """ + empresa_order_sql() + """
     """).fetchall()
     selected = None
     if selected_id not in (None, ""):
@@ -836,13 +885,13 @@ def competencia_da_operacao(conn, raw_id, empresa_id, data_referencia, current_i
 def competencias_for_empresa(conn, empresa_id):
     if empresa_id:
         return conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
-            e.razao_social, e.apelido AS empresa_apelido
+            e.razao_social, e.apelido AS empresa_apelido, e.prioridade AS empresa_prioridade
             FROM competencias c JOIN empresas e ON e.id=c.empresa_id
-            WHERE c.empresa_id=? ORDER BY c.data_inicial DESC, c.descricao""", (empresa_id,)).fetchall()
+            WHERE c.empresa_id=? ORDER BY c.data_inicial DESC, c.descricao, c.id""", (empresa_id,)).fetchall()
     return conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
-        e.razao_social, e.apelido AS empresa_apelido
+        e.razao_social, e.apelido AS empresa_apelido, e.prioridade AS empresa_prioridade
         FROM competencias c JOIN empresas e ON e.id=c.empresa_id
-        ORDER BY c.data_inicial DESC, c.descricao""").fetchall()
+        ORDER BY """ + empresa_order_sql("e") + """, c.data_inicial DESC, c.descricao, c.id""" ).fetchall()
 
 COMPETENCIA_IMPORT_PROXIMIDADE_DIAS = 31
 COMPETENCIA_MESES = {
@@ -1028,7 +1077,7 @@ def ensure_invoice_import_competencies(conn, rows, new_competency_overrides=None
 
 def resolve_invoice_import_companies(conn, rows):
     """Converte a coluna Empresa (CNPJ, razão social ou apelido) para CNPJ."""
-    companies = conn.execute("SELECT id, razao_social, apelido, cnpj FROM empresas ORDER BY id").fetchall()
+    companies = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     for row in rows:
         if row.get("cnpj"):
             company = next((item for item in companies if item["cnpj"] == row["cnpj"]), None)
@@ -1696,7 +1745,7 @@ def index():
         FROM dues d
         LEFT JOIN due_movimentacoes m ON m.due_id=d.id
         LEFT JOIN empresas e ON e.cnpj=d.cnpj
-        GROUP BY d.id ORDER BY d.id DESC
+        GROUP BY d.id ORDER BY """ + empresa_order_sql("e") + """, d.id DESC
     """).fetchall()]
     contratos = [decorate_contract(row) for row in conn.execute("""
         SELECT c.*, e.apelido AS empresa_apelido,
@@ -1706,7 +1755,7 @@ def index():
         FROM contratos c
         LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
         LEFT JOIN empresas e ON e.cnpj=c.cnpj
-        GROUP BY c.id ORDER BY c.id DESC
+        GROUP BY c.id ORDER BY """ + empresa_order_sql("e") + """, c.id DESC
     """).fetchall()]
     resumo = {
         "invoices": conn.execute("SELECT COUNT(*) FROM invoices").fetchone()[0],
@@ -1751,7 +1800,7 @@ def consulta_contratos(conn, args):
         LEFT JOIN competencias comp ON comp.id=c.competencia_id
         LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
         {clause}
-        GROUP BY c.id ORDER BY c.id DESC
+        GROUP BY c.id ORDER BY """ + empresa_order_sql("e") + """, c.id DESC
     """, params).fetchall()
     return rows, empresa_id, competencia_id
 
@@ -1760,8 +1809,9 @@ def lista_contratos():
     conn = db()
     rows, empresa_id, competencia_id = consulta_contratos(conn, request.args)
     contratos = [decorate_contract(row) for row in rows]
-    empresas = conn.execute("SELECT id, razao_social, apelido, cnpj FROM empresas ORDER BY razao_social").fetchall()
-    competencias = conn.execute("SELECT id, descricao, data_inicial, data_final FROM competencias ORDER BY data_inicial DESC, descricao").fetchall()
+    empresas = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
+    competencias = conn.execute("""SELECT id, descricao, data_inicial, data_final, empresa_id
+        FROM competencias ORDER BY data_inicial DESC, descricao, id""").fetchall()
     conn.close()
     return render_template("contratos.html", contratos=contratos, empresas=empresas, competencias=competencias,
                            empresa_id=empresa_id, competencia_id=competencia_id)
@@ -2114,17 +2164,50 @@ def build_contract_report_chart(rows, moeda, granularity="diario"):
     base["segments"] = segments
     return base
 
-def report_dimension_rows(items, name_getter, total_brl):
+def empresa_sort_key(item):
+    """Chave Python equivalente a empresa_order_sql()."""
+    prioridade = item.get("empresa_prioridade", item.get("prioridade"))
+    empresa_id = item.get("empresa_id", item.get("id"))
+    nome = (item.get("empresa_nome") or item.get("empresa") or
+            item.get("razao_social") or item.get("apelido") or "")
+    try:
+        prioridade = int(prioridade) if prioridade is not None else None
+    except (TypeError, ValueError):
+        prioridade = None
+    try:
+        empresa_id = int(empresa_id) if empresa_id is not None else None
+    except (TypeError, ValueError):
+        empresa_id = None
+    return (
+        prioridade is None,
+        prioridade if prioridade is not None else 0,
+        empresa_id is None,
+        empresa_id if empresa_id is not None else 0,
+        str(nome).casefold(),
+    )
+
+def report_dimension_rows(items, name_getter, total_brl, group_key_getter=None,
+                          sort_key_getter=None):
     grouped = {}
+    representatives = {}
     for item in items:
         name = name_getter(item) or "Não informado"
-        summary = grouped.setdefault(name, report_summary())
+        key = group_key_getter(item) if group_key_getter else name
+        summary = grouped.setdefault(key, report_summary())
         add_report_item(summary, item)
+        representatives.setdefault(key, item)
     result = []
-    for name, summary in sorted(grouped.items(), key=lambda entry: entry[0].casefold()):
+    for key, summary in grouped.items():
+        item = representatives[key]
+        name = name_getter(item) or "Não informado"
         participation = summary["brl_total"] / total_brl * Decimal("100") if total_brl else Decimal("0")
         result.append({"nome": name, "total_usd": summary["usd_volume"],
-                       "total_brl": summary["brl_total"], "participacao": participation})
+                       "total_brl": summary["brl_total"], "participacao": participation,
+                       "_sort_key": (sort_key_getter(item) if sort_key_getter
+                                     else str(name).casefold())})
+    result.sort(key=lambda item: item["_sort_key"])
+    for item in result:
+        item.pop("_sort_key", None)
     return result
 
 def report_period_range_label(inicio, fim, periodo):
@@ -2189,7 +2272,8 @@ def build_contract_report_context(args, forced_granularity=None):
                 c.valor_moeda, c.taxa_cambio, c.valor_reais, c.cliente, c.cliente_id,
                 c.banco, c.banco_credito, c.banco_liquidacao, c.competencia_id,
                 e.id AS empresa_id, e.razao_social AS empresa_razao_social,
-                e.apelido AS empresa_apelido, comp.descricao AS competencia_descricao,
+                e.apelido AS empresa_apelido, e.prioridade AS empresa_prioridade,
+                comp.descricao AS competencia_descricao,
                 cl.nome AS cliente_base_nome,
                 p.ptax_venda
             FROM contratos c
@@ -2198,15 +2282,17 @@ def build_contract_report_context(args, forced_granularity=None):
             LEFT JOIN clientes cl ON cl.id=c.cliente_id
             LEFT JOIN ptax_cotacoes p ON p.moeda=c.moeda AND p.data_cotacao=date(c.data_contrato)
             {clause}
-            ORDER BY CASE WHEN c.data_contrato IS NULL OR c.data_contrato='' THEN 1 ELSE 0 END,
+            ORDER BY """ + empresa_order_sql("e") + """,
+                     CASE WHEN c.data_contrato IS NULL OR c.data_contrato='' THEN 1 ELSE 0 END,
                      c.data_contrato ASC, c.numero_contrato ASC""", params).fetchall()
-        empresas = conn.execute("""SELECT id, razao_social, apelido, cnpj FROM empresas
-                                  ORDER BY CASE WHEN TRIM(COALESCE(apelido,''))<>'' THEN 0 ELSE 1 END,
-                                           apelido, razao_social""").fetchall()
+        empresas = conn.execute("""SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas
+                                  ORDER BY """ + empresa_order_sql() + """
+        """).fetchall()
         competencias = conn.execute("""SELECT comp.id, comp.empresa_id, comp.descricao,
-                comp.data_inicial, comp.data_final, e.apelido, e.razao_social
+                comp.data_inicial, comp.data_final, e.apelido, e.razao_social,
+                e.prioridade AS empresa_prioridade
             FROM competencias comp JOIN empresas e ON e.id=comp.empresa_id
-            ORDER BY comp.data_inicial DESC, comp.descricao""").fetchall()
+            ORDER BY """ + empresa_order_sql("e") + ", comp.data_inicial DESC, comp.descricao, comp.id""").fetchall()
     finally:
         conn.close()
 
@@ -2273,7 +2359,12 @@ def build_contract_report_context(args, forced_granularity=None):
         "resultado_acumulado": accumulated,
     }
     total_brl = total["brl_total"]
-    por_empresa = report_dimension_rows(contratos, lambda item: item.get("empresa_nome"), total_brl)
+    por_empresa = report_dimension_rows(
+        contratos, lambda item: item.get("empresa_nome"), total_brl,
+        group_key_getter=lambda item: ("id", item.get("empresa_id"))
+        if item.get("empresa_id") is not None else ("nome", item.get("empresa_nome")),
+        sort_key_getter=empresa_sort_key,
+    )
     por_cliente = report_dimension_rows(contratos, lambda item: item.get("cliente_nome"), total_brl)
     por_banco = report_dimension_rows(contratos, lambda item: item.get("banco_recebedor"), total_brl)
     selected_empresa = next((item for item in empresas if item["id"] == filters["empresa_id"]), None)
@@ -2856,14 +2947,10 @@ def cadastro_empresas():
     conn = db()
     if request.method == "POST":
         try:
-            razao_social = (request.form.get("razao_social") or "").strip()
-            if not razao_social:
-                raise ValueError("A Razão Social é obrigatória.")
-            cnpj = normalize_cnpj(request.form.get("cnpj"))
-            apelido = (request.form.get("apelido") or "").strip() or None
+            data = empresa_form_data(request.form, conn)
             conn.execute(
-                "INSERT INTO empresas (razao_social, cnpj, apelido) VALUES (?,?,?)",
-                (razao_social, cnpj, apelido),
+                "INSERT INTO empresas (razao_social, cnpj, apelido, prioridade) VALUES (?,?,?,?)",
+                (data["razao_social"], data["cnpj"], data["apelido"], data["prioridade"]),
             )
             conn.commit()
             conn.close()
@@ -2875,14 +2962,58 @@ def cadastro_empresas():
         except ValueError as exc:
             conn.rollback()
             flash(str(exc), "danger")
-    empresas = conn.execute("""
-        SELECT id, razao_social, cnpj, apelido
-        FROM empresas
-        ORDER BY CASE WHEN TRIM(COALESCE(apelido, '')) <> '' THEN 0 ELSE 1 END,
-                 apelido, razao_social
-    """).fetchall()
+    empresas = conn.execute("SELECT id, razao_social, cnpj, apelido, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     conn.close()
-    return render_template("empresas.html", empresas=empresas)
+    form_values = {
+        "razao_social": request.form.get("razao_social", "") if request.method == "POST" else "",
+        "cnpj": request.form.get("cnpj", "") if request.method == "POST" else "",
+        "apelido": request.form.get("apelido", "") if request.method == "POST" else "",
+        "prioridade": request.form.get("prioridade", "") if request.method == "POST" else "",
+    }
+    return render_template("empresas.html", empresas=empresas,
+                           empresa_em_edicao=None, form_values=form_values)
+
+@app.route("/configuracoes/empresas/<int:empresa_id>/editar", methods=["GET", "POST"])
+def editar_empresa(empresa_id):
+    conn = db()
+    empresa = conn.execute(
+        "SELECT id, razao_social, cnpj, apelido, prioridade FROM empresas WHERE id=?",
+        (empresa_id,),
+    ).fetchone()
+    if not empresa:
+        conn.close()
+        return "Empresa não encontrada", 404
+
+    if request.method == "POST":
+        try:
+            data = empresa_form_data(request.form, conn, current=empresa)
+            conn.execute(
+                "UPDATE empresas SET razao_social=?, cnpj=?, apelido=?, prioridade=? WHERE id=?",
+                (data["razao_social"], data["cnpj"], data["apelido"], data["prioridade"], empresa_id),
+            )
+            conn.commit()
+            conn.close()
+            flash("Empresa atualizada com sucesso.", "success")
+            return redirect(url_for("cadastro_empresas"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe uma empresa cadastrada com este CNPJ.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+
+    empresas = conn.execute(
+        "SELECT id, razao_social, cnpj, apelido, prioridade FROM empresas ORDER BY " + empresa_order_sql()
+    ).fetchall()
+    form_values = {
+        "razao_social": request.form.get("razao_social", empresa["razao_social"]),
+        "cnpj": request.form.get("cnpj", empresa["cnpj"]),
+        "apelido": request.form.get("apelido", empresa["apelido"] or ""),
+        "prioridade": request.form.get("prioridade", empresa["prioridade"] or ""),
+    }
+    conn.close()
+    return render_template("empresas.html", empresas=empresas,
+                           empresa_em_edicao=empresa, form_values=form_values)
 
 @app.route("/configuracoes/clientes", methods=["GET", "POST"])
 def cadastro_clientes():
@@ -2974,9 +3105,10 @@ def cadastro_competencias():
             conn.rollback(); flash(f"Não foi possível salvar a competência: {exc}", "danger")
         competencia = dict(request.form)
     competencias = conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
-        e.razao_social, e.apelido FROM competencias c JOIN empresas e ON e.id=c.empresa_id
-        ORDER BY c.data_inicial DESC, c.descricao""").fetchall()
-    empresas = conn.execute("SELECT id, razao_social, apelido, cnpj FROM empresas ORDER BY razao_social").fetchall()
+        e.razao_social, e.apelido, e.prioridade AS empresa_prioridade
+        FROM competencias c JOIN empresas e ON e.id=c.empresa_id
+        ORDER BY """ + empresa_order_sql("e") + ", c.data_inicial DESC, c.descricao, c.id""").fetchall()
+    empresas = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     conn.close()
     return render_template("competencias.html", competencia=competencia, competencias=competencias, empresas=empresas, statuses=COMPETENCIA_STATUSES)
 
@@ -3000,10 +3132,11 @@ def editar_competencia(competencia_id):
         except sqlite3.Error as exc:
             conn.rollback(); flash(f"Não foi possível salvar a competência: {exc}", "danger")
         competencia = dict(request.form); competencia["id"] = competencia_id
-    empresas = conn.execute("SELECT id, razao_social, apelido, cnpj FROM empresas ORDER BY razao_social").fetchall()
+    empresas = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     competencias = conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
-        e.razao_social, e.apelido FROM competencias c JOIN empresas e ON e.id=c.empresa_id
-        ORDER BY c.data_inicial DESC, c.descricao""").fetchall()
+        e.razao_social, e.apelido, e.prioridade AS empresa_prioridade
+        FROM competencias c JOIN empresas e ON e.id=c.empresa_id
+        ORDER BY """ + empresa_order_sql("e") + ", c.data_inicial DESC, c.descricao, c.id""").fetchall()
     conn.close()
     return render_template("competencias.html", competencia=competencia, competencias=competencias, empresas=empresas, statuses=COMPETENCIA_STATUSES)
 
@@ -3091,7 +3224,7 @@ def carregar_detalhe_contrato(conn, contrato_id):
     contrato = conn.execute("""
         SELECT c.*, cl.pais AS cliente_pais,
                e.razao_social AS empresa_razao_social,
-               e.apelido AS empresa_apelido
+               e.apelido AS empresa_apelido, e.prioridade AS empresa_prioridade
         FROM contratos c
         LEFT JOIN clientes cl ON cl.id=c.cliente_id
         LEFT JOIN empresas e ON e.cnpj=c.cnpj
@@ -3110,12 +3243,13 @@ def carregar_detalhe_contrato(conn, contrato_id):
     invoice_links = conn.execute("""
         SELECT v.*, i.numero_invoice, i.tipo_documento, i.data_emissao, i.moeda AS invoice_moeda,
                e.apelido AS empresa_apelido, e.razao_social AS empresa_razao_social,
+               e.prioridade AS empresa_prioridade,
                cl.nome AS cliente_nome
         FROM invoice_contrato_cambio v
         JOIN invoices i ON i.id=v.invoice_id
         JOIN empresas e ON e.id=i.empresa_id
         LEFT JOIN clientes cl ON cl.id=i.cliente_id
-        WHERE v.contrato_id=? ORDER BY v.id DESC
+        WHERE v.contrato_id=? ORDER BY """ + empresa_order_sql("e") + """, v.id DESC
     """, (contrato_id,)).fetchall()
     summary = contract_summary(conn, contrato_id)
     contrato = dict(contrato)
@@ -3416,11 +3550,7 @@ def write_excel_model_orientations(writer, conn, pandas):
     clients = [row["nome"] for row in conn.execute(
         "SELECT nome FROM clientes ORDER BY nome, pais"
     ).fetchall()]
-    companies = conn.execute("""
-        SELECT cnpj
-        FROM empresas
-        ORDER BY cnpj
-    """).fetchall()
+    companies = conn.execute("SELECT cnpj FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     company_cnpjs = [format_cnpj(row["cnpj"]) for row in companies]
     competencies = [row["descricao"] for row in conn.execute("""
         SELECT descricao
@@ -4290,7 +4420,8 @@ def invoice_status_from_totals(valor_invoice, total_recebido, total_cambio):
 def invoice_summary(conn, invoice_id):
     invoice = conn.execute("""
         SELECT i.*, e.razao_social AS empresa_razao_social, e.apelido AS empresa_apelido,
-               e.cnpj AS empresa_cnpj, cl.nome AS cliente_nome, cl.pais AS cliente_pais,
+               e.cnpj AS empresa_cnpj, e.prioridade AS empresa_prioridade,
+               cl.nome AS cliente_nome, cl.pais AS cliente_pais,
                comp.descricao AS competencia_descricao, comp.data_inicial AS competencia_data_inicial,
                comp.data_final AS competencia_data_final
         FROM invoices i
@@ -4483,9 +4614,12 @@ def build_invoice_report_context():
             amount = decimal_value(summary[value_key])
 
             banco_group = grouped.setdefault(banco, {"banco": banco, "subtotal": Decimal("0"), "empresas": {}})
-            empresa_key = summary.get("empresa_id") or empresa
+            empresa_id = summary.get("empresa_id")
+            empresa_key = empresa_id if empresa_id is not None else empresa
             empresa_group = banco_group["empresas"].setdefault(
-                empresa_key, {"empresa": empresa, "empresa_id": empresa_key, "subtotal": Decimal("0"), "clientes": {}}
+                empresa_key, {"empresa": empresa, "empresa_id": empresa_id,
+                              "empresa_prioridade": summary.get("empresa_prioridade"),
+                              "subtotal": Decimal("0"), "clientes": {}}
             )
             cliente_group = empresa_group["clientes"].setdefault(
                 cliente, {"cliente": cliente, "subtotal": Decimal("0"), "invoices": []}
@@ -4507,7 +4641,7 @@ def build_invoice_report_context():
         result = []
         for banco_group in sorted(grouped.values(), key=by_subtotal):
             empresas = []
-            for empresa_group in sorted(banco_group["empresas"].values(), key=by_subtotal):
+            for empresa_group in sorted(banco_group["empresas"].values(), key=empresa_sort_key):
                 clientes = []
                 for cliente_group in sorted(empresa_group["clientes"].values(), key=by_subtotal):
                     cliente_group["invoices"].sort(key=lambda item: str(item["numero"]).casefold())
@@ -4524,11 +4658,15 @@ def build_invoice_report_context():
             for empresa_group in banco_group["empresas"]:
                 empresa = empresa_group["empresa"]
                 empresa_key = empresa_group.get("empresa_id") or empresa
-                entry = grouped.setdefault(empresa_key, {"empresa": empresa, "valor": Decimal("0")})
+                entry = grouped.setdefault(empresa_key, {
+                    "empresa": empresa, "empresa_id": empresa_group.get("empresa_id"),
+                    "valor": Decimal("0"),
+                    "empresa_prioridade": empresa_group.get("empresa_prioridade"),
+                })
                 entry["valor"] += empresa_group["subtotal"]
         rows = list(grouped.values())
-        rows.sort(key=lambda row: (-row["valor"], row["empresa"].casefold()))
-        return rows
+        rows.sort(key=empresa_sort_key)
+        return [{"empresa": row["empresa"], "valor": row["valor"]} for row in rows]
 
     recebido_aguardando_cambio, total_recebido_aguardando_cambio = grouped_rows(
         INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, "saldo_cambio", include_bank=True
@@ -4788,10 +4926,7 @@ def invoice_detail_data(conn, invoice_id):
     summary = invoice_summary(conn, invoice_id)
     if not summary:
         return None
-    empresas = conn.execute("""
-        SELECT id, razao_social, apelido, cnpj FROM empresas
-        ORDER BY CASE WHEN TRIM(COALESCE(apelido,''))<>'' THEN 0 ELSE 1 END, apelido, razao_social
-    """).fetchall()
+    empresas = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     clientes = clientes_for_form(conn)
     contrapartes = contrapartes_for_form(conn)
     dues = conn.execute("""
@@ -5336,14 +5471,16 @@ def lista_invoices():
     pages = max(1, (total + per_page - 1) // per_page)
     page = min(page, pages)
     rows = conn.execute(f"""
-        SELECT i.id FROM invoices i {clause}
-        ORDER BY {sort_fields[sort]} {direction}, i.id DESC LIMIT ? OFFSET ?
+        SELECT i.id FROM invoices i
+        LEFT JOIN empresas e ON e.id=i.empresa_id
+        {clause}
+        ORDER BY {empresa_order_sql("e")}, {sort_fields[sort]} {direction}, i.id DESC LIMIT ? OFFSET ?
     """, params + [per_page, (page - 1) * per_page]).fetchall()
     invoices = []
     for row in rows:
         item = invoice_summary(conn, row["id"])
         invoices.append(item)
-    empresas = conn.execute("SELECT id,razao_social,apelido,cnpj FROM empresas ORDER BY razao_social").fetchall()
+    empresas = conn.execute("SELECT id,razao_social,apelido,cnpj,prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     clientes = clientes_for_form(conn)
     competencias = competencias_for_empresa(conn, None)
     moedas = [row[0] for row in conn.execute("SELECT DISTINCT moeda FROM invoices ORDER BY moeda").fetchall()]
@@ -5397,8 +5534,10 @@ def exportar_invoices():
     sort_fields, sort, direction = invoice_sorting(request.args)
     rows = conn.execute(f"""
         SELECT i.id
-        FROM invoices i {clause}
-        ORDER BY {sort_fields[sort]} {direction}, i.id DESC
+        FROM invoices i
+        LEFT JOIN empresas e ON e.id=i.empresa_id
+        {clause}
+        ORDER BY {empresa_order_sql("e")}, {sort_fields[sort]} {direction}, i.id DESC
     """, params).fetchall()
     invoice_ids = [row["id"] for row in rows]
     invoices = [invoice_summary(conn, invoice_id) for invoice_id in invoice_ids]
@@ -5426,7 +5565,7 @@ def exportar_invoices():
             LEFT JOIN clientes cl ON cl.id=i.cliente_id
             LEFT JOIN contrapartes cp ON cp.id=r.banco_credito_id
             WHERE r.invoice_id IN ({placeholders})
-            ORDER BY i.numero_invoice, r.data_credito, r.id
+            ORDER BY """ + empresa_order_sql("e") + """, i.numero_invoice, r.data_credito, r.id
         """, invoice_ids).fetchall()
         changes = conn.execute(f"""
             SELECT v.id AS vinculo_id, v.invoice_id, v.contrato_id,
@@ -5456,7 +5595,7 @@ def exportar_invoices():
             LEFT JOIN clientes cl ON cl.id=i.cliente_id
             JOIN contratos c ON c.id=v.contrato_id
             WHERE v.invoice_id IN ({placeholders})
-            ORDER BY i.numero_invoice, c.numero_contrato, v.id
+            ORDER BY """ + empresa_order_sql("e") + """, i.numero_invoice, c.numero_contrato, v.id
         """, invoice_ids).fetchall()
         due_links = conn.execute(f"""
             SELECT di.id AS vinculo_id, di.invoice_id, di.due_id,
@@ -5480,7 +5619,7 @@ def exportar_invoices():
             JOIN dues d ON d.id=di.due_id
             LEFT JOIN competencias comp ON comp.id=d.competencia_id
             WHERE di.invoice_id IN ({placeholders})
-                   ORDER BY i.numero_invoice, d.numero_due, di.id
+                   ORDER BY """ + empresa_order_sql("e") + """, i.numero_invoice, d.numero_due, di.id
         """, invoice_ids).fetchall()
         due_usage = {
             row["due_id"]: decimal_value(due_effect(conn, row["due_id"]))
@@ -5680,7 +5819,7 @@ def nova_invoice():
             conn.rollback(); flash("Já existe uma Invoice com essa empresa, número e tipo documental.", "danger")
         except ValueError as exc:
             conn.rollback(); flash(str(exc), "danger")
-    empresas = conn.execute("SELECT id,razao_social,apelido,cnpj FROM empresas ORDER BY razao_social").fetchall()
+    empresas = conn.execute("SELECT id,razao_social,apelido,cnpj,prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     clientes = clientes_for_form(conn)
     competencias = competencias_for_empresa(conn, None)
     conn.close()
@@ -5732,7 +5871,7 @@ def editar_invoice(invoice_id):
             conn.rollback(); flash("Já existe uma Invoice com essa empresa, número e tipo documental.", "danger")
         except ValueError as exc:
             conn.rollback(); flash(str(exc), "danger")
-    empresas = conn.execute("SELECT id,razao_social,apelido,cnpj FROM empresas ORDER BY razao_social").fetchall()
+    empresas = conn.execute("SELECT id,razao_social,apelido,cnpj,prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     clientes = clientes_for_form(conn)
     competencias = competencias_for_empresa(conn, None)
     conn.close()
