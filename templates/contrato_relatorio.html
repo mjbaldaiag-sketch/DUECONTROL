@@ -66,5 +66,19 @@
       </tbody>
     </table>
   </section>
+
+  <section class="report-section">
+    <h2>Fechamentos de C&acirc;mbio</h2>
+    <table>
+      <thead><tr><th>Invoice</th><th>Empresa</th><th>Data</th><th>Valor</th><th>Moeda</th><th>Observa&ccedil;&atilde;o</th></tr></thead>
+      <tbody>
+        {% for f in fechamentos %}
+        <tr><td>{{ f.numero_invoice }}</td><td>{{ f.empresa_apelido or f.empresa_razao_social }}</td><td>{{ f.data_fechamento|date_br }}</td><td>{{ f.valor_moeda|money }}</td><td>{{ f.moeda }}</td><td>{{ f.observacao or '-' }}</td></tr>
+        {% else %}
+        <tr><td colspan="6" class="empty">Nenhum fechamento novo vinculado.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
 </div>
 {% endblock %}

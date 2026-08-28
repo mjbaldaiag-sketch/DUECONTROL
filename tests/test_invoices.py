@@ -30,7 +30,8 @@ class InvoiceFlowTests(unittest.TestCase):
         app.DB = self.previous_db
         self.db_path.unlink(missing_ok=True)
 
-    def _create_invoice(self, number="INV-001", value="1000,00", commercial=None, client_id=1, currency="USD"):
+    def _create_invoice(self, number="INV-001", value="1000,00", commercial=None, client_id=1,
+                        currency="USD", banco_referenciado_id=None):
         data = {
             "empresa_id": "1", "numero_invoice": number, "tipo_documento": "COMMERCIAL_INVOICE",
             "competencia_id": "1", "cliente_id": str(client_id), "data_emissao": "01/08/2026", "moeda": currency,
@@ -38,12 +39,117 @@ class InvoiceFlowTests(unittest.TestCase):
         }
         if commercial is not None:
             data["contrato_comercial"] = commercial
+        if banco_referenciado_id is not None:
+            data["banco_referenciado_id"] = str(banco_referenciado_id)
         response = self.client.post("/invoice/nova", data=data)
         self.assertEqual(response.status_code, 302)
         conn = app.db()
         invoice = conn.execute("SELECT * FROM invoices WHERE numero_invoice=?", (number,)).fetchone()
         conn.close()
         return invoice["id"]
+
+    def test_invoice_reference_is_saved_and_receipt_defaults_are_editable(self):
+        conn = app.db()
+        conn.execute("INSERT INTO contrapartes (nome) VALUES (?)", ("Banco Alternativo",))
+        bank_two_id = conn.execute(
+            "SELECT id FROM contrapartes WHERE nome=?", ("Banco Alternativo",)
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        invoice_id = self._create_invoice(
+            number="INV-REFERENCE", value="1000,00", banco_referenciado_id=1
+        )
+        response = self.client.get(f"/invoice/{invoice_id}")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        today_br = app.date.today().strftime("%d/%m/%Y")
+        self.assertIn("Banco Referenciado", html)
+        self.assertIn('<option value="1" selected>Banco Teste</option>', html)
+        self.assertIn(f'name="data_credito" data-date-br value="{today_br}"', html)
+        self.assertIn('name="valor_moeda" data-money value="1.000,00"', html)
+
+        response = self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": str(bank_two_id), "data_credito": "20/08/2026",
+            "valor_moeda": "900,00",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        receipt = conn.execute(
+            "SELECT banco_credito_id, data_credito, valor_moeda FROM recebimentos_invoice WHERE invoice_id=?",
+            (invoice_id,),
+        ).fetchone()
+        self.assertEqual((receipt["banco_credito_id"], receipt["data_credito"]), (bank_two_id, "2026-08-20"))
+        self.assertEqual(app.Decimal(str(receipt["valor_moeda"])), app.Decimal("900"))
+        conn.close()
+
+        response = self.client.post(f"/invoice/{invoice_id}/editar", data={
+            "empresa_id": "1", "numero_invoice": "INV-REFERENCE",
+            "tipo_documento": "COMMERCIAL_INVOICE", "competencia_id": "1",
+            "cliente_id": "1", "data_emissao": "01/08/2026", "moeda": "USD",
+            "valor_moeda": "1000,00",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        self.assertEqual(conn.execute(
+            "SELECT banco_referenciado_id FROM invoices WHERE id=?", (invoice_id,)
+        ).fetchone()[0], 1)
+        conn.close()
+
+        response = self.client.post(f"/invoice/{invoice_id}/editar", data={
+            "empresa_id": "1", "numero_invoice": "INV-REFERENCE",
+            "tipo_documento": "COMMERCIAL_INVOICE", "competencia_id": "1",
+            "cliente_id": "1", "banco_referenciado_id": "", "data_emissao": "01/08/2026",
+            "moeda": "USD", "valor_moeda": "1000,00",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        self.assertIsNone(conn.execute(
+            "SELECT banco_referenciado_id FROM invoices WHERE id=?", (invoice_id,)
+        ).fetchone()[0])
+        self.assertEqual(conn.execute(
+            "SELECT banco_credito_id FROM recebimentos_invoice WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], bank_two_id)
+        conn.close()
+
+        default_invoice_id = self._create_invoice(
+            number="INV-REFERENCE-DEFAULT", value="500,00", banco_referenciado_id=1
+        )
+        response = self.client.post(f"/invoice/{default_invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": today_br, "valor_moeda": "500,00",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        receipt = conn.execute(
+            "SELECT banco_credito_id, data_credito, valor_moeda FROM recebimentos_invoice WHERE invoice_id=?",
+            (default_invoice_id,),
+        ).fetchone()
+        self.assertEqual((receipt["banco_credito_id"], receipt["data_credito"]), (1, app.date.today().isoformat()))
+        self.assertEqual(app.Decimal(str(receipt["valor_moeda"])), app.Decimal("500"))
+        conn.close()
+
+    def test_existing_reference_is_preserved_by_idempotent_schema_bootstrap(self):
+        invoice_id = self._create_invoice(
+            number="INV-REFERENCE-PRESERVED", banco_referenciado_id=1
+        )
+        conn = app.db()
+        conn.execute(
+            "INSERT INTO recebimentos_invoice(invoice_id,banco_credito_id,data_credito,moeda,valor_moeda) "
+            "VALUES (?,?,?,?,?)", (invoice_id, 1, "2026-08-10", "USD", 1000)
+        )
+        conn.commit()
+        conn.close()
+
+        app.init_db()
+        app.init_db()
+        conn = app.db()
+        self.assertEqual(conn.execute(
+            "SELECT banco_referenciado_id FROM invoices WHERE id=?", (invoice_id,)
+        ).fetchone()[0], 1)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM recebimentos_invoice WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], 1)
+        conn.close()
 
     def test_invoice_report_consolidates_real_status_balances_and_copy_payloads(self):
         conn = app.db()
@@ -421,7 +527,7 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertIn("status", model.columns)
         self.assertIn("data_credito", model.columns)
         for column in (
-            "empresa", "invoice", "tipo", "banco_credito", "banco_liquidacao", "contrato_cambio",
+            "empresa", "invoice", "tipo", "banco_referenciado", "banco_credito", "banco_liquidacao", "contrato_cambio",
             "data_fechamento", "data_liquidacao", "valor_moeda", "taxa_cambio", "valor_brl",
         ):
             self.assertIn(column, model.columns)
@@ -489,11 +595,13 @@ class InvoiceFlowTests(unittest.TestCase):
 
         conn = app.db()
         invoice = conn.execute(
-            "SELECT id, status, status_manual, data_credito FROM invoices WHERE numero_invoice='INV-FULL-IMPORT'"
+            "SELECT id, status, status_manual, data_credito, banco_referenciado_id "
+            "FROM invoices WHERE numero_invoice='INV-FULL-IMPORT'"
         ).fetchone()
         self.assertEqual(invoice["status"], app.INVOICE_STATUS_LIQUIDADA)
         self.assertEqual(invoice["status_manual"], 1)
         self.assertEqual(invoice["data_credito"], "2026-08-10")
+        self.assertEqual(invoice["banco_referenciado_id"], 1)
         receipt = conn.execute(
             "SELECT banco_credito_id, data_credito, valor_moeda FROM recebimentos_invoice WHERE invoice_id=?",
             (invoice["id"],),
@@ -541,7 +649,7 @@ class InvoiceFlowTests(unittest.TestCase):
         ))
         conn.close()
 
-    def test_schema_migrates_v1_to_v3_without_recreating_existing_contracts(self):
+    def test_schema_migrates_v1_to_v5_without_recreating_existing_contracts(self):
         migration_path = Path(tempfile.mktemp(prefix="duecontrol_invoice_migration_", suffix=".db"))
         previous_db = app.DB
         try:
@@ -555,6 +663,10 @@ class InvoiceFlowTests(unittest.TestCase):
                 CREATE TABLE clientes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL,
                     pais TEXT NOT NULL, created_at TEXT, UNIQUE(nome, pais)
+                );
+                CREATE TABLE contrapartes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL UNIQUE,
+                    created_at TEXT
                 );
                 CREATE TABLE dues (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, numero_due TEXT NOT NULL UNIQUE,
@@ -580,12 +692,23 @@ class InvoiceFlowTests(unittest.TestCase):
                     observacao TEXT, created_at TEXT,
                     UNIQUE(empresa_id, numero_invoice, tipo_documento)
                 );
+                CREATE TABLE recebimentos_invoice (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id INTEGER NOT NULL,
+                    banco_credito_id INTEGER, data_credito TEXT NOT NULL,
+                    moeda TEXT NOT NULL, valor_moeda REAL NOT NULL,
+                    documento TEXT, observacao TEXT, created_at TEXT
+                );
                 INSERT INTO empresas(razao_social, cnpj, apelido) VALUES ('Empresa V1', '11111111000111', 'V1');
                 INSERT INTO clientes(nome, pais) VALUES ('Cliente V1', 'BR');
+                INSERT INTO contrapartes(nome) VALUES ('Banco Antigo'), ('Banco Mais Antigo');
                 INSERT INTO dues(numero_due, moeda, valor_original) VALUES ('DUE-V1', 'USD', 10);
                 INSERT INTO contratos(numero_contrato, moeda, valor_moeda) VALUES ('C-V1', 'USD', 10);
                 INSERT INTO invoices(empresa_id, numero_invoice, tipo_documento, valor_moeda)
                     VALUES (1, 'INV-V1', 'COMMERCIAL_INVOICE', 10);
+                INSERT INTO recebimentos_invoice(invoice_id,banco_credito_id,data_credito,moeda,valor_moeda)
+                    VALUES (1,2,'2026-08-20','USD',10);
+                INSERT INTO recebimentos_invoice(invoice_id,banco_credito_id,data_credito,moeda,valor_moeda)
+                    VALUES (1,1,'2026-08-10','USD',10);
                 PRAGMA user_version = 1;
             """)
             conn.commit()
@@ -593,7 +716,10 @@ class InvoiceFlowTests(unittest.TestCase):
 
             app.init_db()
             conn = app.db()
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertIsNotNone(conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='fechamentos_cambio'"
+            ).fetchone())
             self.assertIsNotNone(conn.execute(
                 "SELECT id FROM invoices WHERE numero_invoice='INV-V1'"
             ).fetchone())
@@ -609,6 +735,12 @@ class InvoiceFlowTests(unittest.TestCase):
             self.assertIn("competencia_id", {
                 row[1] for row in conn.execute("PRAGMA table_info(invoices)").fetchall()
             })
+            self.assertIn("banco_referenciado_id", {
+                row[1] for row in conn.execute("PRAGMA table_info(invoices)").fetchall()
+            })
+            self.assertEqual(conn.execute(
+                "SELECT banco_referenciado_id FROM invoices WHERE numero_invoice='INV-V1'"
+            ).fetchone()[0], 1)
             conn.close()
         finally:
             app.DB = previous_db
@@ -861,6 +993,158 @@ class InvoiceFlowTests(unittest.TestCase):
         conn = app.db()
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM contratos WHERE numero_contrato='C001'").fetchone()[0], 1)
         self.assertEqual(app.Decimal(str(conn.execute("SELECT valor_moeda FROM contratos WHERE numero_contrato='C001'").fetchone()[0])), app.Decimal("900"))
+        conn.close()
+
+    def test_partial_closings_can_wait_and_then_be_linked_without_legacy_duplication(self):
+        invoice_id = self._create_invoice("INV-CLOSINGS", "1000,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "1000,00",
+        })
+
+        first = self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "300,00", "data_fechamento": "12/08/2026",
+        })
+        second = self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "200,00", "data_fechamento": "13/08/2026",
+        })
+        self.assertEqual(first.status_code, 302)
+        self.assertEqual(second.status_code, 302)
+
+        direct = self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "250,00", "data_fechamento": "14/08/2026",
+            "numero_novo_contrato": "C-CLOSINGS",
+        })
+        self.assertEqual(direct.status_code, 302)
+        conn = app.db()
+        summary = app.invoice_summary(conn, invoice_id)
+        self.assertEqual(summary["total_fechamentos"], app.Decimal("750"))
+        self.assertEqual(summary["total_fechamentos_vinculados"], app.Decimal("250"))
+        self.assertEqual(summary["total_fechamentos_pendentes"], app.Decimal("500"))
+        self.assertEqual(summary["total_cambio"], app.Decimal("250"))
+        self.assertEqual(summary["saldo_fechamentos"], app.Decimal("250"))
+        closure_ids = [row[0] for row in conn.execute(
+            "SELECT id FROM fechamentos_cambio WHERE invoice_id=? ORDER BY id", (invoice_id,)
+        ).fetchall()]
+        contract = conn.execute(
+            "SELECT id, valor_moeda, data_contrato, data_fechamento FROM contratos WHERE numero_contrato='C-CLOSINGS'"
+        ).fetchone()
+        self.assertEqual(app.Decimal(str(contract["valor_moeda"])), app.Decimal("250"))
+        self.assertEqual(contract["data_contrato"], "2026-08-14")
+        conn.close()
+        self.assertEqual(self.client.get(f"/contrato/{contract['id']}").status_code, 200)
+        self.assertEqual(self.client.get(f"/contrato/{contract['id']}/relatorio").status_code, 200)
+
+        self.assertEqual(self.client.post(f"/contrato/{contract['id']}/fechamentos/vincular", data={
+            "fechamento_id": str(closure_ids[0]),
+        }).status_code, 302)
+        self.assertEqual(self.client.post(f"/contrato/{contract['id']}/fechamentos/vincular", data={
+            "fechamento_id": str(closure_ids[1]),
+        }).status_code, 302)
+        conn = app.db()
+        summary = app.invoice_summary(conn, invoice_id)
+        self.assertEqual(summary["total_cambio"], app.Decimal("750"))
+        self.assertEqual(summary["total_fechamentos_pendentes"], app.Decimal("0"))
+        self.assertEqual(summary["saldo_fechamentos"], app.Decimal("250"))
+        self.assertEqual(app.Decimal(str(conn.execute(
+            "SELECT valor_moeda FROM contratos WHERE id=?", (contract["id"],)
+        ).fetchone()[0])), app.Decimal("750"))
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM invoice_contrato_cambio WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], 0)
+        conn.close()
+        self.assertIn("C-CLOSINGS", self.client.get("/due/1").get_data(as_text=True))
+
+        self.assertEqual(self.client.post(
+            f"/invoice/{invoice_id}/fechamentos/{closure_ids[0]}/editar",
+            data={"valor_moeda": "350,00", "data_fechamento": "15/08/2026", "contrato_id": str(contract["id"])},
+        ).status_code, 302)
+        self.assertEqual(self.client.post(
+            f"/invoice/{invoice_id}/fechamentos/{closure_ids[1]}/excluir"
+        ).status_code, 302)
+        conn = app.db()
+        summary = app.invoice_summary(conn, invoice_id)
+        self.assertEqual(summary["total_fechamentos"], app.Decimal("600"))
+        self.assertEqual(summary["total_cambio"], app.Decimal("600"))
+        self.assertEqual(summary["total_fechamentos_pendentes"], app.Decimal("0"))
+        conn.close()
+
+    def test_closing_and_legacy_allocation_respect_reserved_balance(self):
+        invoice_id = self._create_invoice("INV-CLOSING-BALANCE", "500,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "500,00",
+        })
+        self.assertEqual(self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "400,00",
+        }).status_code, 302)
+        self.client.post(f"/invoice/{invoice_id}/fechamentos", data={"valor_moeda": "100,01"})
+        self.client.post(f"/invoice/{invoice_id}/cambio", data={
+            "numero_contrato": "C-RESERVED", "valor_alocado": "100,01",
+        })
+        conn = app.db()
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM fechamentos_cambio WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], 1)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM invoice_contrato_cambio WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], 0)
+        conn.close()
+
+    def test_dates_default_to_today_and_manual_closing_date_is_preserved(self):
+        invoice_id = self._create_invoice("INV-CLOSING-DATES", "200,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={"valor_moeda": "200,00"})
+        self.client.post(f"/invoice/{invoice_id}/fechamentos", data={"valor_moeda": "100,00"})
+        conn = app.db()
+        today = app.date.today().isoformat()
+        self.assertEqual(conn.execute(
+            "SELECT data_credito FROM recebimentos_invoice WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], today)
+        self.assertEqual(conn.execute(
+            "SELECT data_fechamento FROM fechamentos_cambio WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], today)
+        conn.close()
+
+        invoice_id = self._create_invoice("INV-CLOSING-CURRENCY", "100,00", currency="EUR")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={"valor_moeda": "100,00"})
+        self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "100,00", "numero_novo_contrato": "C-EUR-CLOSING",
+            "data_fechamento": "20/08/2026",
+        })
+        conn = app.db()
+        contract = conn.execute(
+            "SELECT moeda, data_contrato FROM contratos WHERE numero_contrato='C-EUR-CLOSING'"
+        ).fetchone()
+        self.assertEqual((contract["moeda"], contract["data_contrato"]), ("EUR", "2026-08-20"))
+        conn.close()
+
+    def test_closing_routes_reject_unknown_or_incompatible_contracts(self):
+        invoice_id = self._create_invoice("INV-CLOSING-VALIDATION", "100,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={"valor_moeda": "100,00"})
+        self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "50,00", "contrato_id": "999999",
+        })
+        conn = app.db()
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM fechamentos_cambio WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], 0)
+        conn.execute("INSERT INTO contratos(numero_contrato,moeda,valor_moeda) VALUES (?,?,?)", ("C-EUR", "EUR", 10))
+        contract_id = conn.execute("SELECT id FROM contratos WHERE numero_contrato='C-EUR'").fetchone()[0]
+        conn.commit()
+        conn.close()
+        other_invoice_id = self._create_invoice("INV-EUR-LINK", "10,00", currency="EUR")
+        conn = app.db()
+        conn.execute(
+            "INSERT INTO invoice_contrato_cambio(invoice_id,contrato_id,valor_alocado) VALUES (?,?,?)",
+            (other_invoice_id, contract_id, 10),
+        )
+        conn.commit()
+        conn.close()
+        self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "50,00", "contrato_id": str(contract_id),
+        })
+        conn = app.db()
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM fechamentos_cambio WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], 0)
         conn.close()
 
     def test_exchange_form_uses_exchange_contract_only(self):
@@ -1221,6 +1505,69 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(invoice["empresa_id"], 2)
         conn.close()
 
+    def test_invoice_import_and_export_support_referenced_bank_without_breaking_legacy_rows(self):
+        import pandas as pd
+
+        frame = pd.DataFrame([{
+            "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-REFERENCE-IMPORT",
+            "tipo_documento": "COMMERCIAL INVOICE", "competencia": "Agosto/2026",
+            "moeda": "USD", "valor_moeda": "100,00", "banco_referenciado": "Banco Teste",
+        }])
+        output = BytesIO()
+        frame.to_excel(output, index=False)
+        output.seek(0)
+        response = self.client.post(
+            "/invoices/importar", data={"arquivo": (output, "reference.xlsx")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200)
+        with self.client.session_transaction() as session:
+            token = session["invoice_import_stage"]
+        self.assertEqual(
+            self.client.post("/invoices/importar/confirmar", data={"stage_token": token}).status_code,
+            302,
+        )
+        conn = app.db()
+        imported = conn.execute(
+            "SELECT banco_referenciado_id FROM invoices WHERE numero_invoice='INV-REFERENCE-IMPORT'"
+        ).fetchone()
+        self.assertEqual(imported["banco_referenciado_id"], 1)
+        conn.close()
+
+        existing_id = self._create_invoice(
+            number="INV-REFERENCE-REIMPORT", value="200,00", banco_referenciado_id=1
+        )
+        legacy_frame = pd.DataFrame([{
+            "cnpj": "45.765.914/0001-81", "numero_invoice": "INV-REFERENCE-REIMPORT",
+            "tipo_documento": "COMMERCIAL INVOICE", "competencia": "Agosto/2026",
+            "moeda": "USD", "valor_moeda": "200,00",
+        }])
+        legacy_output = BytesIO()
+        legacy_frame.to_excel(legacy_output, index=False)
+        legacy_output.seek(0)
+        response = self.client.post(
+            "/invoices/importar", data={"arquivo": (legacy_output, "legacy-reference.xlsx")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200)
+        with self.client.session_transaction() as session:
+            token = session["invoice_import_stage"]
+        self.assertEqual(
+            self.client.post("/invoices/importar/confirmar", data={"stage_token": token}).status_code,
+            302,
+        )
+        conn = app.db()
+        self.assertEqual(conn.execute(
+            "SELECT banco_referenciado_id FROM invoices WHERE id=?", (existing_id,)
+        ).fetchone()[0], 1)
+        conn.close()
+
+        response = self.client.get("/invoices/exportar?numero_invoice=INV-REFERENCE-IMPORT")
+        self.assertEqual(response.status_code, 200)
+        exported = pd.read_excel(BytesIO(response.data), sheet_name="Invoices")
+        self.assertIn("Banco referenciado", exported.columns)
+        self.assertEqual(exported.iloc[0]["Banco referenciado"], "Banco Teste")
+
     def test_invoice_import_accepts_proforma_invoice_type(self):
         import pandas as pd
 
@@ -1345,6 +1692,22 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertIn("Banco de credito", receipts.columns)
         self.assertIn("Taxa de cambio", changes.columns)
         self.assertIn("Chave de acesso", dues.columns)
+
+    def test_invoice_export_includes_new_closings_in_cambios(self):
+        import pandas as pd
+
+        invoice_id = self._create_invoice("INV-EXPORT-CLOSING", "100,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={"valor_moeda": "100,00"})
+        self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "40,00", "data_fechamento": "20/08/2026",
+        })
+        response = self.client.get("/invoices/exportar?numero_invoice=INV-EXPORT-CLOSING")
+        self.assertEqual(response.status_code, 200)
+        changes = pd.read_excel(BytesIO(response.data), sheet_name="Cambios")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes.iloc[0]["Tipo de registro"], "Fechamento")
+        self.assertEqual(changes.iloc[0]["Valor alocado"], 40)
+        self.assertTrue(pd.isna(changes.iloc[0]["Numero do Contrato Cambio"]))
 
     def test_contract_list_filters_by_partial_contract_number(self):
         conn = app.db()

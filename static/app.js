@@ -231,6 +231,14 @@
     });
   });
 
+  const todayBr = new Intl.DateTimeFormat('pt-BR').format(new Date());
+  const fillToday = (form, field) => {
+    const input = form.querySelector(`[name="${field}"]`);
+    if (input && !input.value) input.value = todayBr;
+  };
+  document.querySelectorAll('form[action*="/recebimentos"]').forEach((form) => fillToday(form, 'data_credito'));
+  document.querySelectorAll('form[action$="/cambio"]').forEach((form) => fillToday(form, 'data_fechamento'));
+  document.querySelectorAll('form[action$="/contrato/novo"]').forEach((form) => fillToday(form, 'data_contrato'));
   document.querySelectorAll('[data-date-br]').forEach((input) => input.addEventListener('input', () => formatDate(input)));
   document.querySelectorAll('[data-chave-acesso]').forEach((input) => input.addEventListener('input', () => {
     input.value = input.value.replace(/[^a-zA-Z0-9]/g, '').slice(0, 14).toUpperCase();
