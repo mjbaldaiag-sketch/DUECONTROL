@@ -5394,12 +5394,8 @@ def build_invoice_report_context():
 
     def grouped_rows(status, value_key, include_bank=False):
         grouped = {}
-        accepted_statuses = (
-            INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
-            INVOICE_STATUS_AGUARDANDO_CONTRATO,
-        ) if status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO else (status,)
         for summary in summaries:
-            if summary["status"] not in accepted_statuses:
+            if summary["status"] != status:
                 continue
             cliente = summary.get("cliente_nome") or "Não informado"
             if include_bank:
@@ -5421,12 +5417,8 @@ def build_invoice_report_context():
 
     def hierarchical_rows(status, value_key):
         grouped = {}
-        accepted_statuses = (
-            INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
-            INVOICE_STATUS_AGUARDANDO_CONTRATO,
-        ) if status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO else (status,)
         for summary in summaries:
-            if summary["status"] not in accepted_statuses:
+            if summary["status"] != status:
                 continue
             banco = ", ".join(sorted(summary.get("bancos_credito") or [])) or "-"
             empresa = summary.get("empresa_apelido") or summary.get("empresa_razao_social") or "Não informado"

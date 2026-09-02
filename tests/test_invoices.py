@@ -1222,7 +1222,10 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(saldo["status"], app.INVOICE_STATUS_AGUARDANDO_CONTRATO)
         self.assertEqual(saldo["status_label"], "AGUARDANDO CONTRATO")
         report = app.build_invoice_report_context()
-        self.assertEqual(report["tables"][0]["total"], app.Decimal("100"))
+        self.assertEqual(report["tables"][0]["total"], app.Decimal("0"))
+        self.assertEqual(report["tables"][0]["rows"], [])
+        report_html = self.client.get("/invoices/relatorios").get_data(as_text=True)
+        self.assertNotIn("INV-CLOSING-PENDING", report_html)
 
         liquidated_invoice = self._create_invoice("INV-CLOSING-LIQUIDATED", "100,00")
         self.client.post(f"/invoice/{liquidated_invoice}/recebimentos", data={
