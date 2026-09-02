@@ -32,13 +32,13 @@ Os contratos de câmbio são consolidados por número a partir das Invoices vinc
 
 ## Excel de Invoices
 
-A coluna `status` é opcional para manter compatibilidade com planilhas antigas e aceita `AGUARDANDO RECEBIMENTO`, `RECEBIDO AGUARDANDO CAMBIO` ou `LIQUIDADA`. Quando preenchida, a atribuição é preservada no cadastro; quando vazia, a Invoice começa em `AGUARDANDO RECEBIMENTO`.
+A coluna `status` é opcional para manter compatibilidade com planilhas antigas e aceita `AGUARDANDO RECEBIMENTO`, `RECEBIDO AGUARDANDO CAMBIO`, `AGUARDANDO CONTRATO` ou `LIQUIDADA`. Quando preenchida, a atribuição é preservada no cadastro; quando vazia, a Invoice começa em `AGUARDANDO RECEBIMENTO`.
 
 Use "Baixar modelo Excel" na Gestão de Invoices. A planilha tem uma linha por Invoice e exige `empresa`, `invoice`, `tipo`, `competencia`, `moeda` e `valor_moeda`; `empresa` pode ser o CNPJ, a razão social ou o apelido cadastrado. O modelo também aceita os dados de recebimento (`banco_credito` e `data_credito`) e de câmbio já fechado (`banco_liquidacao`, `contrato_cambio`, `data_fechamento`, `data_liquidacao`, `taxa_cambio` e `valor_brl`). Ao informar um Contrato Câmbio sem `valor_alocado`, o valor integral da Invoice é vinculado automaticamente. Os campos `cliente_pais` e `valor_alocado` não fazem parte do modelo novo, mas planilhas legadas com `valor_alocado` continuam compatíveis.
 
 A competência é localizada por empresa, aceitando variações de descrição quando o período informado for compatível com uma competência cadastrada. Quando não houver competência exata, próxima ou pertinente à data da Invoice, a prévia sugere o cadastro de uma nova competência para a empresa, sem gravá-la até a confirmação.
 
-Quando `data_credito` é informada, o importador registra o recebimento em USD; para uma Invoice com status `RECEBIDO AGUARDANDO CAMBIO`, a data é obrigatória. O `valor_brl` é validado contra `valor_moeda`/valor alocado e `taxa_cambio`. Se um banco informado não estiver cadastrado, a prévia apresenta a lista de bancos de Configurações para que o usuário faça o vínculo antes da confirmação. Planilhas antigas que ainda contenham `valor_alocado` continuam sendo aceitas para reprocessamento compatível.
+Quando `data_credito` é informada, o importador registra o recebimento em USD; para uma Invoice com status `RECEBIDO AGUARDANDO CAMBIO` ou `AGUARDANDO CONTRATO`, a data é obrigatória. O `valor_brl` é validado contra `valor_moeda`/valor alocado e `taxa_cambio`. Se um banco informado não estiver cadastrado, a prévia apresenta a lista de bancos de Configurações para que o usuário faça o vínculo antes da confirmação. Planilhas antigas que ainda contenham `valor_alocado` continuam sendo aceitas para reprocessamento compatível.
 
 Invoices existentes são reprocessadas atualizando seus dados comerciais e substituindo somente suas alocações importadas; recebimentos e vínculos com DU-E são preservados.
 

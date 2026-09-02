@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading">
+  <div><h1>Gestão de Fechamentos</h1><p class="muted">Selecione Invoices recebidas com saldo de câmbio disponível.</p></div>
+  <div class="actions"><a class="btn secondary" href="{{ url_for('lista_invoices') }}">Voltar para Invoices</a></div>
+</div>
+
+<form method="get" class="filters central-closing-filters">
+  <label>Invoice<input name="numero_invoice" value="{{ filters.numero_invoice }}" placeholder="Número da Invoice"></label>
+  <label>Cliente<select name="cliente_id"><option value="">Todos</option>{% for cliente in clientes %}<option value="{{ cliente.id }}" {{ 'selected' if filters.cliente_id == cliente.id|string else '' }}>{{ cliente.nome }}</option>{% endfor %}</select></label>
+  <label>Banco de Crédito<select name="banco_credito_id"><option value="">Todos</option>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if filters.banco_credito_id == banco.id|string else '' }}>{{ banco.nome }}</option>{% endfor %}</select></label>
+  <label>Moeda<select name="moeda"><option value="">Todas</option>{% for moeda in moedas %}<option value="{{ moeda }}" {{ 'selected' if filters.moeda == moeda }}>{{ moeda }}</option>{% endfor %}</select></label>
+  <div class="filter-actions"><button type="submit">Filtrar</button><a class="btn secondary" href="{{ url_for('gestao_fechamentos_invoices') }}">Limpar</a></div>
+</form>
+
+<form method="post" action="{{ url_for('registrar_fechamentos_invoices') }}" data-central-closing-form>
+  <div class="central-closing-toolbar">
+    <strong><span data-central-selected-count>0</span> Invoice(s) selecionada(s)</strong>
+    <span class="muted">A seleção deve usar um único Cliente. Bancos e moedas diferentes serão separados em grupos.</span>
+  </div>
+  <div class="table-wrap">
+    <table class="compact-table central-closing-table">
+      <thead><tr><th class="selection-column"><input type="checkbox" data-central-select-all aria-label="Selecionar todas"></th><th>Invoice</th><th>Empresa</th><th>Cliente</th><th>Banco de Crédito</th><th>Moeda</th><th>Recebido</th><th>Saldo disponível</th></tr></thead>
+      <tbody>
+      {% for invoice in eligible_invoices %}
+        <tr>
+          <td class="selection-column"><input type="checkbox" name="selected_ids" value="{{ invoice.id }}" data-central-checkbox data-client-id="{{ invoice.cliente_id }}" data-invoice-number="{{ invoice.numero_invoice }}" data-invoice-currency="{{ invoice.moeda }}" data-invoice-bank-id="{{ invoice.banco_credito_id }}" data-invoice-bank-name="{{ invoice.banco_credito_nome }}" data-invoice-available="{{ invoice.valor_fechamento }}" data-invoice-splittable="{{ invoice.desdobramento_habilitado }}"></td>
+          <td><a href="{{ url_for('detalhe_invoice', invoice_id=invoice.id) }}">{{ invoice.numero_invoice }}</a></td>
+          <td>{{ invoice.empresa_apelido or invoice.empresa_razao_social }}</td>
+          <td>{{ invoice.cliente_nome }}</td>
+          <td>{{ invoice.banco_credito_nome }}</td>
+          <td>{{ invoice.moeda }}</td>
+          <td>{{ invoice.total_recebido|money }}</td>
+          <td><strong>{{ invoice.valor_fechamento|money }}</strong></td>
+        </tr>
+      {% else %}
+        <tr><td class="empty" colspan="8">Nenhuma Invoice elegível para um novo Fechamento.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="central-closing-toolbar"><span class="muted">Informe os valores no modal para registrar o fechamento.</span><button type="button" data-central-open disabled>Registrar fechamento</button></div>
+</form>
+
+<dialog data-central-closing-dialog aria-labelledby="central-closing-dialog-title">
+  <form method="post" action="{{ url_for('registrar_fechamentos_invoices') }}" data-central-closing-dialog-form>
+    <h2 id="central-closing-dialog-title">Registrar fechamento de câmbio</h2>
+    <p class="muted">Confira o valor de cada Invoice. O limite é o saldo disponível exibido.</p>
+    <div data-central-closing-items class="central-closing-dialog-items"></div>
+    <div data-central-closing-contracts class="central-closing-dialog-contracts"></div>
+    <div class="central-closing-dialog-fields">
+      <label>Data de Fechamento<input type="date" name="data_fechamento" value="{{ today_iso() }}" required></label>
+      <label>Data de Liquidação<input type="date" name="data_liquidacao" required></label>
+      <label>Taxa<input name="taxa_cambio" data-rate inputmode="decimal" step="0.0001" placeholder="0,0000" required></label>
+      <label>Banco de Liquidação<select name="banco_liquidacao_id" required><option value="">Selecione</option>{% for banco in contrapartes %}<option value="{{ banco.id }}">{{ banco.nome }}</option>{% endfor %}</select></label>
+    </div>
+    <div class="form-actions"><button type="submit">Confirmar e registrar</button><button type="button" class="btn secondary" data-central-cancel>Cancelar</button></div>
+  </form>
+</dialog>
+
+<h2>Fechamentos registrados</h2>
+<div class="table-wrap"><table class="compact-table">
+  <thead><tr><th>ID</th><th>Cliente</th><th>Banco de Crédito</th><th>Moeda</th><th>Valor</th><th>BRL</th><th>Taxa</th><th>Fechamento</th><th>Liquidação</th><th>Contrato</th><th>Ações</th></tr></thead>
+  <tbody>
+  {% for fechamento in fechamentos %}
+    <tr><td><a href="{{ url_for('detalhe_fechamento_invoice', fechamento_id=fechamento.id) }}">{{ fechamento.id }}</a></td><td>{{ fechamento.cliente_nome }}</td><td>{{ fechamento.banco_credito_nome }}</td><td>{{ fechamento.moeda }}</td><td>{{ fechamento.valor_moeda|money }}</td><td>{{ fechamento.valor_brl|money if fechamento.valor_brl is not none else '-' }}</td><td>{{ fechamento.taxa_cambio|rate if fechamento.taxa_cambio is not none else '-' }}</td><td>{{ fechamento.data_fechamento|date_br }}</td><td>{{ fechamento.data_liquidacao|date_br }}</td><td>{% if fechamento.numero_contrato %}<a href="{{ url_for('detalhe_contrato', contrato_id=fechamento.contrato_id) }}">{{ fechamento.numero_contrato }}</a>{% else %}<span class="muted">Pendente</span>{% endif %}</td><td><a href="{{ url_for('detalhe_fechamento_invoice', fechamento_id=fechamento.id) }}">Ver / editar</a></td></tr>
+  {% else %}
+    <tr><td class="empty" colspan="11">Nenhum Fechamento centralizado registrado.</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading"><div><h1>Prévia do Fechamento</h1><p class="muted">Confira os grupos antes da gravação transacional.</p></div><a class="btn secondary" href="{{ url_for('gestao_fechamentos_invoices') }}">Cancelar</a></div>
+<form method="post" action="{{ url_for('registrar_fechamentos_invoices') }}" class="central-closing-preview-form">
+  {% for invoice_id in form_data.selected_ids %}<input type="hidden" name="selected_ids" value="{{ invoice_id }}">{% endfor %}
+  <input type="hidden" name="data_fechamento" value="{{ form_data.data_fechamento }}">
+  <input type="hidden" name="data_liquidacao" value="{{ form_data.data_liquidacao }}">
+  <input type="hidden" name="taxa_cambio" value="{{ form_data.taxa_cambio }}">
+  <input type="hidden" name="banco_liquidacao_id" value="{{ form_data.banco_liquidacao_id }}">
+  <div class="detail-grid central-closing-preview-summary">
+    <div><span>Data de Fechamento</span><strong>{{ form_data.data_fechamento|date_br }}</strong></div>
+    <div><span>Data de Liquidação</span><strong>{{ form_data.data_liquidacao|date_br }}</strong></div>
+    <div><span>Taxa</span><strong>{{ form_data.taxa_cambio|rate }}</strong></div>
+    <div><span>Grupos</span><strong>{{ groups|length }}</strong></div>
+  </div>
+  {% for group in groups %}
+    <section class="central-closing-group">
+      <div class="section-heading"><h2>Grupo {{ loop.index }} — {{ group.cliente_nome }}</h2><strong>{{ group.valor_moeda|money }} {{ group.moeda }}</strong></div>
+      <p class="muted">Banco de Crédito: {{ group.banco_credito_nome }} · Banco de Liquidação: {{ group.banco_liquidacao_nome }} · Moeda: {{ group.moeda }} · Taxa: {{ group.taxa_cambio|rate }} · BRL: {{ group.valor_brl|money }}</p>
+      {% for item in group.invoices %}<input type="hidden" name="valor_fechamento_{{ item.id }}" value="{{ item.valor_moeda }}">{% endfor %}<table class="compact-table"><thead><tr><th>Invoice</th><th>Empresa</th><th>Valor reservado</th><th>BRL</th></tr></thead><tbody>
+        {% for item in group.invoices %}<tr><td>{{ item.numero_invoice }}</td><td>{{ item.empresa_apelido or item.empresa_razao_social }}</td><td>{{ item.valor_moeda|money }} {{ group.moeda }}</td><td>{{ (item.valor_moeda * group.taxa_cambio)|money }}</td></tr>{% endfor %}
+      </tbody></table>
+      <label class="central-closing-contract-field">Número novo de Contrato de Câmbio (opcional)<input name="numero_contrato_{{ group.index }}" maxlength="120" placeholder="Deixe vazio para vincular depois"></label>
+    </section>
+  {% endfor %}
+  <div class="form-actions"><button type="submit">Confirmar e registrar</button><a class="btn secondary" href="{{ url_for('gestao_fechamentos_invoices') }}">Voltar</a></div>
+</form>
+{% endblock %}

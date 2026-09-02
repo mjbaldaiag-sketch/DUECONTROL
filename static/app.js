@@ -180,10 +180,18 @@
     const selectAll = form.querySelector('[data-batch-select-all]');
     const count = form.querySelector('[data-batch-count]');
     const submit = form.querySelector('[data-batch-submit]');
+    const receiptOpen = form.querySelector('[data-batch-receipt-open]');
+    const receiptDialog = document.querySelector('[data-batch-receipt-dialog]');
+    const receiptForm = receiptDialog ? receiptDialog.querySelector('[data-batch-receipt-form]') : null;
+    const receiptCount = receiptDialog ? receiptDialog.querySelector('[data-batch-receipt-count]') : null;
+    const receiptCancel = receiptDialog ? receiptDialog.querySelector('[data-batch-receipt-cancel]') : null;
+    const receiptBank = receiptForm ? receiptForm.querySelector('[name="banco_credito_id"]') : null;
     const sync = () => {
       const selected = checkboxes.filter((checkbox) => checkbox.checked).length;
       if (count) count.textContent = selected;
       if (submit) submit.disabled = selected === 0;
+      if (receiptOpen) receiptOpen.disabled = selected === 0;
+      if (receiptCount) receiptCount.textContent = selected;
       if (selectAll) {
         selectAll.checked = checkboxes.length > 0 && selected === checkboxes.length;
         selectAll.indeterminate = selected > 0 && selected < checkboxes.length;
@@ -196,7 +204,36 @@
       });
     }
     checkboxes.forEach((checkbox) => checkbox.addEventListener('change', sync));
+    if (receiptOpen && receiptDialog && receiptForm) {
+      receiptOpen.addEventListener('click', () => {
+        receiptForm.querySelectorAll('[data-batch-receipt-id]').forEach((input) => input.remove());
+        checkboxes.filter((checkbox) => checkbox.checked).forEach((checkbox) => {
+          const input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = 'selected_ids';
+          input.value = checkbox.value;
+          input.setAttribute('data-batch-receipt-id', '');
+          receiptForm.appendChild(input);
+        });
+        if (typeof receiptDialog.showModal === 'function') receiptDialog.showModal();
+        else receiptDialog.setAttribute('open', '');
+        if (receiptBank) receiptBank.focus();
+      });
+      const closeReceiptDialog = () => {
+        if (typeof receiptDialog.close === 'function') receiptDialog.close();
+        else receiptDialog.removeAttribute('open');
+      };
+      if (receiptCancel) receiptCancel.addEventListener('click', closeReceiptDialog);
+      receiptDialog.addEventListener('cancel', closeReceiptDialog);
+      receiptForm.addEventListener('submit', (event) => {
+        if (!receiptForm.querySelector('[data-batch-receipt-id]')) {
+          event.preventDefault();
+          window.alert('Selecione uma ou mais Invoices para registrar os recebimentos.');
+        }
+      });
+    }
     form.addEventListener('submit', (event) => {
+      if (event.submitter && event.submitter.hasAttribute('data-invoice-single-delete')) return;
       const selected = checkboxes.filter((checkbox) => checkbox.checked);
       if (!selected.length) {
         event.preventDefault();
@@ -254,6 +291,175 @@
     select.addEventListener('change', update);
     update();
   });
+  document.querySelectorAll('[data-central-closing-form]').forEach((form) => {
+    const checkboxes = [...form.querySelectorAll('[data-central-checkbox]')];
+    const selectAll = form.querySelector('[data-central-select-all]');
+    const count = form.querySelector('[data-central-selected-count]');
+    const submit = form.querySelector('[data-central-open]');
+    const dialog = document.querySelector('[data-central-closing-dialog]');
+    const dialogForm = dialog ? dialog.querySelector('[data-central-closing-dialog-form]') : null;
+    const dialogItems = dialog ? dialog.querySelector('[data-central-closing-items]') : null;
+    const dialogContracts = dialog ? dialog.querySelector('[data-central-closing-contracts]') : null;
+    const cancel = dialog ? dialog.querySelector('[data-central-cancel]') : null;
+    const selected = () => checkboxes.filter((checkbox) => checkbox.checked);
+    const closeDialog = () => {
+      if (!dialog) return;
+      if (typeof dialog.close === 'function') dialog.close();
+      else dialog.removeAttribute('open');
+    };
+    const renderDialog = () => {
+      if (!dialogItems || !dialogForm) return;
+      dialogItems.replaceChildren();
+      if (dialogContracts) dialogContracts.replaceChildren();
+      dialogForm.querySelectorAll('[data-central-selected-id]').forEach((input) => input.remove());
+      selected().forEach((checkbox) => {
+        const item = document.createElement('div');
+        item.className = 'central-closing-dialog-item';
+        const label = document.createElement('label');
+        const title = document.createElement('strong');
+        title.textContent = checkbox.dataset.invoiceNumber || `Invoice ${checkbox.value}`;
+        const limit = document.createElement('small');
+        const currency = checkbox.dataset.invoiceCurrency || 'USD';
+        const max = Number(checkbox.dataset.invoiceAvailable || 0);
+        const splittable = checkbox.dataset.invoiceSplittable === '1';
+        limit.textContent = `Saldo disponível: ${new Intl.NumberFormat('pt-BR', {
+          minimumFractionDigits: 2, maximumFractionDigits: 2,
+        }).format(max)} ${currency}${splittable ? '' : ' · Invoice legada: somente integral'}`;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.name = `valor_fechamento_${checkbox.value}`;
+        input.value = new Intl.NumberFormat('pt-BR', {
+          minimumFractionDigits: 2, maximumFractionDigits: 2,
+        }).format(max);
+        input.inputMode = 'decimal';
+        input.required = true;
+        input.dataset.maxClosing = String(max);
+        input.dataset.splittable = String(splittable);
+        const validateClosingInput = () => {
+          const normalized = input.value.includes(',')
+            ? input.value.replace(/\./g, '').replace(',', '.') : input.value;
+          const amount = Number(normalized);
+          const invalid = !Number.isFinite(amount) || amount <= 0 || amount > max + 0.005
+            || (!splittable && amount < max - 0.005);
+          input.setCustomValidity(invalid
+            ? 'Informe um valor maior que zero dentro do saldo disponível.' : '');
+          input.classList.toggle('input-invalid', invalid);
+          input.setAttribute('aria-invalid', String(invalid));
+        };
+        input.addEventListener('input', validateClosingInput);
+        input.addEventListener('blur', () => { formatMoney(input); validateClosingInput(); });
+        validateClosingInput();
+        label.append(title, limit, input);
+        item.appendChild(label);
+        dialogItems.appendChild(item);
+        const hidden = document.createElement('input');
+        hidden.type = 'hidden';
+        hidden.name = 'selected_ids';
+        hidden.value = checkbox.value;
+        hidden.setAttribute('data-central-selected-id', '');
+        dialogForm.appendChild(hidden);
+      });
+      if (dialogContracts) {
+        const groups = [...new Map(selected().map((checkbox) => {
+          const key = `${checkbox.dataset.invoiceBankId || ''}|${checkbox.dataset.invoiceCurrency || ''}`;
+          return [key, {
+            bankId: checkbox.dataset.invoiceBankId || '',
+            bank: checkbox.dataset.invoiceBankName || 'Banco de Crédito',
+            currency: checkbox.dataset.invoiceCurrency || 'USD',
+          }];
+        })).values()].sort((left, right) => {
+          const bankOrder = left.bank.localeCompare(right.bank, 'pt-BR');
+          return bankOrder || left.currency.localeCompare(right.currency, 'pt-BR');
+        });
+        groups.forEach((group, index) => {
+          const label = document.createElement('label');
+          label.className = 'central-closing-contract-field';
+          label.textContent = `Número do Contrato de Câmbio — Grupo ${index + 1} (${group.bank} · ${group.currency})`;
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.name = `numero_contrato_grupo_${group.bankId}_${group.currency}`;
+          input.maxLength = 120;
+          input.placeholder = 'Opcional; pode ser vinculado depois';
+          label.appendChild(input);
+          dialogContracts.appendChild(label);
+        });
+      }
+    };
+    const sync = () => {
+      const checked = selected();
+      if (count) count.textContent = checked.length;
+      if (submit) submit.disabled = checked.length === 0;
+      if (selectAll) {
+        selectAll.checked = checkboxes.length > 0 && checked.length === checkboxes.length;
+        selectAll.indeterminate = checked.length > 0 && checked.length < checkboxes.length;
+      }
+    };
+    const sameClient = (items) => new Set(
+      items.map((checkbox) => checkbox.dataset.clientId)
+    ).size <= 1;
+    checkboxes.forEach((checkbox) => checkbox.addEventListener('change', () => {
+      if (checkbox.checked && !sameClient(selected())) {
+        checkbox.checked = false;
+        window.alert('Selecione apenas Invoices do mesmo Cliente.');
+      }
+      sync();
+    }));
+    if (selectAll) selectAll.addEventListener('change', () => {
+      if (!selectAll.checked) {
+        checkboxes.forEach((checkbox) => { checkbox.checked = false; });
+        sync();
+        return;
+      }
+      const clients = new Set(checkboxes.map((checkbox) => checkbox.dataset.clientId));
+      if (clients.size > 1) {
+        window.alert('A seleção contém Clientes diferentes. Selecione um Cliente por vez.');
+        selectAll.checked = false;
+        return;
+      }
+      checkboxes.forEach((checkbox) => { checkbox.checked = true; });
+      sync();
+    });
+    if (submit && dialog) submit.addEventListener('click', () => {
+      if (!selected().length || !sameClient(selected())) {
+        window.alert('Selecione uma ou mais Invoices do mesmo Cliente.');
+        return;
+      }
+      renderDialog();
+      if (typeof dialog.showModal === 'function') dialog.showModal();
+      else dialog.setAttribute('open', '');
+      const firstAmount = dialogItems ? dialogItems.querySelector('input[name^="valor_fechamento_"]') : null;
+      if (firstAmount) firstAmount.focus();
+    });
+    if (cancel) cancel.addEventListener('click', closeDialog);
+    if (dialog) dialog.addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeDialog();
+    });
+    if (dialogForm) dialogForm.addEventListener('submit', (event) => {
+      const amountInputs = [...dialogForm.querySelectorAll('input[name^="valor_fechamento_"]')];
+      for (const input of amountInputs) {
+        const normalized = input.value.includes(',')
+          ? input.value.replace(/\./g, '').replace(',', '.') : input.value;
+        const amount = Number(normalized);
+        const maximum = Number(input.dataset.maxClosing || 0);
+        const splittable = input.dataset.splittable === 'true';
+        if (!Number.isFinite(amount) || amount <= 0 || amount > maximum + 0.005
+            || (!splittable && amount < maximum - 0.005)) {
+          event.preventDefault();
+          window.alert('Cada valor deve ser maior que zero, não pode ultrapassar o saldo disponível e Invoices legadas só permitem fechamento integral.');
+          input.focus();
+          return;
+        }
+      }
+    });
+    form.addEventListener('submit', (event) => {
+      if (!selected().length || !sameClient(selected())) {
+        event.preventDefault();
+        window.alert('Selecione uma ou mais Invoices do mesmo Cliente.');
+      }
+    });
+    sync();
+  });
   document.querySelectorAll('[data-invoice-default-bank]').forEach((bankSelect) => {
     const form = bankSelect.closest('form');
     const companySelect = form ? form.querySelector('[data-invoice-company-select]') : null;
@@ -308,6 +514,7 @@
 
     const awaiting = 'AGUARDANDO_RECEBIMENTO';
     const received = 'RECEBIDA_AGUARDANDO_CAMBIO';
+    const receivedStatuses = new Set([received, 'AGUARDANDO_CONTRATO']);
     let acceptedStatus = select.value;
     const showDialog = () => {
       dialogDate.value = creditDate.value || '';
@@ -327,7 +534,7 @@
 
     select.addEventListener('change', () => {
       const nextStatus = select.value;
-      if (nextStatus === received && acceptedStatus !== received && !creditDate.value) {
+      if (receivedStatuses.has(nextStatus) && !receivedStatuses.has(acceptedStatus) && !creditDate.value) {
         showDialog();
         return;
       }
@@ -341,7 +548,7 @@
       event.preventDefault();
       if (!dialogDate.reportValidity()) return;
       creditDate.value = dialogDate.value;
-      acceptedStatus = received;
+      acceptedStatus = select.value;
       closeDialog();
     });
     cancel.addEventListener('click', restoreStatus);
@@ -350,7 +557,7 @@
       restoreStatus();
     });
     form.addEventListener('submit', (event) => {
-      if (select.value === received && !creditDate.value) {
+      if (receivedStatuses.has(select.value) && !creditDate.value) {
         event.preventDefault();
         showDialog();
       }

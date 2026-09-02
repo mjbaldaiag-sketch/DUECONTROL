@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading"><div><h1>Fechamento {{ fechamento.id }}</h1><p class="muted">Grupo centralizado de Invoices</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('gestao_fechamentos_invoices') }}">Voltar</a>{% if fechamento.contrato_id %}<a class="btn secondary" href="{{ url_for('detalhe_contrato', contrato_id=fechamento.contrato_id) }}">Ver contrato</a>{% endif %}</div></div>
+<div class="detail-grid">
+  <div><span>Cliente</span><strong>{{ fechamento.cliente_nome }}</strong></div>
+  <div><span>Banco de Crédito</span><strong>{{ fechamento.banco_credito_nome }}</strong></div>
+  <div><span>Moeda / Total</span><strong>{{ fechamento.moeda }} {{ fechamento.valor_moeda|money }}</strong></div>
+  <div><span>Taxa</span><strong>{{ fechamento.taxa_cambio|rate if fechamento.taxa_cambio is not none else '-' }}</strong></div>
+  <div><span>Valor em BRL</span><strong>{{ fechamento.valor_brl|money if fechamento.valor_brl is not none else '-' }}</strong></div>
+  <div><span>Data de Fechamento</span><strong>{{ fechamento.data_fechamento|date_br }}</strong></div>
+  <div><span>Data de Liquidação</span><strong>{{ fechamento.data_liquidacao|date_br }}</strong></div>
+  <div><span>Banco de Liquidação</span><strong>{{ fechamento.banco_liquidacao_nome }}</strong></div>
+</div>
+<h2>Invoices participantes</h2>
+<div class="table-wrap"><table class="compact-table"><thead><tr><th>Invoice</th><th>Empresa</th><th>Moeda</th><th>Valor</th></tr></thead><tbody>{% for item in fechamento['items'] %}<tr><td><a href="{{ url_for('detalhe_invoice', invoice_id=item.invoice_id) }}">{{ item.numero_invoice }}</a></td><td>{{ item.empresa_apelido or item.empresa_razao_social }}</td><td>{{ item.invoice_moeda }}</td><td>{{ item.valor_moeda|money }}</td></tr>{% else %}<tr><td class="empty" colspan="4">Nenhuma Invoice vinculada.</td></tr>{% endfor %}</tbody></table></div>
+<h2>Editar grupo</h2>
+<form method="post" action="{{ url_for('editar_fechamento_invoice', fechamento_id=fechamento.id) }}" class="form inline-form central-closing-edit-form">
+  <label>Data de Fechamento<input type="date" name="data_fechamento" value="{{ fechamento.data_fechamento }}" required></label>
+  <label>Data de Liquidação<input type="date" name="data_liquidacao" value="{{ fechamento.data_liquidacao }}" required></label>
+  <label>Taxa<input name="taxa_cambio" data-rate inputmode="decimal" step="0.0001" value="{{ fechamento.taxa_cambio|rate if fechamento.taxa_cambio is not none else '' }}" required></label>
+  <label>Banco de Liquidação<select name="banco_liquidacao_id" required>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if banco.id == fechamento.banco_liquidacao_id }}>{{ banco.nome }}</option>{% endfor %}</select></label>
+  {% if not fechamento.contrato_id %}<label>Número novo de Contrato (opcional)<input name="numero_novo_contrato" maxlength="120" placeholder="Deixe vazio para manter pendente"></label>{% else %}<p class="muted">Contrato vinculado: {{ fechamento.numero_contrato }}. Os dados bancários e as datas serão sincronizados.</p>{% endif %}
+  <div class="form-actions"><button type="submit">Salvar alterações</button></div>
+</form>
+<form method="post" action="{{ url_for('excluir_fechamento_invoice', fechamento_id=fechamento.id) }}" data-confirm-delete="Excluir este Fechamento?" class="central-closing-delete-form"><button class="batch-delete" type="submit">Excluir grupo</button></form>
+{% endblock %}

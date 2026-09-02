@@ -7,7 +7,7 @@ import secrets
 import tempfile
 from html import escape as html_escape
 from pathlib import Path
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 import io
 import time
@@ -25,7 +25,7 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 6
+INVOICE_SCHEMA_VERSION = 10
 
 SALDO_TOLERANCE = Decimal("0.005")
 STATUS_PENDENTE = "PENDENTE"
@@ -36,13 +36,19 @@ INVOICE_STATUS_AGUARDANDO_RECEBIMENTO = "AGUARDANDO_RECEBIMENTO"
 # possuía uma opção PARCIAL separada.
 INVOICE_STATUS_PARCIAL = INVOICE_STATUS_AGUARDANDO_RECEBIMENTO
 INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO = "RECEBIDA_AGUARDANDO_CAMBIO"
+INVOICE_STATUS_AGUARDANDO_CONTRATO = "AGUARDANDO_CONTRATO"
 INVOICE_STATUS_LIQUIDADA = "LIQUIDADA"
 INVOICE_STATUS_LABELS = {
     INVOICE_STATUS_AGUARDANDO_RECEBIMENTO: "AGUARDANDO RECEBIMENTO",
     INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO: "RECEBIDO AGUARDANDO CAMBIO",
+    INVOICE_STATUS_AGUARDANDO_CONTRATO: "AGUARDANDO CONTRATO",
     INVOICE_STATUS_LIQUIDADA: "LIQUIDADA",
 }
 INVOICE_STATUS_OPTIONS = tuple(INVOICE_STATUS_LABELS.values())
+INVOICE_STATUS_RECEBIDOS = frozenset({
+    INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
+    INVOICE_STATUS_AGUARDANDO_CONTRATO,
+})
 
 def normalize_invoice_status(value, default=None):
     """Normaliza o status da Invoice e aceita valores das versões anteriores."""
@@ -57,6 +63,7 @@ def normalize_invoice_status(value, default=None):
         "RECEBIDO": INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
         "RECEBIDO_AGUARDANDO_CAMBIO": INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
         "RECEBIDA_AGUARDANDO_CAMBIO": INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
+        "AGUARDANDO_CONTRATO": INVOICE_STATUS_AGUARDANDO_CONTRATO,
         "LIQUIDADA": INVOICE_STATUS_LIQUIDADA,
     }
     normalized = aliases.get(key)
@@ -163,6 +170,83 @@ def db():
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
     return conn
+
+
+def migrate_invoice_status_constraint(conn):
+    """Rebuilds the Invoice table when its status CHECK predates new states."""
+    table = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='invoices'"
+    ).fetchone()
+    if not table or INVOICE_STATUS_AGUARDANDO_CONTRATO in (table[0] or ""):
+        return False
+
+    index_sql = [row[0] for row in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='invoices' AND sql IS NOT NULL"
+    ).fetchall()]
+    # SQLite cannot alter a CHECK constraint in place. The table is rebuilt
+    # with the same columns and foreign keys while all dependent rows remain
+    # untouched. Existing indexes are recreated after the rename.
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("DROP TABLE IF EXISTS invoices_status_migration")
+        conn.execute("""
+            CREATE TABLE invoices_status_migration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                empresa_id INTEGER NOT NULL,
+                numero_invoice TEXT NOT NULL,
+                tipo_documento TEXT NOT NULL CHECK(tipo_documento IN
+                    ('PROFORMA','COMMERCIAL_INVOICE','SERVICE_INVOICE','DEBIT_NOTE')),
+                competencia_id INTEGER,
+                cliente_id INTEGER,
+                banco_referenciado_id INTEGER,
+                data_emissao TEXT,
+                data_credito TEXT,
+                moeda TEXT NOT NULL DEFAULT 'USD',
+                valor_moeda REAL NOT NULL DEFAULT 0 CHECK(valor_moeda >= 0),
+                status TEXT NOT NULL DEFAULT 'AGUARDANDO_RECEBIMENTO' CHECK(status IN
+                    ('AGUARDANDO_RECEBIMENTO','RECEBIDA_AGUARDANDO_CAMBIO',
+                     'AGUARDANDO_CONTRATO','LIQUIDADA')),
+                status_manual INTEGER NOT NULL DEFAULT 0,
+                desdobramento_habilitado INTEGER NOT NULL DEFAULT 0,
+                observacao TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                contrato_comercial TEXT,
+                FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE RESTRICT,
+                FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE SET NULL,
+                FOREIGN KEY (banco_referenciado_id) REFERENCES contrapartes(id) ON DELETE SET NULL,
+                UNIQUE(empresa_id, numero_invoice, tipo_documento)
+            )
+        """)
+        old_columns = {row[1] for row in conn.execute("PRAGMA table_info(invoices)")}
+        desdobramento_column = (
+            "desdobramento_habilitado" if "desdobramento_habilitado" in old_columns
+            else "0 AS desdobramento_habilitado"
+        )
+        columns = (
+            "id,empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,"
+            "banco_referenciado_id,data_emissao,data_credito,moeda,valor_moeda,status,"
+            "status_manual,desdobramento_habilitado,observacao,created_at,contrato_comercial"
+        )
+        conn.execute(
+            f"INSERT INTO invoices_status_migration ({columns}) "
+            "SELECT id,empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,"
+            "banco_referenciado_id,data_emissao,data_credito,moeda,valor_moeda,status,"
+            f"status_manual,{desdobramento_column},observacao,COALESCE(created_at,CURRENT_TIMESTAMP),contrato_comercial "
+            "FROM invoices"
+        )
+        conn.execute("DROP TABLE invoices")
+        conn.execute("ALTER TABLE invoices_status_migration RENAME TO invoices")
+        for sql in index_sql:
+            conn.execute(sql)
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON")
+        return True
+    except Exception:
+        conn.rollback()
+        conn.execute("PRAGMA foreign_keys = ON")
+        raise
+
 
 def init_db():
     conn = db()
@@ -363,6 +447,24 @@ def init_db():
                 )
             """)
         conn.executescript("""
+            CREATE TABLE IF NOT EXISTS fechamentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cliente_id INTEGER NOT NULL,
+                banco_credito_id INTEGER NOT NULL,
+                moeda TEXT NOT NULL,
+                data_fechamento TEXT NOT NULL,
+                data_liquidacao TEXT NOT NULL,
+                banco_liquidacao_id INTEGER NOT NULL,
+                taxa_cambio REAL,
+                valor_brl REAL,
+                contrato_id INTEGER UNIQUE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT,
+                FOREIGN KEY (banco_credito_id) REFERENCES contrapartes(id) ON DELETE RESTRICT,
+                FOREIGN KEY (banco_liquidacao_id) REFERENCES contrapartes(id) ON DELETE RESTRICT,
+                FOREIGN KEY (contrato_id) REFERENCES contratos(id) ON DELETE RESTRICT
+            );
+
             CREATE TABLE IF NOT EXISTS invoices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 empresa_id INTEGER NOT NULL,
@@ -377,8 +479,10 @@ def init_db():
                 moeda TEXT NOT NULL DEFAULT 'USD',
                 valor_moeda REAL NOT NULL DEFAULT 0 CHECK(valor_moeda >= 0),
                 status TEXT NOT NULL DEFAULT 'AGUARDANDO_RECEBIMENTO' CHECK(status IN
-                    ('AGUARDANDO_RECEBIMENTO','RECEBIDA_AGUARDANDO_CAMBIO','LIQUIDADA')),
+                    ('AGUARDANDO_RECEBIMENTO','RECEBIDA_AGUARDANDO_CAMBIO',
+                     'AGUARDANDO_CONTRATO','LIQUIDADA')),
                 status_manual INTEGER NOT NULL DEFAULT 0,
+                desdobramento_habilitado INTEGER NOT NULL DEFAULT 0,
                 observacao TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE RESTRICT,
@@ -401,6 +505,31 @@ def init_db():
                 FOREIGN KEY (banco_credito_id) REFERENCES contrapartes(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS invoice_desdobramentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id INTEGER NOT NULL UNIQUE,
+                invoice_raiz_id INTEGER NOT NULL,
+                invoice_anterior_id INTEGER,
+                numero_base TEXT NOT NULL,
+                numero_parcela INTEGER NOT NULL CHECK(numero_parcela > 0),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
+                FOREIGN KEY (invoice_raiz_id) REFERENCES invoices(id) ON DELETE CASCADE,
+                FOREIGN KEY (invoice_anterior_id) REFERENCES invoices(id) ON DELETE SET NULL,
+                UNIQUE(invoice_raiz_id, numero_parcela)
+            );
+
+            CREATE TABLE IF NOT EXISTS invoice_recebimento_alocacoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id INTEGER NOT NULL,
+                recebimento_id INTEGER NOT NULL,
+                valor_moeda REAL NOT NULL CHECK(valor_moeda > 0),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
+                FOREIGN KEY (recebimento_id) REFERENCES recebimentos_invoice(id) ON DELETE CASCADE,
+                UNIQUE(invoice_id, recebimento_id)
+            );
+
             CREATE TABLE IF NOT EXISTS invoice_contrato_cambio (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 invoice_id INTEGER NOT NULL,
@@ -421,9 +550,11 @@ def init_db():
                 valor_moeda REAL NOT NULL CHECK(valor_moeda > 0),
                 data_fechamento TEXT NOT NULL,
                 observacao TEXT,
+                fechamento_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
-                FOREIGN KEY (contrato_id) REFERENCES contratos(id) ON DELETE SET NULL
+                FOREIGN KEY (contrato_id) REFERENCES contratos(id) ON DELETE SET NULL,
+                FOREIGN KEY (fechamento_id) REFERENCES fechamentos(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS due_invoice (
@@ -443,6 +574,10 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_invoices_emissao ON invoices(data_emissao);
             CREATE INDEX IF NOT EXISTS idx_recebimentos_invoice ON recebimentos_invoice(invoice_id);
             CREATE INDEX IF NOT EXISTS idx_recebimentos_banco ON recebimentos_invoice(banco_credito_id);
+            CREATE INDEX IF NOT EXISTS idx_invoice_desdobramentos_raiz ON invoice_desdobramentos(invoice_raiz_id);
+            CREATE INDEX IF NOT EXISTS idx_invoice_desdobramentos_anterior ON invoice_desdobramentos(invoice_anterior_id);
+            CREATE INDEX IF NOT EXISTS idx_invoice_recebimento_alocacoes_invoice ON invoice_recebimento_alocacoes(invoice_id);
+            CREATE INDEX IF NOT EXISTS idx_invoice_recebimento_alocacoes_recebimento ON invoice_recebimento_alocacoes(recebimento_id);
             CREATE INDEX IF NOT EXISTS idx_invoice_contrato_invoice ON invoice_contrato_cambio(invoice_id);
             CREATE INDEX IF NOT EXISTS idx_invoice_contrato_contrato ON invoice_contrato_cambio(contrato_id);
             CREATE INDEX IF NOT EXISTS idx_fechamentos_cambio_invoice ON fechamentos_cambio(invoice_id);
@@ -451,7 +586,26 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_due_invoice_due ON due_invoice(due_id);
             CREATE INDEX IF NOT EXISTS idx_due_invoice_invoice ON due_invoice(invoice_id);
             CREATE INDEX IF NOT EXISTS idx_contratos_fechamento ON contratos(data_fechamento);
+            CREATE INDEX IF NOT EXISTS idx_fechamentos_cliente ON fechamentos(cliente_id);
+            CREATE INDEX IF NOT EXISTS idx_fechamentos_banco_credito ON fechamentos(banco_credito_id);
+            CREATE INDEX IF NOT EXISTS idx_fechamentos_contrato ON fechamentos(contrato_id);
+            CREATE INDEX IF NOT EXISTS idx_fechamentos_data ON fechamentos(data_fechamento);
         """)
+        fechamento_columns = {row[1] for row in conn.execute("PRAGMA table_info(fechamentos_cambio)")}
+        if "fechamento_id" not in fechamento_columns:
+            conn.execute(
+                "ALTER TABLE fechamentos_cambio ADD COLUMN fechamento_id INTEGER "
+                "REFERENCES fechamentos(id) ON DELETE CASCADE"
+            )
+        header_columns = {row[1] for row in conn.execute("PRAGMA table_info(fechamentos)")}
+        if "taxa_cambio" not in header_columns:
+            conn.execute("ALTER TABLE fechamentos ADD COLUMN taxa_cambio REAL")
+        if "valor_brl" not in header_columns:
+            conn.execute("ALTER TABLE fechamentos ADD COLUMN valor_brl REAL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fechamentos_cambio_fechamento ON fechamentos_cambio(fechamento_id)")
+        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_fechamentos_cambio_grupo_invoice
+                       ON fechamentos_cambio(fechamento_id, invoice_id)
+                       WHERE fechamento_id IS NOT NULL""")
         if schema_version < INVOICE_SCHEMA_VERSION:
             invoice_columns = {row[1] for row in conn.execute("PRAGMA table_info(invoices)")}
             if "contrato_comercial" not in invoice_columns:
@@ -472,6 +626,16 @@ def init_db():
         if "banco_referenciado_id" not in invoice_columns:
             conn.execute("ALTER TABLE invoices ADD COLUMN banco_referenciado_id INTEGER REFERENCES contrapartes(id) ON DELETE SET NULL")
             invoice_columns.add("banco_referenciado_id")
+        if "desdobramento_habilitado" not in invoice_columns:
+            conn.execute("ALTER TABLE invoices ADD COLUMN desdobramento_habilitado INTEGER NOT NULL DEFAULT 0")
+            invoice_columns.add("desdobramento_habilitado")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_contrato_comercial ON invoices(contrato_comercial)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_competencia ON invoices(competencia_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_banco_referenciado ON invoices(banco_referenciado_id)")
+        status_schema_migrated = migrate_invoice_status_constraint(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_empresa ON invoices(empresa_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_emissao ON invoices(data_emissao)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_contrato_comercial ON invoices(contrato_comercial)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_competencia ON invoices(competencia_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_banco_referenciado ON invoices(banco_referenciado_id)")
@@ -490,12 +654,27 @@ def init_db():
                 normalized_status = INVOICE_STATUS_AGUARDANDO_RECEBIMENTO
             if normalized_status != invoice["status"]:
                 conn.execute("UPDATE invoices SET status=? WHERE id=?", (normalized_status, invoice["id"]))
+        if schema_version < INVOICE_SCHEMA_VERSION or status_schema_migrated:
+            conn.execute("""
+                UPDATE invoices
+                SET status=?, status_manual=0
+                WHERE status=?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM fechamentos_cambio f
+                      LEFT JOIN fechamentos h ON h.id=f.fechamento_id
+                      WHERE f.invoice_id=invoices.id
+                        AND COALESCE(h.contrato_id, f.contrato_id) IS NULL
+                  )
+            """, (INVOICE_STATUS_AGUARDANDO_CONTRATO,
+                  INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO))
         conn.execute("""
             UPDATE invoices
             SET data_credito=(SELECT MIN(r.data_credito)
                               FROM recebimentos_invoice r WHERE r.invoice_id=invoices.id)
-            WHERE data_credito IS NULL AND status IN (?, ?)
-        """, (INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, INVOICE_STATUS_LIQUIDADA))
+            WHERE data_credito IS NULL AND status IN (?, ?, ?)
+        """, (INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
+               INVOICE_STATUS_AGUARDANDO_CONTRATO, INVOICE_STATUS_LIQUIDADA))
         conn.execute("""
             UPDATE invoices
             SET banco_referenciado_id=(
@@ -602,7 +781,10 @@ def percent(v):
 @app.template_filter("rate")
 def rate(v):
     try:
-        return f"{float(v):,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        text = str(v).strip().replace(" ", "")
+        if "," in text:
+            text = text.replace(".", "").replace(",", ".")
+        return f"{float(Decimal(text)):,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "0,0000"
 
@@ -699,11 +881,35 @@ def parse_number(value):
     except (InvalidOperation, ValueError):
         raise ValueError("Valor inválido. Use o formato 1.234,56.")
 
-def selected_record_ids(form):
-    """Validate and deduplicate IDs sent by a batch deletion form."""
+
+def parse_exchange_rate(value):
+    """Converte e valida a taxa sem fazer os cálculos monetários em float."""
+    if value is None or str(value).strip() == "":
+        raise ValueError("A Taxa é obrigatória no Fechamento.")
+    text = str(value).strip().replace(" ", "")
+    if "," in text:
+        text = text.replace(".", "").replace(",", ".")
+    try:
+        rate = Decimal(text)
+    except (InvalidOperation, ValueError):
+        raise ValueError("A Taxa é inválida. Informe um número com até 4 casas decimais.")
+    if not rate.is_finite() or rate <= 0:
+        raise ValueError("A Taxa deve ser maior que zero.")
+    if rate.as_tuple().exponent < -4:
+        raise ValueError("A Taxa deve ter no máximo 4 casas decimais.")
+    return rate.quantize(Decimal("0.0001"))
+
+
+def closing_brl_value(valor_moeda, taxa_cambio):
+    """Calcula o BRL com Decimal e arredonda apenas na precisão monetária final."""
+    value = decimal_value(valor_moeda) * decimal_value(taxa_cambio)
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+def selected_record_ids(form, operation="excluir"):
+    """Validate and deduplicate IDs sent by a batch form."""
     raw_ids = form.getlist("selected_ids")
     if not raw_ids:
-        raise ValueError("Selecione pelo menos um registro para excluir.")
+        raise ValueError(f"Selecione pelo menos um registro para {operation}.")
     ids = []
     for raw_id in raw_ids:
         value = str(raw_id or "").strip()
@@ -725,11 +931,13 @@ def ensure_existing_record_ids(conn, table, ids, label):
     if len(found) != len(ids):
         raise ValueError(f"Um ou mais {label} selecionados não foram encontrados.")
 
-def redirect_batch_result(endpoint):
+def redirect_batch_result(endpoint, excluded_keys=None):
     """Preserve filters, ordering and pagination sent as hidden form fields."""
+    excluded = {"selected_ids"}
+    excluded.update(excluded_keys or ())
     args = {
         key: value for key, value in request.form.items()
-        if key != "selected_ids" and value not in (None, "")
+        if key not in excluded and value not in (None, "")
     }
     return redirect(url_for(endpoint, **args))
 
@@ -1352,9 +1560,13 @@ def cliente_vinculos(conn, cliente_id):
         LEFT JOIN invoices i ON i.id=v.invoice_id
         LEFT JOIN fechamentos_cambio f ON f.contrato_id=c.id
         LEFT JOIN invoices fi ON fi.id=f.invoice_id
+        LEFT JOIN fechamentos h ON h.contrato_id=c.id
+        LEFT JOIN fechamentos_cambio hf ON hf.fechamento_id=h.id
+        LEFT JOIN invoices hi ON hi.id=hf.invoice_id
         WHERE c.cliente_id=? OR i.cliente_id=? OR fi.cliente_id=?
+           OR h.cliente_id=? OR hi.cliente_id=?
         ORDER BY c.numero_contrato, c.id
-    """, (cliente_id, cliente_id, cliente_id)).fetchall()
+    """, (cliente_id, cliente_id, cliente_id, cliente_id, cliente_id)).fetchall()
     ndfs = conn.execute("""
         SELECT id, numero_operacao
         FROM ndfs
@@ -1573,12 +1785,19 @@ def contract_total_sql(alias="c"):
         CASE WHEN EXISTS (
             SELECT 1 FROM invoice_contrato_cambio v WHERE v.contrato_id={alias}.id
             UNION ALL
-            SELECT 1 FROM fechamentos_cambio f WHERE f.contrato_id={alias}.id
+            SELECT 1 FROM fechamentos_cambio f
+            WHERE f.contrato_id={alias}.id AND f.fechamento_id IS NULL
+            UNION ALL
+            SELECT 1 FROM fechamentos f WHERE f.contrato_id={alias}.id
         ) THEN
             COALESCE((SELECT SUM(v.valor_alocado) FROM invoice_contrato_cambio v
                       WHERE v.contrato_id={alias}.id), 0)
             + COALESCE((SELECT SUM(f.valor_moeda) FROM fechamentos_cambio f
-                        WHERE f.contrato_id={alias}.id), 0)
+                        WHERE f.contrato_id={alias}.id AND f.fechamento_id IS NULL), 0)
+            + COALESCE((SELECT SUM(i.valor_moeda)
+                        FROM fechamentos_cambio i
+                        JOIN fechamentos h ON h.id=i.fechamento_id
+                        WHERE h.contrato_id={alias}.id), 0)
         ELSE {alias}.valor_moeda END
     """
 
@@ -2003,7 +2222,12 @@ def excluir_contratos_lote():
             FROM fechamentos_cambio
             WHERE contrato_id IN ({placeholders})
         """, contrato_ids).fetchone()[0]
-        if invoice_links or fechamento_links:
+        central_links = conn.execute(f"""
+            SELECT COUNT(*)
+            FROM fechamentos
+            WHERE contrato_id IN ({placeholders})
+        """, contrato_ids).fetchone()[0]
+        if invoice_links or fechamento_links or central_links:
             raise ValueError("Contratos Câmbio derivados de Invoices devem ser excluídos pelos vínculos da própria Invoice.")
         due_rows = conn.execute(f"""
             SELECT DISTINCT due_id
@@ -3119,6 +3343,88 @@ def importar_ptax():
 def configuracoes():
     return render_template("configuracoes.html")
 
+@app.route("/configuracoes/padroes", methods=["GET", "POST"])
+def configuracoes_padroes():
+    conn = db()
+    selected_empresa_id = (
+        form_record_id(request.form.get("empresa_id"))
+        if request.method == "POST"
+        else form_record_id(request.args.get("empresa_id"))
+    )
+    form_values = None
+    if request.method == "POST":
+        form_values = {
+            "empresa_id": request.form.get("empresa_id", ""),
+            "banco_credito_id": request.form.get("banco_credito_id", ""),
+            "banco_referenciado_id": request.form.get("banco_referenciado_id", ""),
+            "banco_liquidacao_id": request.form.get("banco_liquidacao_id", ""),
+        }
+        try:
+            data = configuracoes_padrao_form_data(request.form, conn)
+            if all(data[field] is None for field in (
+                "banco_credito_id", "banco_referenciado_id", "banco_liquidacao_id"
+            )):
+                conn.execute(
+                    "DELETE FROM configuracoes_padrao WHERE empresa_id=?",
+                    (data["empresa_id"],),
+                )
+            else:
+                conn.execute("""
+                    INSERT INTO configuracoes_padrao
+                        (empresa_id,banco_credito_id,banco_referenciado_id,banco_liquidacao_id,updated_at)
+                    VALUES (?,?,?,?,CURRENT_TIMESTAMP)
+                    ON CONFLICT(empresa_id) DO UPDATE SET
+                        banco_credito_id=excluded.banco_credito_id,
+                        banco_referenciado_id=excluded.banco_referenciado_id,
+                        banco_liquidacao_id=excluded.banco_liquidacao_id,
+                        updated_at=CURRENT_TIMESTAMP
+                """, (
+                    data["empresa_id"], data["banco_credito_id"],
+                    data["banco_referenciado_id"], data["banco_liquidacao_id"],
+                ))
+            conn.commit()
+            conn.close()
+            flash("Configurações padrão salvas com sucesso.", "success")
+            return redirect(url_for("configuracoes_padroes", empresa_id=data["empresa_id"]))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Não foi possível salvar as configurações padrão.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+
+    empresas = conn.execute(
+        "SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY "
+        + empresa_order_sql()
+    ).fetchall()
+    contrapartes = contrapartes_for_form(conn)
+    padroes = configuracoes_padrao_for_empresa(conn, selected_empresa_id)
+    if form_values is None:
+        form_values = {
+            "empresa_id": str(selected_empresa_id) if selected_empresa_id else "",
+            "banco_credito_id": str(padroes["banco_credito_id"]) if padroes and padroes["banco_credito_id"] else "",
+            "banco_referenciado_id": str(padroes["banco_referenciado_id"]) if padroes and padroes["banco_referenciado_id"] else "",
+            "banco_liquidacao_id": str(padroes["banco_liquidacao_id"]) if padroes and padroes["banco_liquidacao_id"] else "",
+        }
+    configuracoes = conn.execute("""
+        SELECT e.id AS empresa_id, e.razao_social, e.apelido,
+               cp.nome AS banco_credito_nome,
+               br.nome AS banco_referenciado_nome,
+               bl.nome AS banco_liquidacao_nome
+        FROM empresas e
+        LEFT JOIN configuracoes_padrao p ON p.empresa_id=e.id
+        LEFT JOIN contrapartes cp ON cp.id=p.banco_credito_id
+        LEFT JOIN contrapartes br ON br.id=p.banco_referenciado_id
+        LEFT JOIN contrapartes bl ON bl.id=p.banco_liquidacao_id
+        ORDER BY """ + empresa_order_sql("e")
+    ).fetchall()
+    conn.close()
+    return render_template(
+        "configuracoes_padroes.html", empresas=empresas,
+        contrapartes=contrapartes, form_values=form_values,
+        configuracoes=configuracoes,
+    )
+
 @app.route("/configuracoes/empresas", methods=["GET", "POST"])
 def cadastro_empresas():
     conn = db()
@@ -3503,15 +3809,21 @@ def carregar_detalhe_contrato(conn, contrato_id):
         WHERE v.contrato_id=? ORDER BY """ + empresa_order_sql("e") + """, v.id DESC
     """, (contrato_id,)).fetchall()
     fechamentos = conn.execute("""
-        SELECT f.*, i.numero_invoice, i.tipo_documento, i.data_emissao,
+        SELECT f.*, h.id AS fechamento_grupo_id,
+               h.data_fechamento AS fechamento_data_fechamento,
+               h.data_liquidacao AS fechamento_data_liquidacao,
+               i.numero_invoice, i.tipo_documento, i.data_emissao,
                e.apelido AS empresa_apelido, e.razao_social AS empresa_razao_social,
                cl.nome AS cliente_nome
         FROM fechamentos_cambio f
+        LEFT JOIN fechamentos h ON h.id=f.fechamento_id
         JOIN invoices i ON i.id=f.invoice_id
         JOIN empresas e ON e.id=i.empresa_id
         LEFT JOIN clientes cl ON cl.id=i.cliente_id
-        WHERE f.contrato_id=? ORDER BY f.data_fechamento DESC, f.id DESC
-    """, (contrato_id,)).fetchall()
+        WHERE (f.fechamento_id IS NULL AND f.contrato_id=?)
+           OR h.contrato_id=?
+        ORDER BY f.data_fechamento DESC, f.id DESC
+    """, (contrato_id, contrato_id)).fetchall()
     fechamentos_pendentes = conn.execute("""
         SELECT f.*, i.numero_invoice, i.tipo_documento, i.data_emissao,
                e.apelido AS empresa_apelido, e.razao_social AS empresa_razao_social,
@@ -3520,7 +3832,7 @@ def carregar_detalhe_contrato(conn, contrato_id):
         JOIN invoices i ON i.id=f.invoice_id
         JOIN empresas e ON e.id=i.empresa_id
         LEFT JOIN clientes cl ON cl.id=i.cliente_id
-        WHERE f.contrato_id IS NULL AND f.moeda=?
+        WHERE f.fechamento_id IS NULL AND f.contrato_id IS NULL AND f.moeda=?
         ORDER BY f.data_fechamento, f.id
     """, (contrato["moeda"],)).fetchall()
     summary = contract_summary(conn, contrato_id)
@@ -4683,6 +4995,7 @@ def invoice_status_class(status):
     return {
         INVOICE_STATUS_AGUARDANDO_RECEBIMENTO: "status-invoice-awaiting",
         INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO: "status-invoice-exchange",
+        INVOICE_STATUS_AGUARDANDO_CONTRATO: "status-pendente",
         INVOICE_STATUS_LIQUIDADA: "status-invoice-settled",
     }.get(status, "status-pendente")
 
@@ -4690,14 +5003,98 @@ app.jinja_env.filters["invoice_status_class"] = invoice_status_class
 app.jinja_env.filters["invoice_status_label"] = lambda value: INVOICE_STATUS_LABELS.get(value, value or "-")
 app.jinja_env.globals["today_iso"] = lambda: date.today().isoformat()
 
-def invoice_status_from_totals(valor_invoice, total_recebido, total_cambio):
+
+def invoice_receipt_rows(conn, invoice_id):
+    """Retorna os recebimentos efetivos de uma parcela sem duplicar o registro financeiro.
+
+    Registros antigos continuam sendo lidos pela FK original. Quando existe uma
+    alocação de desdobramento, ela substitui a leitura direta e permite que o
+    mesmo recebimento seja apresentado em mais de uma parcela com valores
+    distintos.
+    """
+    return conn.execute("""
+        SELECT r.id, r.invoice_id AS recebimento_invoice_id,
+               r.banco_credito_id, r.data_credito, r.moeda,
+               r.valor_moeda AS valor_recebimento,
+               COALESCE(a.valor_moeda, r.valor_moeda) AS valor_moeda,
+               r.documento, r.observacao, r.created_at,
+               cp.nome AS banco_credito_nome,
+               CASE WHEN a.id IS NULL THEN 0 ELSE 1 END AS recebimento_compartilhado
+        FROM recebimentos_invoice r
+        LEFT JOIN invoice_recebimento_alocacoes a
+          ON a.recebimento_id=r.id AND a.invoice_id=?
+        LEFT JOIN contrapartes cp ON cp.id=r.banco_credito_id
+        WHERE a.id IS NOT NULL
+           OR (r.invoice_id=? AND NOT EXISTS (
+                SELECT 1 FROM invoice_recebimento_alocacoes ax
+                WHERE ax.recebimento_id=r.id
+           ))
+        ORDER BY r.data_credito DESC, r.id DESC
+    """, (invoice_id, invoice_id)).fetchall()
+
+
+def invoice_receipt_total(conn, invoice_id):
+    return sum(
+        (decimal_value(row["valor_moeda"]) for row in invoice_receipt_rows(conn, invoice_id)),
+        Decimal("0"),
+    )
+
+
+def receipt_is_shared(conn, receipt_id):
+    return bool(conn.execute(
+        "SELECT 1 FROM invoice_recebimento_alocacoes WHERE recebimento_id=? LIMIT 1",
+        (receipt_id,),
+    ).fetchone())
+
+
+def invoice_lineage(conn, invoice_id):
+    row = conn.execute("""
+        SELECT d.*, root.numero_invoice AS numero_invoice_raiz,
+               previous.numero_invoice AS numero_invoice_anterior
+        FROM invoice_desdobramentos d
+        JOIN invoices root ON root.id=d.invoice_raiz_id
+        LEFT JOIN invoices previous ON previous.id=d.invoice_anterior_id
+        WHERE d.invoice_id=?
+    """, (invoice_id,)).fetchone()
+    if not row:
+        return {
+            "invoice_id": invoice_id,
+            "invoice_raiz_id": None,
+            "invoice_anterior_id": None,
+            "numero_base": None,
+            "numero_parcela": None,
+            "numero_invoice_raiz": None,
+            "numero_invoice_anterior": None,
+            "proxima_parcela": None,
+            "parcelas": [],
+        }
+    parcelas = conn.execute("""
+        SELECT d.invoice_id, d.numero_parcela, d.numero_base,
+               i.numero_invoice, i.valor_moeda, i.status
+        FROM invoice_desdobramentos d
+        JOIN invoices i ON i.id=d.invoice_id
+        WHERE d.invoice_raiz_id=?
+        ORDER BY d.numero_parcela
+    """, (row["invoice_raiz_id"],)).fetchall()
+    return {
+        **dict(row),
+        "proxima_parcela": max(item["numero_parcela"] for item in parcelas) + 1,
+        "numero_invoice_raiz": row["numero_base"] or row["numero_invoice_raiz"],
+        "parcelas": parcelas,
+    }
+
+def invoice_status_from_totals(valor_invoice, total_recebido, total_cambio,
+                               total_fechamentos_pendentes=0):
     valor_invoice = decimal_value(valor_invoice)
     total_recebido = decimal_value(total_recebido)
     total_cambio = decimal_value(total_cambio)
+    total_fechamentos_pendentes = decimal_value(total_fechamentos_pendentes)
     saldo_recebimento = normalize_balance(valor_invoice - total_recebido)
     saldo_cambio = normalize_balance(total_recebido - total_cambio)
     if saldo_recebimento > SALDO_TOLERANCE:
         return INVOICE_STATUS_AGUARDANDO_RECEBIMENTO
+    if total_fechamentos_pendentes > SALDO_TOLERANCE:
+        return INVOICE_STATUS_AGUARDANDO_CONTRATO
     if saldo_cambio > SALDO_TOLERANCE:
         return INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO
     return INVOICE_STATUS_LIQUIDADA
@@ -4719,12 +5116,8 @@ def invoice_summary(conn, invoice_id):
     """, (invoice_id,)).fetchone()
     if not invoice:
         return None
-    recebimentos = conn.execute("""
-        SELECT r.*, cp.nome AS banco_credito_nome
-        FROM recebimentos_invoice r
-        LEFT JOIN contrapartes cp ON cp.id=r.banco_credito_id
-        WHERE r.invoice_id=? ORDER BY r.data_credito DESC, r.id DESC
-    """, (invoice_id,)).fetchall()
+    lineage = invoice_lineage(conn, invoice_id)
+    recebimentos = invoice_receipt_rows(conn, invoice_id)
     cambios = conn.execute("""
         SELECT v.*, c.numero_contrato, c.moeda AS contrato_moeda,
                c.banco_liquidacao, c.data_fechamento, c.data_liquidacao,
@@ -4734,11 +5127,24 @@ def invoice_summary(conn, invoice_id):
         WHERE v.invoice_id=? ORDER BY v.id DESC
     """, (invoice_id,)).fetchall()
     fechamentos = conn.execute("""
-        SELECT f.*, c.numero_contrato, c.moeda AS contrato_moeda,
+        SELECT f.*, h.id AS fechamento_id, h.cliente_id AS fechamento_cliente_id,
+               h.banco_credito_id AS fechamento_banco_credito_id,
+               h.data_fechamento AS fechamento_data_fechamento,
+               h.data_liquidacao AS fechamento_data_liquidacao,
+               h.banco_liquidacao_id AS fechamento_banco_liquidacao_id,
+               h.taxa_cambio AS fechamento_taxa_cambio,
+               h.valor_brl AS fechamento_valor_brl,
+               bank_credito.nome AS fechamento_banco_credito_nome,
+               bank_liquidacao.nome AS fechamento_banco_liquidacao_nome,
+               COALESCE(h.contrato_id, f.contrato_id) AS contrato_id_efetivo,
+               c.numero_contrato, c.moeda AS contrato_moeda,
                c.banco_liquidacao, c.data_liquidacao, c.taxa_cambio,
                c.valor_reais AS contrato_valor_reais
         FROM fechamentos_cambio f
-        LEFT JOIN contratos c ON c.id=f.contrato_id
+        LEFT JOIN fechamentos h ON h.id=f.fechamento_id
+        LEFT JOIN contrapartes bank_credito ON bank_credito.id=h.banco_credito_id
+        LEFT JOIN contrapartes bank_liquidacao ON bank_liquidacao.id=h.banco_liquidacao_id
+        LEFT JOIN contratos c ON c.id=COALESCE(h.contrato_id, f.contrato_id)
         WHERE f.invoice_id=? ORDER BY f.data_fechamento DESC, f.id DESC
     """, (invoice_id,)).fetchall()
     due_links = conn.execute("""
@@ -4750,7 +5156,7 @@ def invoice_summary(conn, invoice_id):
     total_cambio_legado = sum((decimal_value(row["valor_alocado"]) for row in cambios), Decimal("0"))
     total_fechamentos = sum((decimal_value(row["valor_moeda"]) for row in fechamentos), Decimal("0"))
     total_fechamentos_vinculados = sum(
-        (decimal_value(row["valor_moeda"]) for row in fechamentos if row["contrato_id"]), Decimal("0")
+        (decimal_value(row["valor_moeda"]) for row in fechamentos if row["contrato_id_efetivo"]), Decimal("0")
     )
     total_fechamentos_pendentes = total_fechamentos - total_fechamentos_vinculados
     total_cambio = total_cambio_legado + total_fechamentos_vinculados
@@ -4765,7 +5171,7 @@ def invoice_summary(conn, invoice_id):
         for row in cambios
     ] + [
         (decimal_value(row["valor_moeda"]), row["taxa_cambio"])
-        for row in fechamentos if row["contrato_id"]
+        for row in fechamentos if row["contrato_id_efetivo"]
     ]
     taxa_volume = sum((valor for valor, taxa in taxa_rows if taxa is not None), Decimal("0"))
     taxa_valor = sum((valor * decimal_value(taxa) for valor, taxa in taxa_rows if taxa is not None), Decimal("0"))
@@ -4775,9 +5181,15 @@ def invoice_summary(conn, invoice_id):
     except ValueError:
         status = INVOICE_STATUS_AGUARDANDO_RECEBIMENTO
     if not invoice["status_manual"]:
-        status = invoice_status_from_totals(valor_invoice, total_recebido, total_cambio)
-    if total_fechamentos_pendentes > SALDO_TOLERANCE and total_recebido > SALDO_TOLERANCE:
-        status = INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO
+        status = invoice_status_from_totals(
+            valor_invoice, total_recebido, total_cambio, total_fechamentos_pendentes
+        )
+    elif (
+        status in INVOICE_STATUS_RECEBIDOS
+        and total_fechamentos_pendentes > SALDO_TOLERANCE
+        and total_recebido > SALDO_TOLERANCE
+    ):
+        status = INVOICE_STATUS_AGUARDANDO_CONTRATO
     datas_credito = {row["data_credito"] for row in recebimentos if row["data_credito"]}
     if invoice["data_credito"]:
         datas_credito.add(invoice["data_credito"])
@@ -4795,7 +5207,7 @@ def invoice_summary(conn, invoice_id):
         "saldo_fechamentos": saldo_fechamentos,
         "taxa_cambio_media": taxa_valor / taxa_volume if taxa_volume else None,
         "valor_brl": valor_brl_calculado if any(
-            row["taxa_cambio"] is not None for row in cambios + [row for row in fechamentos if row["contrato_id"]]
+            row["taxa_cambio"] is not None for row in cambios + [row for row in fechamentos if row["contrato_id_efetivo"]]
         ) else None,
         "status": status,
         "recebimentos": recebimentos,
@@ -4806,6 +5218,8 @@ def invoice_summary(conn, invoice_id):
         "bancos_liquidacao": sorted(
             {row["banco_liquidacao"] for row in cambios if row["banco_liquidacao"]}
             | {row["banco_liquidacao"] for row in fechamentos if row["banco_liquidacao"]}
+            | {row["fechamento_banco_liquidacao_nome"] for row in fechamentos
+               if row["fechamento_banco_liquidacao_nome"]}
         ),
         "contratos_numeros": sorted(
             {row["numero_contrato"] for row in cambios if row["numero_contrato"]}
@@ -4815,29 +5229,97 @@ def invoice_summary(conn, invoice_id):
         "datas_fechamento": sorted(
             {row["data_fechamento"] for row in cambios if row["data_fechamento"]}
             | {row["data_fechamento"] for row in fechamentos if row["data_fechamento"]}
+            | {row["fechamento_data_fechamento"] for row in fechamentos
+               if row["fechamento_data_fechamento"]}
         ),
         "datas_liquidacao": sorted(
             {row["data_liquidacao"] for row in cambios if row["data_liquidacao"]}
             | {row["data_liquidacao"] for row in fechamentos if row["data_liquidacao"]}
+            | {row["fechamento_data_liquidacao"] for row in fechamentos
+               if row["fechamento_data_liquidacao"]}
         ),
+        "fechamentos_ids": sorted({row["fechamento_id"] for row in fechamentos if row["fechamento_id"]}),
+        "linhagem": lineage,
+        "invoice_parcela": lineage.get("numero_parcela"),
+        "invoice_numero_base": lineage.get("numero_base"),
+        "invoice_raiz_id": lineage.get("invoice_raiz_id"),
+        "invoice_anterior_id": lineage.get("invoice_anterior_id"),
+        "invoice_parcelas": lineage.get("parcelas", []),
     })
     return data
 
-def refresh_invoice_status(conn, invoice_id):
+def refresh_invoice_status(conn, invoice_id, force=False):
     summary = invoice_summary(conn, invoice_id)
     if not summary:
         return None
     current = conn.execute("SELECT status, status_manual, data_credito FROM invoices WHERE id=?", (invoice_id,)).fetchone()
-    if current and not current["status_manual"]:
+    if current and (force or not current["status_manual"]):
+        status = summary["status"]
+        if force:
+            status = invoice_status_from_totals(
+                summary["valor_moeda"], summary["total_recebido"],
+                summary["total_cambio"], summary["total_fechamentos_pendentes"],
+            )
         data_credito = None
-        if summary["status"] in {INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, INVOICE_STATUS_LIQUIDADA}:
-            data_credito = conn.execute(
-                "SELECT MIN(data_credito) FROM recebimentos_invoice WHERE invoice_id=?", (invoice_id,)
-            ).fetchone()[0]
-        if current["status"] != summary["status"] or current["data_credito"] != data_credito:
-            conn.execute("UPDATE invoices SET status=?, data_credito=? WHERE id=?",
-                         (summary["status"], data_credito, invoice_id))
-    return summary["status"]
+        if status in INVOICE_STATUS_RECEBIDOS | {INVOICE_STATUS_LIQUIDADA}:
+            receipt_dates = [
+                row["data_credito"] for row in invoice_receipt_rows(conn, invoice_id)
+                if row["data_credito"]
+            ]
+            data_credito = min(receipt_dates) if receipt_dates else None
+        status_manual = 0 if force else current["status_manual"]
+        if (current["status"] != status or current["data_credito"] != data_credito
+                or current["status_manual"] != status_manual):
+            conn.execute("UPDATE invoices SET status=?, status_manual=?, data_credito=? WHERE id=?",
+                         (status, status_manual, data_credito, invoice_id))
+    return status if current and force else summary["status"]
+
+
+def refresh_invoice_status_after_closing(conn, invoice_id):
+    """Recalcula o status após o fechamento ser incluído na transação atual."""
+    current = conn.execute(
+        "SELECT status FROM invoices WHERE id=?", (invoice_id,)
+    ).fetchone()
+    if not current:
+        return None
+    try:
+        current_status = normalize_invoice_status(current["status"])
+    except ValueError:
+        current_status = None
+    force = current_status in INVOICE_STATUS_RECEBIDOS
+    return refresh_invoice_status(conn, invoice_id, force=force)
+
+
+def refresh_invoice_status_after_receipt(conn, invoice_id):
+    """Atualiza o status após um recebimento confirmado e com saldo quitado."""
+    status = refresh_invoice_status(conn, invoice_id)
+    if status != INVOICE_STATUS_AGUARDANDO_RECEBIMENTO:
+        return status
+
+    summary = invoice_summary(conn, invoice_id)
+    if (
+        not summary
+        or summary["total_recebido"] <= SALDO_TOLERANCE
+        or summary["saldo_recebimento"] > SALDO_TOLERANCE
+    ):
+        return status
+
+    current = conn.execute(
+        "SELECT status, data_credito FROM invoices WHERE id=?", (invoice_id,)
+    ).fetchone()
+    if not current or current["status"] != INVOICE_STATUS_AGUARDANDO_RECEBIMENTO:
+        return status
+
+    receipt_dates = [
+        row["data_credito"] for row in invoice_receipt_rows(conn, invoice_id)
+        if row["data_credito"]
+    ]
+    data_credito = min(receipt_dates) if receipt_dates else None
+    conn.execute(
+        "UPDATE invoices SET status=?, data_credito=? WHERE id=?",
+        (INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, data_credito, invoice_id),
+    )
+    return INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO
 
 
 def invoice_report_copy_text(rows, total, variant):
@@ -4912,8 +5394,12 @@ def build_invoice_report_context():
 
     def grouped_rows(status, value_key, include_bank=False):
         grouped = {}
+        accepted_statuses = (
+            INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
+            INVOICE_STATUS_AGUARDANDO_CONTRATO,
+        ) if status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO else (status,)
         for summary in summaries:
-            if summary["status"] != status:
+            if summary["status"] not in accepted_statuses:
                 continue
             cliente = summary.get("cliente_nome") or "Não informado"
             if include_bank:
@@ -4935,8 +5421,12 @@ def build_invoice_report_context():
 
     def hierarchical_rows(status, value_key):
         grouped = {}
+        accepted_statuses = (
+            INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
+            INVOICE_STATUS_AGUARDANDO_CONTRATO,
+        ) if status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO else (status,)
         for summary in summaries:
-            if summary["status"] != status:
+            if summary["status"] not in accepted_statuses:
                 continue
             banco = ", ".join(sorted(summary.get("bancos_credito") or [])) or "-"
             empresa = summary.get("empresa_apelido") or summary.get("empresa_razao_social") or "Não informado"
@@ -5059,6 +5549,156 @@ def validate_invoice_closing_total(summary, total_fechamentos):
         "O fechamento não pode ultrapassar o saldo disponível dos recebimentos da Invoice.",
     )
 
+def invoice_split_conflict(conn, invoice_id):
+    """Retorna o motivo que impede repartir uma Invoice com vinculos antigos."""
+    if conn.execute(
+        "SELECT 1 FROM invoice_contrato_cambio WHERE invoice_id=? LIMIT 1",
+        (invoice_id,),
+    ).fetchone():
+        return "alocacoes legadas de cambio"
+    if conn.execute(
+        "SELECT 1 FROM due_invoice WHERE invoice_id=? LIMIT 1",
+        (invoice_id,),
+    ).fetchone():
+        return "vinculos com DU-E"
+    return None
+
+
+def allocate_invoice_receipts_for_split(conn, source_id, child_id, source_amount):
+    """Reparticiona a posse contabil dos recebimentos entre duas parcelas."""
+    rows = list(invoice_receipt_rows(conn, source_id))
+    rows.sort(key=lambda row: (row["data_credito"] or "", row["id"]))
+    conn.execute(
+        "DELETE FROM invoice_recebimento_alocacoes WHERE invoice_id=?",
+        (source_id,),
+    )
+    remaining_for_source = decimal_value(source_amount)
+    for row in rows:
+        available = decimal_value(row["valor_moeda"])
+        source_value = min(available, max(remaining_for_source, Decimal("0")))
+        child_value = available - source_value
+        if source_value > SALDO_TOLERANCE:
+            conn.execute("""
+                INSERT INTO invoice_recebimento_alocacoes
+                    (invoice_id,recebimento_id,valor_moeda)
+                VALUES (?,?,?)
+            """, (source_id, row["id"], float(source_value)))
+        if child_value > SALDO_TOLERANCE:
+            conn.execute("""
+                INSERT INTO invoice_recebimento_alocacoes
+                    (invoice_id,recebimento_id,valor_moeda)
+                VALUES (?,?,?)
+            """, (child_id, row["id"], float(child_value)))
+        remaining_for_source -= source_value
+
+    if remaining_for_source > SALDO_TOLERANCE:
+        raise ValueError(
+            "Não foi possível repartir integralmente os recebimentos da Invoice."
+        )
+
+
+def split_invoice_for_closing(conn, summary, closing_amount):
+    """Cria a parcela remanescente de um fechamento parcial.
+
+    O chamador deve manter a transacao aberta. Nenhum recebimento fisico e
+    inserido, atualizado ou excluido nesta operacao.
+    """
+    closing_amount = decimal_value(closing_amount)
+    available = decimal_value(summary["saldo_fechamentos"])
+    if closing_amount >= available - SALDO_TOLERANCE:
+        return None
+    if not summary.get("desdobramento_habilitado"):
+        raise ValueError(
+            f"A Invoice {summary['numero_invoice']} é legada e não pode ser desdobrada."
+        )
+    if summary["saldo_recebimento"] > SALDO_TOLERANCE:
+        raise ValueError(
+            f"A Invoice {summary['numero_invoice']} precisa estar totalmente recebida para um fechamento parcial."
+        )
+    if summary["total_fechamentos"] > SALDO_TOLERANCE:
+        raise ValueError(
+            f"A Invoice {summary['numero_invoice']} já possui fechamento e não pode ser desdobrada novamente."
+        )
+    conflict = invoice_split_conflict(conn, summary["id"])
+    if conflict:
+        raise ValueError(
+            f"A Invoice {summary['numero_invoice']} possui {conflict} e não pode ser desdobrada."
+        )
+
+    lineage = summary["linhagem"]
+    if lineage.get("invoice_raiz_id"):
+        root_id = lineage["invoice_raiz_id"]
+        base_number = lineage["numero_base"]
+        current_part = lineage["numero_parcela"]
+        next_part = lineage["proxima_parcela"]
+    else:
+        root_id = summary["id"]
+        base_number = summary["numero_invoice"]
+        current_part = 1
+        next_part = 2
+
+    current_number = f"{base_number} - {current_part}"
+    if not lineage.get("invoice_raiz_id") and conn.execute("""
+        SELECT 1 FROM invoices
+        WHERE empresa_id=? AND numero_invoice=? AND tipo_documento=? AND id<>?
+        LIMIT 1
+    """, (summary["empresa_id"], current_number, summary["tipo_documento"], summary["id"])).fetchone():
+        raise ValueError(
+            f"Já existe a Invoice {current_number}; não foi possível renomear a parcela."
+        )
+    child_number = f"{base_number} - {next_part}"
+    duplicate = conn.execute("""
+        SELECT 1 FROM invoices
+        WHERE empresa_id=? AND numero_invoice=? AND tipo_documento=?
+        LIMIT 1
+    """, (summary["empresa_id"], child_number, summary["tipo_documento"])).fetchone()
+    if duplicate:
+        raise ValueError(
+            f"Já existe a Invoice {child_number}; não foi possível criar a nova parcela."
+        )
+
+    if not lineage.get("invoice_raiz_id"):
+        conn.execute("""
+            INSERT INTO invoice_desdobramentos
+                (invoice_id,invoice_raiz_id,invoice_anterior_id,numero_base,numero_parcela)
+            VALUES (?,?,?,?,?)
+        """, (summary["id"], root_id, None, base_number, current_part))
+        conn.execute(
+            "UPDATE invoices SET numero_invoice=? WHERE id=?",
+            (current_number, summary["id"]),
+        )
+
+    remaining = normalize_balance(available - closing_amount)
+    conn.execute(
+        "UPDATE invoices SET valor_moeda=? WHERE id=?",
+        (float(closing_amount), summary["id"]),
+    )
+    cursor = conn.execute("""
+        INSERT INTO invoices
+            (empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,
+             banco_referenciado_id,data_emissao,data_credito,moeda,valor_moeda,
+             status,status_manual,desdobramento_habilitado,observacao,contrato_comercial)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        summary["empresa_id"], child_number, summary["tipo_documento"],
+        summary["competencia_id"], summary["cliente_id"],
+        summary["banco_referenciado_id"], summary["data_emissao"],
+        summary["data_credito"], summary["moeda"], float(remaining),
+        INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, 0, 1,
+        summary["observacao"], summary["contrato_comercial"],
+    ))
+    child_id = cursor.lastrowid
+    conn.execute("""
+        INSERT INTO invoice_desdobramentos
+            (invoice_id,invoice_raiz_id,invoice_anterior_id,numero_base,numero_parcela)
+        VALUES (?,?,?,?,?)
+    """, (child_id, root_id, summary["id"], base_number, next_part))
+    allocate_invoice_receipts_for_split(
+        conn, summary["id"], child_id, closing_amount
+    )
+    return child_id
+
+
 def normalize_contract_commercial(value):
     text_value = str(value or "").strip()
     if any(unicodedata.category(character) == "Cc" for character in text_value):
@@ -5122,7 +5762,7 @@ def invoice_form_data(form, conn, current=None):
         data_credito = None
     if status == INVOICE_STATUS_AGUARDANDO_RECEBIMENTO:
         data_credito = None
-    elif status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO and not data_credito:
+    elif status in INVOICE_STATUS_RECEBIDOS and not data_credito:
         raise ValueError("Informe a data do crédito para alterar o status para recebido.")
     return {
         "empresa_id": empresa_id, "numero_invoice": numero, "tipo_documento": tipo,
@@ -5158,6 +5798,57 @@ def resolve_counterparty(conn, raw_id, required=False):
     if not row:
         raise ValueError("O Banco / Contraparte selecionado não foi encontrado.")
     return row
+
+
+def prepare_invoice_receipt(conn, invoice_id, amount, banco_credito_id,
+                            data_credito, require_bank=False):
+    """Valida e prepara um recebimento usando as regras do fluxo individual."""
+    summary = invoice_summary(conn, invoice_id)
+    if not summary:
+        raise ValueError("Invoice não encontrada.")
+
+    amount = decimal_value(amount)
+    if amount <= 0:
+        raise ValueError("O valor do recebimento deve ser maior que zero.")
+    validate_invoice_balances(summary, extra_recebido=amount)
+
+    central_header = conn.execute("""
+        SELECT h.banco_credito_id
+        FROM fechamentos_cambio f
+        JOIN fechamentos h ON h.id=f.fechamento_id
+        WHERE f.invoice_id=? LIMIT 1
+    """, (invoice_id,)).fetchone()
+    bank = resolve_counterparty(
+        conn, banco_credito_id, required=require_bank or bool(central_header)
+    )
+    if central_header and (not bank or bank["id"] != central_header["banco_credito_id"]):
+        raise ValueError("O Banco de Crédito deve permanecer igual ao do Fechamento centralizado.")
+
+    parsed_date = parse_date(data_credito) or date.today().isoformat()
+    if not parsed_date:
+        raise ValueError("A data de crédito é obrigatória.")
+    return {
+        "summary": summary,
+        "amount": amount,
+        "bank": bank,
+        "data_credito": parsed_date,
+    }
+
+
+def insert_invoice_receipt(conn, receipt, documento=None, observacao=None):
+    summary = receipt["summary"]
+    bank = receipt["bank"]
+    conn.execute("""
+        INSERT INTO recebimentos_invoice
+            (invoice_id,banco_credito_id,data_credito,moeda,valor_moeda,documento,observacao)
+        VALUES (?,?,?,?,?,?,?)
+    """, (
+        summary["id"], bank["id"] if bank else None, receipt["data_credito"],
+        summary["moeda"], float(receipt["amount"]),
+        (documento or "").strip() or None,
+        (observacao or "").strip() or None,
+    ))
+
 
 def contract_metadata_from_form(form, conn):
     bank = resolve_counterparty(conn, form.get("banco_liquidacao_id"))
@@ -5200,6 +5891,8 @@ def contract_for_invoice(conn, invoice, metadata):
            SELECT 1 FROM fechamentos_cambio WHERE contrato_id=? LIMIT 1""",
         (contrato["id"], contrato["id"]),
     ).fetchone()
+    if conn.execute("SELECT 1 FROM fechamentos WHERE contrato_id=?", (contrato["id"],)).fetchone():
+        raise ValueError("Este Contrato Câmbio já está associado a um fechamento centralizado.")
     if contrato["moeda"] and contrato["moeda"] != invoice["moeda"] and has_allocations:
         raise ValueError("A moeda do Contrato Câmbio deve ser igual à moeda da Invoice.")
     if not has_allocations and contrato["moeda"] != invoice["moeda"]:
@@ -5239,23 +5932,41 @@ def sync_contract_cache(conn, contrato_id):
             JOIN invoices i ON i.id=f.invoice_id
             LEFT JOIN empresas e ON e.id=i.empresa_id
             LEFT JOIN clientes cl ON cl.id=i.cliente_id
-            WHERE f.contrato_id=?
+            WHERE f.contrato_id=? AND f.fechamento_id IS NULL
+            UNION ALL
+            SELECT f.invoice_id, f.valor_moeda AS valor, h.moeda, NULL AS empresa_id,
+                   h.cliente_id, NULL AS cnpj, cl.nome AS cliente, NULL AS data_emissao
+            FROM fechamentos_cambio f
+            JOIN fechamentos h ON h.id=f.fechamento_id AND h.contrato_id=?
+            LEFT JOIN clientes cl ON cl.id=h.cliente_id
         ) x
-    """, (contrato_id, contrato_id)).fetchone()
-    banks = conn.execute("""
-        SELECT DISTINCT cp.nome
-        FROM (
-            SELECT invoice_id FROM invoice_contrato_cambio WHERE contrato_id=?
-            UNION
-            SELECT invoice_id FROM fechamentos_cambio WHERE contrato_id=?
-        ) x
-        JOIN recebimentos_invoice r ON r.invoice_id=x.invoice_id
-        JOIN contrapartes cp ON cp.id=r.banco_credito_id
-        WHERE cp.nome IS NOT NULL ORDER BY cp.nome
-    """, (contrato_id, contrato_id)).fetchall()
+    """, (contrato_id, contrato_id, contrato_id)).fetchone()
+    linked_invoice_ids = [row[0] for row in conn.execute("""
+        SELECT invoice_id FROM invoice_contrato_cambio WHERE contrato_id=?
+        UNION
+        SELECT invoice_id FROM fechamentos_cambio
+        WHERE contrato_id=? AND fechamento_id IS NULL
+        UNION
+        SELECT f.invoice_id
+        FROM fechamentos_cambio f
+        JOIN fechamentos h ON h.id=f.fechamento_id AND h.contrato_id=?
+    """, (contrato_id, contrato_id, contrato_id)).fetchall()]
+    bank_names = set()
+    for linked_invoice_id in linked_invoice_ids:
+        bank_names.update(
+            row["banco_credito_nome"] for row in invoice_receipt_rows(conn, linked_invoice_id)
+            if row["banco_credito_nome"]
+        )
+    banks = [{"nome": name} for name in sorted(bank_names)]
     total_value = decimal_value(total["total"])
-    valor_reais = (total_value * decimal_value(contrato["taxa_cambio"])
-                   if contrato["taxa_cambio"] is not None else None)
+    central_header = conn.execute(
+        "SELECT valor_brl FROM fechamentos WHERE contrato_id=?", (contrato_id,)
+    ).fetchone()
+    if central_header and central_header["valor_brl"] is not None:
+        valor_reais = decimal_value(central_header["valor_brl"])
+    else:
+        valor_reais = (total_value * decimal_value(contrato["taxa_cambio"])
+                       if contrato["taxa_cambio"] is not None else None)
     linked = decimal_value(conn.execute("""
         SELECT COALESCE(SUM(valor),0) FROM due_movimentacoes
         WHERE contrato_id=? AND tipo='VINCULACAO'
@@ -5269,7 +5980,7 @@ def sync_contract_cache(conn, contrato_id):
         WHERE id=?
     """, (float(total_value), float(valor_reais) if valor_reais is not None else None,
           total["moeda"] or contrato["moeda"], total["cnpj"], total["cliente"], total["cliente_id"],
-          contrato["banco_liquidacao"], ", ".join(row[0] for row in banks) or None, status, contrato_id))
+          contrato["banco_liquidacao"], ", ".join(row["nome"] for row in banks) or None, status, contrato_id))
     return conn.execute("SELECT * FROM contratos WHERE id=?", (contrato_id,)).fetchone()
 
 def sync_contracts_for_invoice(conn, invoice_id):
@@ -5277,8 +5988,12 @@ def sync_contracts_for_invoice(conn, invoice_id):
         """SELECT contrato_id FROM invoice_contrato_cambio WHERE invoice_id=?
            UNION
            SELECT contrato_id FROM fechamentos_cambio
-           WHERE invoice_id=? AND contrato_id IS NOT NULL""",
-        (invoice_id, invoice_id),
+           WHERE invoice_id=? AND contrato_id IS NOT NULL AND fechamento_id IS NULL
+           UNION
+           SELECT h.contrato_id FROM fechamentos_cambio f
+           JOIN fechamentos h ON h.id=f.fechamento_id
+           WHERE f.invoice_id=? AND h.contrato_id IS NOT NULL""",
+        (invoice_id, invoice_id, invoice_id),
     ).fetchall()]
     for contract_id in contract_ids:
         sync_contract_cache(conn, contract_id)
@@ -5291,7 +6006,10 @@ def invoice_contracts_for_currency(conn, invoice):
         WHERE c.moeda=? OR NOT EXISTS (
             SELECT 1 FROM invoice_contrato_cambio x WHERE x.contrato_id=c.id
             UNION ALL
-            SELECT 1 FROM fechamentos_cambio y WHERE y.contrato_id=c.id
+            SELECT 1 FROM fechamentos_cambio y
+            WHERE y.contrato_id=c.id AND y.fechamento_id IS NULL
+            UNION ALL
+            SELECT 1 FROM fechamentos z WHERE z.contrato_id=c.id
         )
         GROUP BY c.id ORDER BY c.numero_contrato
     """, (invoice["moeda"],)).fetchall()
@@ -5310,13 +6028,124 @@ def invoice_detail_data(conn, invoice_id):
     contratos = invoice_contracts_for_currency(conn, summary)
     return summary, empresas, clientes, contrapartes, dues, contratos
 
+def invoice_deletion_blockers(conn, invoice_id):
+    """Retorna os vínculos que impedem a exclusão segura de uma Invoice."""
+    blockers = []
+
+    receipt_count = conn.execute(
+        "SELECT COUNT(*) FROM recebimentos_invoice WHERE invoice_id=?",
+        (invoice_id,),
+    ).fetchone()[0]
+    if receipt_count:
+        blockers.append(f"{receipt_count} recebimento(s) registrado(s)")
+
+    shared_receipt_count = conn.execute(
+        "SELECT COUNT(*) FROM invoice_recebimento_alocacoes WHERE invoice_id=?",
+        (invoice_id,),
+    ).fetchone()[0]
+    if shared_receipt_count:
+        blockers.append(
+            f"{shared_receipt_count} recebimento(s) compartilhado(s) entre parcelas"
+        )
+
+    allocation = conn.execute(
+        """
+        SELECT COUNT(*) AS total, GROUP_CONCAT(DISTINCT c.numero_contrato) AS contratos
+        FROM invoice_contrato_cambio v
+        LEFT JOIN contratos c ON c.id=v.contrato_id
+        WHERE v.invoice_id=?
+        """,
+        (invoice_id,),
+    ).fetchone()
+    if allocation["total"]:
+        contracts = allocation["contratos"] or ""
+        suffix = f": {contracts}" if contracts else ""
+        blockers.append(
+            f"{allocation['total']} vínculo(s) com Contrato(s) Câmbio{suffix}"
+        )
+
+    closing = conn.execute(
+        """
+        SELECT COUNT(*) AS total,
+               GROUP_CONCAT(DISTINCT c.numero_contrato) AS contratos,
+               SUM(CASE WHEN COALESCE(h.contrato_id, f.contrato_id) IS NULL THEN 1 ELSE 0 END) AS pendentes
+        FROM fechamentos_cambio f
+        LEFT JOIN fechamentos h ON h.id=f.fechamento_id
+        LEFT JOIN contratos c ON c.id=COALESCE(h.contrato_id, f.contrato_id)
+        WHERE f.invoice_id=?
+        """,
+        (invoice_id,),
+    ).fetchone()
+    if closing["total"]:
+        contracts = closing["contratos"] or ""
+        suffix = f" (Contrato(s): {contracts})" if contracts else ""
+        if closing["pendentes"]:
+            suffix += " (há fechamento(s) aguardando vínculo)"
+        blockers.append(f"{closing['total']} fechamento(s) de câmbio{suffix}")
+
+    due_link = conn.execute(
+        """
+        SELECT COUNT(*) AS total, GROUP_CONCAT(DISTINCT d.numero_due) AS dues
+        FROM due_invoice di
+        LEFT JOIN dues d ON d.id=di.due_id
+        WHERE di.invoice_id=?
+        """,
+        (invoice_id,),
+    ).fetchone()
+    if due_link["total"]:
+        dues = due_link["dues"] or ""
+        suffix = f": {dues}" if dues else ""
+        blockers.append(f"{due_link['total']} vínculo(s) com DU-E(s){suffix}")
+
+    return blockers
+
+def invoice_deletion_label(invoice):
+    empresa = invoice["empresa_apelido"] or invoice["empresa_razao_social"]
+    return (
+        f"Invoice {invoice['numero_invoice']} "
+        f"({invoice_type_label(invoice['tipo_documento'])} — {empresa})"
+    )
+
+def delete_invoice_if_unlinked(conn, invoice_id):
+    """Exclui uma Invoice somente quando não há vínculos transacionais."""
+    invoice = conn.execute(
+        """
+        SELECT i.id, i.numero_invoice, i.tipo_documento,
+               e.razao_social AS empresa_razao_social, e.apelido AS empresa_apelido
+        FROM invoices i
+        JOIN empresas e ON e.id=i.empresa_id
+        WHERE i.id=?
+        """,
+        (invoice_id,),
+    ).fetchone()
+    if not invoice:
+        raise ValueError("Invoice não encontrada.")
+
+    invoice = dict(invoice)
+    blockers = invoice_deletion_blockers(conn, invoice_id)
+    if blockers:
+        return {"deleted": False, "invoice": invoice, "blockers": blockers}
+
+    cursor = conn.execute("DELETE FROM invoices WHERE id=?", (invoice_id,))
+    if cursor.rowcount != 1:
+        raise sqlite3.DatabaseError("A Invoice não foi excluída.")
+    return {"deleted": True, "invoice": invoice, "blockers": []}
+
+def invoice_deletion_blocked_message(result):
+    return (
+        f"{invoice_deletion_label(result['invoice'])}: "
+        f"{'; '.join(result['blockers'])}. Remova os vínculos antes de tentar excluir."
+    )
+
 def contract_has_exchange_links(conn, contrato_id):
     return bool(conn.execute("""
         SELECT 1 FROM invoice_contrato_cambio WHERE contrato_id=?
         UNION ALL
-        SELECT 1 FROM fechamentos_cambio WHERE contrato_id=?
+        SELECT 1 FROM fechamentos_cambio WHERE contrato_id=? AND fechamento_id IS NULL
+        UNION ALL
+        SELECT 1 FROM fechamentos WHERE contrato_id=?
         LIMIT 1
-    """, (contrato_id, contrato_id)).fetchone())
+    """, (contrato_id, contrato_id, contrato_id)).fetchone())
 
 def contract_for_fechamento(conn, invoice, form, data_fechamento):
     """Resolve um Contrato existente ou cria um novo sem alocação legada."""
@@ -5332,6 +6161,8 @@ def contract_for_fechamento(conn, invoice, form, data_fechamento):
         contrato = conn.execute("SELECT * FROM contratos WHERE id=?", (contract_id,)).fetchone()
         if not contrato:
             raise ValueError("O Contrato Câmbio selecionado não foi encontrado.")
+        if conn.execute("SELECT 1 FROM fechamentos WHERE contrato_id=?", (contract_id,)).fetchone():
+            raise ValueError("Este Contrato Câmbio já está associado a um fechamento centralizado.")
         if contrato["moeda"] != invoice["moeda"] and contract_has_exchange_links(conn, contract_id):
             raise ValueError("A moeda do Contrato Câmbio deve ser igual à moeda da Invoice.")
         if contrato["moeda"] != invoice["moeda"]:
@@ -5358,6 +6189,228 @@ def contract_for_fechamento(conn, invoice, form, data_fechamento):
         data_contrato, data_fechamento, data_liquidacao, invoice["moeda"],
         optional_number(form.get("taxa_cambio")), STATUS_PENDENTE,
         (form.get("novo_contrato_observacao") or "").strip() or None,
+    ))
+    return cursor.lastrowid
+
+
+def central_closing_invoice(conn, invoice_id):
+    """Retorna uma Invoice elegível para a Gestão de Fechamentos."""
+    summary = invoice_summary(conn, invoice_id)
+    if not summary:
+        raise ValueError("Uma das Invoices selecionadas não foi encontrada.")
+    if not summary["cliente_id"] or not summary["cliente_nome"]:
+        raise ValueError(
+            f"A Invoice {summary['numero_invoice']} não possui Cliente cadastrado."
+        )
+    if summary["total_recebido"] <= SALDO_TOLERANCE:
+        raise ValueError(
+            f"A Invoice {summary['numero_invoice']} ainda não possui recebimento confirmado."
+        )
+    if summary["saldo_fechamentos"] <= SALDO_TOLERANCE:
+        raise ValueError(
+            f"A Invoice {summary['numero_invoice']} não possui saldo de câmbio disponível."
+        )
+    receipts = summary["recebimentos"]
+    bank_ids = {row["banco_credito_id"] for row in receipts}
+    if not receipts or None in bank_ids or len(bank_ids) != 1:
+        raise ValueError(
+            f"A Invoice {summary['numero_invoice']} precisa ter exatamente um Banco de Crédito "
+            "informado em todos os recebimentos."
+        )
+    bank_id = next(iter(bank_ids))
+    bank = conn.execute("SELECT id, nome FROM contrapartes WHERE id=?", (bank_id,)).fetchone()
+    if not bank:
+        raise ValueError(
+            f"O Banco de Crédito da Invoice {summary['numero_invoice']} não foi encontrado."
+        )
+    data = dict(summary)
+    data["banco_credito_id"] = bank["id"]
+    data["banco_credito_nome"] = bank["nome"]
+    data["valor_fechamento"] = normalize_balance(summary["saldo_fechamentos"])
+    return data
+
+
+def closing_amounts_from_form(form):
+    amounts = {}
+    for key, value in form.items():
+        match = re.fullmatch(r"valor_fechamento_([1-9]\d*)", str(key))
+        if match:
+            amounts[int(match.group(1))] = value
+    return amounts
+
+
+def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=None,
+                           taxa_cambio=None, banco_liquidacao_id=None, amounts=None):
+    """Valida a seleção e monta grupos determinísticos sem gravar nada."""
+    ids = []
+    for raw_id in raw_ids:
+        value = str(raw_id or "").strip()
+        if not re.fullmatch(r"[1-9]\d*", value):
+            raise ValueError("A seleção contém uma Invoice inválida.")
+        invoice_id = int(value)
+        if invoice_id not in ids:
+            ids.append(invoice_id)
+    if not ids:
+        raise ValueError("Selecione pelo menos uma Invoice.")
+
+    fechamento = parse_date(data_fechamento)
+    liquidacao = parse_date(data_liquidacao)
+    if not fechamento:
+        raise ValueError("A Data de Fechamento é obrigatória.")
+    if not liquidacao:
+        raise ValueError("A Data de Liquidação é obrigatória.")
+    if liquidacao < fechamento:
+        raise ValueError("A Data de Liquidação não pode ser anterior à Data de Fechamento.")
+    rate = parse_exchange_rate(taxa_cambio)
+    banco_liquidacao = resolve_counterparty(conn, banco_liquidacao_id, required=True)
+
+    invoices = [central_closing_invoice(conn, invoice_id) for invoice_id in ids]
+    client_ids = {invoice["cliente_id"] for invoice in invoices}
+    if len(client_ids) != 1:
+        raise ValueError("Todas as Invoices selecionadas devem pertencer ao mesmo Cliente.")
+
+    groups_by_key = {}
+    amounts = amounts or {}
+    for invoice in invoices:
+        raw_amount = amounts.get(invoice["id"], amounts.get(str(invoice["id"])))
+        if raw_amount is None:
+            requested_amount = invoice["valor_fechamento"]
+        else:
+            requested_amount = decimal_value(parse_number(raw_amount))
+        if requested_amount <= SALDO_TOLERANCE:
+            raise ValueError(
+                f"Informe um valor de fechamento maior que zero para a Invoice {invoice['numero_invoice']}."
+            )
+        if requested_amount > invoice["valor_fechamento"] + SALDO_TOLERANCE:
+            raise ValueError(
+                f"O fechamento da Invoice {invoice['numero_invoice']} não pode ultrapassar o saldo disponível."
+            )
+        invoice = dict(invoice)
+        invoice["valor_fechamento"] = normalize_balance(requested_amount)
+        invoice["fechamento_parcial"] = (
+            invoice["valor_fechamento"] < decimal_value(invoice["saldo_fechamentos"]) - SALDO_TOLERANCE
+        )
+        key = (invoice["banco_credito_id"], invoice["moeda"])
+        group = groups_by_key.setdefault(key, {
+            "cliente_id": invoice["cliente_id"],
+            "cliente_nome": invoice["cliente_nome"],
+            "banco_credito_id": invoice["banco_credito_id"],
+            "banco_credito_nome": invoice["banco_credito_nome"],
+            "moeda": invoice["moeda"],
+            "valor_moeda": Decimal("0"),
+            "invoices": [],
+            "data_fechamento": fechamento,
+            "data_liquidacao": liquidacao,
+            "taxa_cambio": rate,
+            "valor_brl": Decimal("0"),
+            "banco_liquidacao_id": banco_liquidacao["id"],
+            "banco_liquidacao_nome": banco_liquidacao["nome"],
+        })
+        item = {
+            "id": invoice["id"],
+            "numero_invoice": invoice["numero_invoice"],
+            "tipo_documento": invoice["tipo_documento"],
+            "empresa_apelido": invoice["empresa_apelido"],
+            "empresa_razao_social": invoice["empresa_razao_social"],
+            "valor_moeda": invoice["valor_fechamento"],
+            "total_recebido": invoice["total_recebido"],
+            "saldo_fechamentos": invoice["saldo_fechamentos"],
+            "fechamento_parcial": invoice["fechamento_parcial"],
+        }
+        group["invoices"].append(item)
+        group["valor_moeda"] += invoice["valor_fechamento"]
+
+    for group in groups_by_key.values():
+        group["valor_brl"] = closing_brl_value(group["valor_moeda"], group["taxa_cambio"])
+
+    groups = list(groups_by_key.values())
+    groups.sort(key=lambda group: (group["banco_credito_nome"].casefold(), group["moeda"]))
+    for index, group in enumerate(groups):
+        group["index"] = index
+        group["invoices"].sort(key=lambda item: (str(item["numero_invoice"]).casefold(), item["id"]))
+    return groups
+
+
+def central_closing_headers(conn, filters=None):
+    filters = filters or {}
+    clauses = []
+    params = []
+    if filters.get("cliente_id"):
+        clauses.append("h.cliente_id=?")
+        params.append(filters["cliente_id"])
+    if filters.get("banco_credito_id"):
+        clauses.append("h.banco_credito_id=?")
+        params.append(filters["banco_credito_id"])
+    if filters.get("moeda"):
+        clauses.append("h.moeda=?")
+        params.append(filters["moeda"])
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return conn.execute(f"""
+        SELECT h.*, cl.nome AS cliente_nome,
+               bc.nome AS banco_credito_nome, bl.nome AS banco_liquidacao_nome,
+               c.numero_contrato, c.status AS contrato_status,
+               COALESCE(SUM(f.valor_moeda), 0) AS valor_moeda
+        FROM fechamentos h
+        JOIN clientes cl ON cl.id=h.cliente_id
+        JOIN contrapartes bc ON bc.id=h.banco_credito_id
+        JOIN contrapartes bl ON bl.id=h.banco_liquidacao_id
+        LEFT JOIN contratos c ON c.id=h.contrato_id
+        LEFT JOIN fechamentos_cambio f ON f.fechamento_id=h.id
+        {where}
+        GROUP BY h.id
+        ORDER BY h.id DESC
+    """, params).fetchall()
+
+
+def central_closing_detail(conn, fechamento_id):
+    header = conn.execute("""
+        SELECT h.*, cl.nome AS cliente_nome,
+               bc.nome AS banco_credito_nome, bl.nome AS banco_liquidacao_nome,
+               c.numero_contrato, c.status AS contrato_status
+        FROM fechamentos h
+        JOIN clientes cl ON cl.id=h.cliente_id
+        JOIN contrapartes bc ON bc.id=h.banco_credito_id
+        JOIN contrapartes bl ON bl.id=h.banco_liquidacao_id
+        LEFT JOIN contratos c ON c.id=h.contrato_id
+        WHERE h.id=?
+    """, (fechamento_id,)).fetchone()
+    if not header:
+        return None
+    items = conn.execute("""
+        SELECT f.*, i.numero_invoice, i.tipo_documento, i.moeda AS invoice_moeda,
+               e.apelido AS empresa_apelido, e.razao_social AS empresa_razao_social
+        FROM fechamentos_cambio f
+        JOIN invoices i ON i.id=f.invoice_id
+        JOIN empresas e ON e.id=i.empresa_id
+        WHERE f.fechamento_id=?
+        ORDER BY i.numero_invoice, i.id
+    """, (fechamento_id,)).fetchall()
+    data = dict(header)
+    data["items"] = items
+    data["valor_moeda"] = sum((decimal_value(item["valor_moeda"]) for item in items), Decimal("0"))
+    return data
+
+
+def create_central_closing_contract(conn, group, number):
+    number = (number or "").strip()
+    if not number:
+        return None
+    if conn.execute("SELECT id FROM contratos WHERE numero_contrato=?", (number,)).fetchone():
+        raise ValueError(f"Já existe um Contrato Câmbio com o número {number}.")
+    cursor = conn.execute("""
+        INSERT INTO contratos
+            (numero_contrato,banco_id,banco,banco_credito,banco_liquidacao_id,
+             banco_liquidacao,data_contrato,data_fechamento,data_liquidacao,moeda,
+             valor_moeda,taxa_cambio,valor_reais,status,cliente,cliente_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        number, group["banco_credito_id"], group["banco_credito_nome"],
+        group["banco_credito_nome"], group["banco_liquidacao_id"],
+        group["banco_liquidacao_nome"], group["data_fechamento"],
+        group["data_fechamento"], group["data_liquidacao"], group["moeda"],
+        float(group["valor_moeda"]), float(group["taxa_cambio"]), float(group["valor_brl"]),
+        STATUS_PENDENTE, group["cliente_nome"],
+        group["cliente_id"],
     ))
     return cursor.lastrowid
 
@@ -5604,9 +6657,9 @@ def prepare_invoice_import_rows(df, pandas):
             for row in group:
                 row["banco_referenciado"] = group_banco_referenciado
         group_status = next((row["status"] for row in group if row.get("status_provided")), None)
-        if group_status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO and not group_data_credito:
+        if group_status in INVOICE_STATUS_RECEBIDOS and not group_data_credito:
             raise ValueError(
-                f"Invoice {key[1]}: data_credito é obrigatória quando o status é RECEBIDO AGUARDANDO CAMBIO."
+                f"Invoice {key[1]}: data_credito é obrigatória quando o status é RECEBIDO AGUARDANDO CAMBIO ou AGUARDANDO CONTRATO."
             )
     contract_groups = {}
     for row in rows:
@@ -5629,10 +6682,27 @@ def invoice_identity_rows(conn, rows):
         db_key = (empresa["id"], row["numero_invoice"], row["tipo_documento"])
         display_key = (row["cnpj"], row["numero_invoice"], row["tipo_documento"])
         result[display_key] = conn.execute("""
-            SELECT i.*, COALESCE((SELECT SUM(valor_moeda) FROM recebimentos_invoice WHERE invoice_id=i.id),0) AS total_recebido,
+            SELECT i.*, COALESCE((
+                       SELECT SUM(CASE WHEN EXISTS (
+                                      SELECT 1 FROM invoice_recebimento_alocacoes ax
+                                      WHERE ax.recebimento_id=r.id
+                                  ) THEN COALESCE((
+                                      SELECT SUM(a.valor_moeda)
+                                      FROM invoice_recebimento_alocacoes a
+                                      WHERE a.recebimento_id=r.id AND a.invoice_id=i.id
+                                  ), 0) ELSE r.valor_moeda END)
+                       FROM recebimentos_invoice r
+                       WHERE r.invoice_id=i.id OR EXISTS (
+                           SELECT 1 FROM invoice_recebimento_alocacoes ar
+                           WHERE ar.recebimento_id=r.id AND ar.invoice_id=i.id
+                       )
+                   ),0) AS total_recebido,
                    COALESCE((SELECT SUM(valor_alocado) FROM invoice_contrato_cambio WHERE invoice_id=i.id),0)
                    + COALESCE((SELECT SUM(valor_moeda) FROM fechamentos_cambio
-                               WHERE invoice_id=i.id AND contrato_id IS NOT NULL),0) AS total_cambio
+                               WHERE invoice_id=i.id AND contrato_id IS NOT NULL AND fechamento_id IS NULL),0)
+                   + COALESCE((SELECT SUM(f.valor_moeda) FROM fechamentos_cambio f
+                               JOIN fechamentos h ON h.id=f.fechamento_id
+                               WHERE f.invoice_id=i.id AND h.contrato_id IS NOT NULL),0) AS total_cambio
             FROM invoices i WHERE i.empresa_id=? AND i.numero_invoice=? AND i.tipo_documento=?
         """, db_key).fetchone()
     return result
@@ -5717,11 +6787,7 @@ def apply_invoice_import_receipt(conn, invoice_id, row, status=None):
         return
     bank = invoice_import_counterparty(conn, banco_nome, "Banco de Crédito")
     amount = decimal_value(row["valor_invoice"])
-    receipts = conn.execute(
-        "SELECT id, valor_moeda FROM recebimentos_invoice WHERE invoice_id=? ORDER BY id",
-        (invoice_id,)
-    ).fetchall()
-    total_received = sum((decimal_value(receipt["valor_moeda"]) for receipt in receipts), Decimal("0"))
+    total_received = invoice_receipt_total(conn, invoice_id)
     if total_received >= amount - SALDO_TOLERANCE:
         return
     remaining = amount - total_received
@@ -5756,9 +6822,9 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
         imported_data_credito = first.get("data_credito")
         if imported_status == INVOICE_STATUS_AGUARDANDO_RECEBIMENTO:
             imported_data_credito = None
-        elif imported_status == INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO and not imported_data_credito:
+        elif imported_status in INVOICE_STATUS_RECEBIDOS and not imported_data_credito:
             raise ValueError(
-                f"Invoice {first['numero_invoice']}: data_credito é obrigatória quando o status é RECEBIDO AGUARDANDO CAMBIO."
+                f"Invoice {first['numero_invoice']}: data_credito é obrigatória quando o status é RECEBIDO AGUARDANDO CAMBIO ou AGUARDANDO CONTRATO."
             )
         cliente_id = first.get("cliente_id")
         current = conn.execute("""
@@ -5780,6 +6846,22 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
             banco_referenciado_id = current["banco_referenciado_id"] or banco_referenciado_id
         if current:
             summary = invoice_summary(conn, current["id"])
+            if summary["linhagem"].get("numero_parcela") and decimal_value(first["valor_invoice"]) != decimal_value(current["valor_moeda"]):
+                raise ValueError(
+                    f"A Invoice desdobrada {first['numero_invoice']} não pode ter o valor alterado por importação."
+                )
+            central_header = conn.execute("""
+                SELECT h.cliente_id, h.moeda
+                FROM fechamentos_cambio f JOIN fechamentos h ON h.id=f.fechamento_id
+                WHERE f.invoice_id=? LIMIT 1
+            """, (current["id"],)).fetchone()
+            if central_header and (
+                central_header["cliente_id"] != cliente_id
+                or central_header["moeda"] != first["moeda"]
+            ):
+                raise ValueError(
+                    f"Invoice {first['numero_invoice']} pertence a um Fechamento centralizado e não pode mudar de Cliente ou moeda."
+                )
             if decimal_value(first["valor_invoice"]) < summary["total_recebido"]:
                 raise ValueError(f"Invoice {first['numero_invoice']} não pode ficar abaixo do total recebido.")
             if decimal_value(first["valor_invoice"]) < summary["total_fechamentos"]:
@@ -5819,12 +6901,13 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
             cursor = conn.execute("""
                 INSERT INTO invoices
                     (empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,banco_referenciado_id,
-                     data_emissao,moeda,valor_moeda,contrato_comercial,status,status_manual,data_credito,observacao)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     data_emissao,moeda,valor_moeda,contrato_comercial,status,status_manual,
+                     desdobramento_habilitado,data_credito,observacao)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (company["id"], first["numero_invoice"], first["tipo_documento"], first["competencia_id"], cliente_id,
                   banco_referenciado_id, first["data_emissao"], first["moeda"], first["valor_invoice"],
                   first["contrato_comercial"], imported_status or INVOICE_STATUS_AGUARDANDO_RECEBIMENTO,
-                  1 if status_provided else 0, imported_data_credito, first["observacao"]))
+                  1 if status_provided else 0, 1, imported_data_credito, first["observacao"]))
             invoice_id = cursor.lastrowid
         apply_invoice_import_receipt(conn, invoice_id, first, status=imported_status)
         allocation_total = sum((decimal_value(
@@ -5863,7 +6946,8 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
         changed_invoices.add(invoice_id)
     for contract_id in changed_contracts:
         if conn.execute("SELECT COUNT(*) FROM invoice_contrato_cambio WHERE contrato_id=?", (contract_id,)).fetchone()[0] \
-           or conn.execute("SELECT COUNT(*) FROM fechamentos_cambio WHERE contrato_id=?", (contract_id,)).fetchone()[0]:
+           or conn.execute("SELECT COUNT(*) FROM fechamentos_cambio WHERE contrato_id=?", (contract_id,)).fetchone()[0] \
+           or conn.execute("SELECT COUNT(*) FROM fechamentos WHERE contrato_id=?", (contract_id,)).fetchone()[0]:
             sync_contract_cache(conn, contract_id)
         elif not conn.execute("SELECT 1 FROM due_contratos WHERE contrato_id=?", (contract_id,)).fetchone():
             conn.execute("DELETE FROM contratos WHERE id=?", (contract_id,))
@@ -5948,6 +7032,7 @@ def lista_invoices():
     empresas = conn.execute("SELECT id,razao_social,apelido,cnpj,prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     clientes = clientes_for_form(conn)
     competencias = competencias_for_empresa(conn, None)
+    contrapartes = contrapartes_for_form(conn)
     moedas = [row[0] for row in conn.execute("SELECT DISTINCT moeda FROM invoices ORDER BY moeda").fetchall()]
     conn.commit(); conn.close()
     sort_links = {}
@@ -5956,9 +7041,326 @@ def lista_invoices():
     previous_args = {**filters, "sort": sort, "direction": direction, "page": page - 1}
     next_args = {**filters, "sort": sort, "direction": direction, "page": page + 1}
     return render_template("invoices.html", invoices=invoices, total=total, page=page, pages=pages,
-                           filters=filters, empresas=empresas, clientes=clientes, competencias=competencias, moedas=moedas,
+                           filters=filters, empresas=empresas, clientes=clientes, competencias=competencias,
+                           contrapartes=contrapartes, moedas=moedas,
                            invoice_statuses=INVOICE_STATUS_LABELS, sort=sort, direction=direction,
                            sort_links=sort_links, previous_args=previous_args, next_args=next_args)
+
+
+def central_closing_page_data(conn):
+    eligible = []
+    for row in conn.execute("SELECT id FROM invoices ORDER BY numero_invoice, id").fetchall():
+        try:
+            eligible.append(central_closing_invoice(conn, row["id"]))
+        except ValueError:
+            continue
+    return {
+        "eligible_invoices": eligible,
+        "clientes": clientes_for_form(conn),
+        "contrapartes": contrapartes_for_form(conn),
+        "fechamentos": central_closing_headers(conn),
+        "moedas": [row[0] for row in conn.execute(
+            "SELECT DISTINCT moeda FROM invoices ORDER BY moeda"
+        ).fetchall()],
+    }
+
+
+@app.route("/invoices/fechamentos")
+def gestao_fechamentos_invoices():
+    conn = db()
+    try:
+        data = central_closing_page_data(conn)
+    finally:
+        conn.close()
+    filters = {
+        "cliente_id": request.args.get("cliente_id", ""),
+        "banco_credito_id": request.args.get("banco_credito_id", ""),
+        "moeda": (request.args.get("moeda") or "").strip().upper(),
+        "numero_invoice": (request.args.get("numero_invoice") or "").strip(),
+    }
+    data["eligible_invoices"] = [
+        invoice for invoice in data["eligible_invoices"]
+        if (not filters["cliente_id"] or str(invoice["cliente_id"]) == filters["cliente_id"])
+        and (not filters["banco_credito_id"] or str(invoice["banco_credito_id"]) == filters["banco_credito_id"])
+        and (not filters["moeda"] or invoice["moeda"] == filters["moeda"])
+        and (not filters["numero_invoice"] or filters["numero_invoice"].casefold() in str(invoice["numero_invoice"]).casefold())
+    ]
+    return render_template("invoice_fechamentos.html", filters=filters, **data)
+
+
+@app.route("/invoices/fechamentos/preview", methods=["POST"])
+def previsualizar_fechamentos_invoices():
+    conn = db()
+    try:
+        groups = central_closing_groups(
+            conn, request.form.getlist("selected_ids"),
+            request.form.get("data_fechamento"), request.form.get("data_liquidacao"),
+            request.form.get("taxa_cambio"),
+            request.form.get("banco_liquidacao_id"),
+            amounts=closing_amounts_from_form(request.form),
+        )
+        form_data = {
+            "data_fechamento": request.form.get("data_fechamento", ""),
+            "data_liquidacao": request.form.get("data_liquidacao", ""),
+            "taxa_cambio": request.form.get("taxa_cambio", ""),
+            "banco_liquidacao_id": request.form.get("banco_liquidacao_id", ""),
+            "selected_ids": request.form.getlist("selected_ids"),
+        }
+    except ValueError as exc:
+        conn.close()
+        flash(str(exc), "danger")
+        return redirect(url_for("gestao_fechamentos_invoices"))
+    conn.close()
+    return render_template("invoice_fechamentos_preview.html", groups=groups, form_data=form_data)
+
+
+@app.route("/invoices/fechamentos", methods=["POST"])
+def registrar_fechamentos_invoices():
+    conn = db()
+    created_ids = []
+    invoice_ids = set()
+    split_children = {}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        groups = central_closing_groups(
+            conn, request.form.getlist("selected_ids"),
+            request.form.get("data_fechamento"), request.form.get("data_liquidacao"),
+            request.form.get("taxa_cambio"),
+            request.form.get("banco_liquidacao_id"),
+            amounts=closing_amounts_from_form(request.form),
+        )
+        for group in groups:
+            cursor = conn.execute("""
+                INSERT INTO fechamentos
+                    (cliente_id,banco_credito_id,moeda,data_fechamento,data_liquidacao,
+                     banco_liquidacao_id,taxa_cambio,valor_brl)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (
+                group["cliente_id"], group["banco_credito_id"], group["moeda"],
+                group["data_fechamento"], group["data_liquidacao"],
+                group["banco_liquidacao_id"], float(group["taxa_cambio"]),
+                float(group["valor_brl"]),
+            ))
+            fechamento_id = cursor.lastrowid
+            number = request.form.get(
+                f"numero_contrato_grupo_{group['banco_credito_id']}_{group['moeda']}"
+            )
+            if number is None:
+                number = request.form.get(f"numero_contrato_{group['index']}")
+            if number is None and len(groups) == 1:
+                number = request.form.get("numero_contrato")
+            contrato_id = create_central_closing_contract(conn, group, number)
+            if contrato_id:
+                conn.execute("UPDATE fechamentos SET contrato_id=? WHERE id=?", (contrato_id, fechamento_id))
+            for item in group["invoices"]:
+                if item["fechamento_parcial"]:
+                    source_summary = invoice_summary(conn, item["id"])
+                    split_children[item["id"]] = split_invoice_for_closing(
+                        conn, source_summary, item["valor_moeda"]
+                    )
+                conn.execute("""
+                    INSERT INTO fechamentos_cambio
+                        (invoice_id,contrato_id,moeda,valor_moeda,data_fechamento,observacao,fechamento_id)
+                    VALUES (?,?,?,?,?,?,?)
+                """, (
+                    item["id"], None, group["moeda"], float(item["valor_moeda"]),
+                    group["data_fechamento"], "Gestão centralizada de Fechamentos", fechamento_id,
+                ))
+                invoice_ids.add(item["id"])
+            if contrato_id:
+                sync_contract_cache(conn, contrato_id)
+            created_ids.append(fechamento_id)
+        for invoice_id in invoice_ids:
+            if invoice_id in split_children:
+                refresh_invoice_status(conn, invoice_id, force=True)
+                refresh_invoice_status(conn, split_children[invoice_id], force=True)
+            else:
+                refresh_invoice_status_after_closing(conn, invoice_id)
+        conn.commit()
+        flash("Fechamento(s) registrado(s): " + ", ".join(map(str, created_ids)) + ".", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        flash("Não foi possível registrar os Fechamentos. Verifique os números de Contrato e tente novamente.", "danger")
+    except sqlite3.Error:
+        conn.rollback()
+        flash("Não foi possível registrar os Fechamentos; nenhuma alteração foi mantida.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("gestao_fechamentos_invoices"))
+
+
+@app.route("/invoices/fechamentos/<int:fechamento_id>")
+def detalhe_fechamento_invoice(fechamento_id):
+    conn = db()
+    detail = central_closing_detail(conn, fechamento_id)
+    contrapartes = contrapartes_for_form(conn)
+    conn.close()
+    if not detail:
+        return "Fechamento não encontrado", 404
+    return render_template("invoice_fechamento_detalhe.html", fechamento=detail, contrapartes=contrapartes)
+
+
+@app.route("/invoices/fechamentos/<int:fechamento_id>/editar", methods=["POST"])
+def editar_fechamento_invoice(fechamento_id):
+    conn = db()
+    invoice_ids = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        detail = central_closing_detail(conn, fechamento_id)
+        if not detail:
+            raise ValueError("Fechamento não encontrado.")
+        data_fechamento = parse_date(request.form.get("data_fechamento"))
+        data_liquidacao = parse_date(request.form.get("data_liquidacao"))
+        if not data_fechamento:
+            raise ValueError("A Data de Fechamento é obrigatória.")
+        if not data_liquidacao:
+            raise ValueError("A Data de Liquidação é obrigatória.")
+        if data_liquidacao < data_fechamento:
+            raise ValueError("A Data de Liquidação não pode ser anterior à Data de Fechamento.")
+        taxa_cambio = parse_exchange_rate(request.form.get("taxa_cambio"))
+        banco_liquidacao = resolve_counterparty(
+            conn, request.form.get("banco_liquidacao_id"), required=True
+        )
+        group = dict(detail)
+        group.update({
+            "data_fechamento": data_fechamento,
+            "data_liquidacao": data_liquidacao,
+            "taxa_cambio": taxa_cambio,
+            "valor_brl": closing_brl_value(detail["valor_moeda"], taxa_cambio),
+            "banco_liquidacao_id": banco_liquidacao["id"],
+            "banco_liquidacao_nome": banco_liquidacao["nome"],
+        })
+        for item in detail["items"]:
+            invoice_ids.append(item["invoice_id"])
+        if not invoice_ids:
+            raise ValueError("O Fechamento não possui Invoices vinculadas.")
+        if detail["contrato_id"]:
+            contrato_id = detail["contrato_id"]
+            conn.execute("""
+                UPDATE contratos SET banco_liquidacao_id=?, banco_liquidacao=?,
+                    data_contrato=?, data_fechamento=?, data_liquidacao=?,
+                    taxa_cambio=?, valor_reais=?
+                WHERE id=?
+            """, (banco_liquidacao["id"], banco_liquidacao["nome"], data_fechamento,
+                  data_fechamento, data_liquidacao, float(taxa_cambio),
+                  float(group["valor_brl"]), contrato_id))
+        else:
+            contrato_id = create_central_closing_contract(
+                conn, group, request.form.get("numero_novo_contrato")
+            )
+            if contrato_id:
+                conn.execute("UPDATE fechamentos SET contrato_id=? WHERE id=?", (contrato_id, fechamento_id))
+        conn.execute("""
+            UPDATE fechamentos
+            SET data_fechamento=?, data_liquidacao=?, banco_liquidacao_id=?,
+                taxa_cambio=?, valor_brl=?
+            WHERE id=?
+        """, (data_fechamento, data_liquidacao, banco_liquidacao["id"],
+              float(taxa_cambio), float(group["valor_brl"]), fechamento_id))
+        conn.execute("UPDATE fechamentos_cambio SET data_fechamento=? WHERE fechamento_id=?",
+                     (data_fechamento, fechamento_id))
+        if contrato_id:
+            sync_contract_cache(conn, contrato_id)
+        for invoice_id in invoice_ids:
+            refresh_invoice_status_after_closing(conn, invoice_id)
+        conn.commit()
+        flash(f"Fechamento {fechamento_id} atualizado com sucesso.", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        flash("Não foi possível atualizar o Fechamento; verifique os dados informados.", "danger")
+    except sqlite3.Error:
+        conn.rollback()
+        flash("Não foi possível atualizar o Fechamento; nenhuma alteração foi mantida.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_fechamento_invoice", fechamento_id=fechamento_id))
+
+
+@app.route("/invoices/fechamentos/<int:fechamento_id>/excluir", methods=["POST"])
+def excluir_fechamento_invoice(fechamento_id):
+    conn = db()
+    invoice_ids = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        detail = central_closing_detail(conn, fechamento_id)
+        if not detail:
+            raise ValueError("Fechamento não encontrado.")
+        invoice_ids = [item["invoice_id"] for item in detail["items"]]
+        contrato_id = detail["contrato_id"]
+        if contrato_id:
+            blockers = []
+            if conn.execute("SELECT 1 FROM invoice_contrato_cambio WHERE contrato_id=?", (contrato_id,)).fetchone():
+                blockers.append("vínculo legado com Invoice")
+            if conn.execute("SELECT 1 FROM fechamentos_cambio WHERE contrato_id=? AND fechamento_id IS NULL", (contrato_id,)).fetchone():
+                blockers.append("fechamento legado")
+            if conn.execute("SELECT 1 FROM due_contratos WHERE contrato_id=?", (contrato_id,)).fetchone():
+                blockers.append("vínculo com DU-E")
+            if conn.execute("SELECT 1 FROM due_movimentacoes WHERE contrato_id=?", (contrato_id,)).fetchone():
+                blockers.append("movimentação de DU-E")
+            if blockers:
+                raise ValueError(
+                    "O Contrato Câmbio não pode ser excluído automaticamente porque possui "
+                    + ", ".join(blockers) + "."
+                )
+        conn.execute("DELETE FROM fechamentos WHERE id=?", (fechamento_id,))
+        if contrato_id:
+            conn.execute("DELETE FROM contratos WHERE id=?", (contrato_id,))
+        for invoice_id in invoice_ids:
+            refresh_invoice_status_after_closing(conn, invoice_id)
+        conn.commit()
+        flash(f"Fechamento {fechamento_id} excluído com sucesso.", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    except sqlite3.Error:
+        conn.rollback()
+        flash("Não foi possível excluir o Fechamento; nenhuma alteração foi mantida.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("gestao_fechamentos_invoices"))
+
+@app.route("/invoices/excluir-lote", methods=["POST"])
+def excluir_invoices_lote():
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        invoice_ids = selected_record_ids(request.form)
+        ensure_existing_record_ids(conn, "invoices", invoice_ids, "Invoices")
+
+        deleted = []
+        blocked = []
+        for invoice_id in invoice_ids:
+            result = delete_invoice_if_unlinked(conn, invoice_id)
+            if result["deleted"]:
+                deleted.append(result["invoice"])
+            else:
+                blocked.append(result)
+
+        conn.commit()
+        if deleted:
+            labels = ", ".join(invoice_deletion_label(invoice) for invoice in deleted)
+            flash(f"Invoice(s) excluída(s) com sucesso: {labels}.", "success")
+        if blocked:
+            details = " | ".join(invoice_deletion_blocked_message(result) for result in blocked)
+            flash(f"Invoice(s) não excluída(s): {details}", "danger")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    except (sqlite3.Error, OverflowError):
+        conn.rollback()
+        flash("Não foi possível concluir a exclusão das Invoices.", "danger")
+    except Exception:
+        conn.rollback()
+        flash("Não foi possível concluir a exclusão das Invoices.", "danger")
+    finally:
+        conn.close()
+    return redirect_batch_result("lista_invoices")
 
 
 @app.route("/invoices/relatorios")
@@ -6015,8 +7417,14 @@ def exportar_invoices():
     if invoice_ids:
         placeholders = ",".join("?" for _ in invoice_ids)
         receipts = conn.execute(f"""
-            SELECT r.id AS recebimento_id, r.invoice_id, r.banco_credito_id,
-                   r.data_credito, r.moeda, r.valor_moeda, r.documento,
+            SELECT r.id AS recebimento_id,
+                   COALESCE(a.invoice_id, r.invoice_id) AS invoice_id,
+                   r.invoice_id AS recebimento_invoice_id,
+                   r.banco_credito_id, r.data_credito, r.moeda,
+                   COALESCE(a.valor_moeda, r.valor_moeda) AS valor_moeda,
+                   r.valor_moeda AS valor_recebimento, a.id AS recebimento_alocacao_id,
+                   CASE WHEN a.id IS NULL THEN 0 ELSE 1 END AS recebimento_compartilhado,
+                   r.documento,
                    r.observacao, r.created_at AS recebimento_criado_em,
                    i.numero_invoice, i.tipo_documento, i.data_emissao,
                    i.moeda AS invoice_moeda, i.valor_moeda AS invoice_valor_moeda,
@@ -6025,13 +7433,15 @@ def exportar_invoices():
                    cl.id AS cliente_id, cl.nome AS cliente_nome, cl.pais AS cliente_pais,
                    cp.nome AS banco_credito_nome
             FROM recebimentos_invoice r
-            JOIN invoices i ON i.id=r.invoice_id
+            LEFT JOIN invoice_recebimento_alocacoes a ON a.recebimento_id=r.id
+            JOIN invoices i ON i.id=COALESCE(a.invoice_id, r.invoice_id)
             JOIN empresas e ON e.id=i.empresa_id
             LEFT JOIN clientes cl ON cl.id=i.cliente_id
             LEFT JOIN contrapartes cp ON cp.id=r.banco_credito_id
-            WHERE r.invoice_id IN ({placeholders})
+            WHERE a.invoice_id IN ({placeholders})
+               OR (a.id IS NULL AND r.invoice_id IN ({placeholders}))
             ORDER BY """ + empresa_order_sql("e") + """, i.numero_invoice, r.data_credito, r.id
-        """, invoice_ids).fetchall()
+        """, invoice_ids + invoice_ids).fetchall()
         changes = conn.execute(f"""
             SELECT v.id AS vinculo_id, v.invoice_id, v.contrato_id,
                    v.valor_alocado, v.observacao AS vinculo_observacao,
@@ -6063,7 +7473,8 @@ def exportar_invoices():
             ORDER BY """ + empresa_order_sql("e") + """, i.numero_invoice, c.numero_contrato, v.id
         """, invoice_ids).fetchall()
         new_changes = conn.execute(f"""
-            SELECT f.id AS vinculo_id, f.invoice_id, f.contrato_id,
+            SELECT f.id AS vinculo_id, f.invoice_id, COALESCE(h.contrato_id, f.contrato_id) AS contrato_id,
+                   h.id AS fechamento_id,
                    f.valor_moeda AS valor_alocado, f.observacao AS vinculo_observacao,
                    f.created_at AS vinculo_criado_em, 'Fechamento' AS tipo_registro,
                    i.numero_invoice, i.tipo_documento, i.data_emissao,
@@ -6073,25 +7484,31 @@ def exportar_invoices():
                    cl.id AS cliente_id, cl.nome AS cliente_nome, cl.pais AS cliente_pais,
                    c.id AS contrato_registro_id, c.numero_contrato, c.banco_liquidacao_id,
                    c.banco, c.banco_id, c.banco_credito, c.banco_liquidacao,
-                   c.data_contrato, c.data_recebimento, f.data_fechamento,
-                   c.data_liquidacao, c.cnpj AS contrato_cnpj,
+                   c.data_contrato, c.data_recebimento,
+                   COALESCE(h.data_fechamento, f.data_fechamento) AS data_fechamento,
+                   COALESCE(h.data_liquidacao, c.data_liquidacao) AS data_liquidacao,
+                   h.banco_credito_id AS fechamento_banco_credito_id,
+                   bc.nome AS fechamento_banco_credito,
+                   h.banco_liquidacao_id AS fechamento_banco_liquidacao_id,
+                   bl.nome AS fechamento_banco_liquidacao,
+                   c.cnpj AS contrato_cnpj,
                    c.cliente AS contrato_cliente, c.cliente_id AS contrato_cliente_id,
                    c.moeda AS contrato_moeda, c.valor_moeda AS contrato_valor_moeda,
                    c.taxa_cambio AS contrato_taxa_cambio, c.valor_reais AS contrato_valor_reais,
+                   h.taxa_cambio AS fechamento_taxa_cambio,
+                   h.valor_brl AS fechamento_valor_brl,
                    c.status AS contrato_status, c.saldo_zerado_manual,
                    c.observacao AS contrato_observacao, c.competencia_id AS contrato_competencia_id,
                    c.created_at AS contrato_criado_em,
-                   COALESCE((SELECT SUM(x.valor_alocado)
-                             FROM invoice_contrato_cambio x
-                             WHERE x.contrato_id=c.id), 0)
-                   + COALESCE((SELECT SUM(y.valor_moeda)
-                               FROM fechamentos_cambio y
-                               WHERE y.contrato_id=c.id), 0) AS contrato_total_alocado
+                   {contract_total_sql("c")} AS contrato_total_alocado
             FROM fechamentos_cambio f
             JOIN invoices i ON i.id=f.invoice_id
             JOIN empresas e ON e.id=i.empresa_id
             LEFT JOIN clientes cl ON cl.id=i.cliente_id
-            LEFT JOIN contratos c ON c.id=f.contrato_id
+            LEFT JOIN fechamentos h ON h.id=f.fechamento_id
+            LEFT JOIN contrapartes bc ON bc.id=h.banco_credito_id
+            LEFT JOIN contrapartes bl ON bl.id=h.banco_liquidacao_id
+            LEFT JOIN contratos c ON c.id=COALESCE(h.contrato_id, f.contrato_id)
             WHERE f.invoice_id IN ({placeholders})
             ORDER BY """ + empresa_order_sql("e") + """, i.numero_invoice, f.data_fechamento, f.id
         """, invoice_ids).fetchall()
@@ -6163,6 +7580,8 @@ def exportar_invoices():
         ("competencia_descricao", "Competencia"), ("competencia_data_inicial", "Competencia - inicio"),
         ("competencia_data_final", "Competencia - fim"), ("cliente_id", "Cliente ID"),
         ("cliente_nome", "Cliente"), ("cliente_pais", "Pais do cliente"),
+        ("invoice_raiz_id", "Invoice raiz ID"), ("invoice_anterior_id", "Invoice anterior ID"),
+        ("invoice_numero_base", "Numero base da Invoice"), ("invoice_parcela", "Parcela"),
         ("banco_referenciado_id", "Banco referenciado ID"),
         ("banco_referenciado_nome", "Banco referenciado"),
         ("data_emissao", "Data de emissao"), ("data_credito", "Data de credito"),
@@ -6188,7 +7607,9 @@ def exportar_invoices():
         invoice_data.append(mapped_row(item, invoice_fields))
 
     receipt_fields = [
-        ("recebimento_id", "Recebimento ID"), ("invoice_id", "Invoice ID"),
+        ("recebimento_id", "Recebimento ID"), ("recebimento_alocacao_id", "Alocacao recebimento ID"),
+        ("recebimento_compartilhado", "Recebimento compartilhado"),
+        ("recebimento_invoice_id", "Invoice fisica do recebimento"), ("invoice_id", "Invoice ID"),
         ("numero_invoice", "Numero da Invoice"), ("tipo_documento", "Tipo"),
         ("empresa_id", "Empresa ID"), ("empresa_cnpj", "Empresa - CNPJ"),
         ("empresa_razao_social", "Empresa - Razao social"), ("empresa_apelido", "Empresa - Apelido"),
@@ -6196,7 +7617,8 @@ def exportar_invoices():
         ("data_emissao", "Data de emissao"), ("invoice_moeda", "Moeda da Invoice"),
         ("invoice_valor_moeda", "Valor da Invoice"), ("banco_credito_id", "Banco credito ID"),
         ("banco_credito_nome", "Banco de credito"), ("data_credito", "Data de credito"),
-        ("moeda", "Moeda do recebimento"), ("valor_moeda", "Valor recebido"),
+        ("moeda", "Moeda do recebimento"), ("valor_moeda", "Valor alocado na parcela"),
+        ("valor_recebimento", "Valor fisico recebido"),
         ("documento", "Documento"), ("observacao", "Observacao"),
         ("recebimento_criado_em", "Recebimento criado em"), ("invoice_status", "Status da Invoice"),
     ]
@@ -6215,12 +7637,15 @@ def exportar_invoices():
         ("empresa_razao_social", "Empresa - Razao social"), ("empresa_apelido", "Empresa - Apelido"),
         ("cliente_id", "Cliente ID"), ("cliente_nome", "Cliente"), ("cliente_pais", "Pais do cliente"),
         ("data_emissao", "Data de emissao"), ("invoice_moeda", "Moeda da Invoice"),
-        ("invoice_valor_moeda", "Valor da Invoice"), ("contrato_id", "Contrato ID"),
+        ("invoice_valor_moeda", "Valor da Invoice"), ("fechamento_id", "ID de fechamento"),
+        ("contrato_id", "Contrato ID"),
         ("numero_contrato", "Numero do Contrato Cambio"), ("banco_liquidacao_id", "Banco liquidacao ID"),
         ("banco", "Banco legado"), ("banco_id", "Banco credito ID"),
         ("banco_credito", "Banco de credito"), ("banco_liquidacao", "Banco de liquidacao"),
         ("data_contrato", "Data do contrato"), ("data_recebimento", "Data de recebimento"),
         ("data_fechamento", "Data de fechamento"), ("data_liquidacao", "Data de liquidacao"),
+        ("fechamento_taxa_cambio", "Taxa do fechamento"),
+        ("fechamento_valor_brl", "BRL do fechamento"),
         ("contrato_cnpj", "Contrato - CNPJ"), ("contrato_cliente", "Contrato - Cliente"),
         ("contrato_cliente_id", "Contrato - Cliente ID"), ("contrato_moeda", "Moeda do contrato"),
         ("contrato_valor_moeda", "Valor do contrato"), ("contrato_taxa_cambio", "Taxa de cambio"),
@@ -6312,11 +7737,13 @@ def nova_invoice():
             conn.execute("""
                 INSERT INTO invoices
                     (empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,banco_referenciado_id,
-                     data_emissao,moeda,valor_moeda,contrato_comercial,status,status_manual,data_credito,observacao)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     data_emissao,moeda,valor_moeda,contrato_comercial,status,status_manual,
+                     desdobramento_habilitado,data_credito,observacao)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (data["empresa_id"], data["numero_invoice"], data["tipo_documento"], data["competencia_id"], data["cliente_id"],
                   data["banco_referenciado_id"], data["data_emissao"], data["moeda"], data["valor_moeda"],
-                  data["contrato_comercial"], data["status"], data["status_manual"], data["data_credito"], data["observacao"]))
+                  data["contrato_comercial"], data["status"], data["status_manual"], 1,
+                  data["data_credito"], data["observacao"]))
             invoice_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.commit(); conn.close()
             flash("Invoice cadastrada com sucesso.", "success")
@@ -6367,6 +7794,16 @@ def editar_invoice(invoice_id):
         try:
             data = invoice_form_data(request.form, conn, current=current)
             summary = invoice_summary(conn, invoice_id)
+            if summary["linhagem"].get("numero_parcela") and (
+                data["empresa_id"] != current["empresa_id"]
+                or data["numero_invoice"] != current["numero_invoice"]
+                or data["tipo_documento"] != current["tipo_documento"]
+                or data["moeda"] != current["moeda"]
+                or decimal_value(data["valor_moeda"]) != decimal_value(current["valor_moeda"])
+            ):
+                raise ValueError(
+                    "Empresa, número, tipo, moeda e valor de uma Invoice desdobrada não podem ser alterados."
+                )
             if decimal_value(data["valor_moeda"]) < summary["total_recebido"]:
                 raise ValueError("O valor da Invoice não pode ficar abaixo do total recebido.")
             if decimal_value(data["valor_moeda"]) < (
@@ -6379,6 +7816,16 @@ def editar_invoice(invoice_id):
                 summary["total_fechamentos"] > SALDO_TOLERANCE
             ):
                 raise ValueError("Não é possível alterar a moeda de uma Invoice com recebimento ou câmbio vinculado.")
+            central_header = conn.execute("""
+                SELECT h.cliente_id, h.moeda
+                FROM fechamentos_cambio f JOIN fechamentos h ON h.id=f.fechamento_id
+                WHERE f.invoice_id=? LIMIT 1
+            """, (invoice_id,)).fetchone()
+            if central_header and (
+                central_header["cliente_id"] != data["cliente_id"]
+                or central_header["moeda"] != data["moeda"]
+            ):
+                raise ValueError("Cliente e moeda não podem ser alterados enquanto a Invoice pertence a um Fechamento centralizado.")
             conn.execute("""
                 UPDATE invoices SET empresa_id=?,numero_invoice=?,tipo_documento=?,competencia_id=?,cliente_id=?,data_emissao=?,
                     banco_referenciado_id=?,moeda=?,valor_moeda=?,contrato_comercial=?,status=?,status_manual=?,data_credito=?,observacao=? WHERE id=?
@@ -6404,45 +7851,109 @@ def editar_invoice(invoice_id):
         if request.method == "POST" and "banco_referenciado_id" in request.form
         else current["banco_referenciado_id"]
     )
+    editing_lineage = invoice_lineage(conn, invoice_id)
     conn.close()
     return render_template("invoice_form.html", invoice=current, empresas=empresas, clientes=clientes,
                            competencias=competencias,
                            contrapartes=contrapartes,
                            padroes_por_empresa=padroes_por_empresa,
                            banco_referenciado_id=banco_referenciado_id,
+                           invoice_lineage=editing_lineage,
                            invoice_types=INVOICE_STATUS_TYPES,
                            invoice_statuses=INVOICE_STATUS_LABELS)
+
+@app.route("/invoice/<int:invoice_id>/excluir", methods=["POST"])
+def excluir_invoice(invoice_id):
+    conn = db()
+    redirect_target = url_for("lista_invoices")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        result = delete_invoice_if_unlinked(conn, invoice_id)
+        if not result["deleted"]:
+            conn.rollback()
+            redirect_target = url_for("detalhe_invoice", invoice_id=invoice_id)
+            flash(invoice_deletion_blocked_message(result), "danger")
+        else:
+            conn.commit()
+            flash(
+                f"{invoice_deletion_label(result['invoice'])} excluída com sucesso.",
+                "success",
+            )
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    except (sqlite3.Error, OverflowError):
+        conn.rollback()
+        flash("Não foi possível concluir a exclusão da Invoice.", "danger")
+    except Exception:
+        conn.rollback()
+        flash("Não foi possível concluir a exclusão da Invoice.", "danger")
+    finally:
+        conn.close()
+    return redirect(redirect_target)
 
 @app.route("/invoice/<int:invoice_id>/recebimentos", methods=["POST"])
 def adicionar_recebimento_invoice(invoice_id):
     conn = db()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        summary = invoice_summary(conn, invoice_id)
-        if not summary:
-            raise ValueError("Invoice não encontrada.")
         amount = parse_number(request.form.get("valor_moeda"))
-        if decimal_value(amount) <= 0:
-            raise ValueError("O valor do recebimento deve ser maior que zero.")
-        validate_invoice_balances(summary, extra_recebido=amount)
-        bank = resolve_counterparty(conn, request.form.get("banco_credito_id"))
-        data_credito = parse_date(request.form.get("data_credito")) or date.today().isoformat()
-        if not data_credito:
-            raise ValueError("A data de crédito é obrigatória.")
-        conn.execute("""
-            INSERT INTO recebimentos_invoice
-                (invoice_id,banco_credito_id,data_credito,moeda,valor_moeda,documento,observacao)
-            VALUES (?,?,?,?,?,?,?)
-        """, (invoice_id, bank["id"] if bank else None, data_credito, summary["moeda"], amount,
-              (request.form.get("documento") or "").strip() or None,
-              (request.form.get("observacao") or "").strip() or None))
-        refresh_invoice_status(conn, invoice_id); sync_contracts_for_invoice(conn, invoice_id); conn.commit()
+        receipt = prepare_invoice_receipt(
+            conn, invoice_id, amount, request.form.get("banco_credito_id"),
+            request.form.get("data_credito"),
+        )
+        insert_invoice_receipt(
+            conn, receipt, request.form.get("documento"), request.form.get("observacao")
+        )
+        refresh_invoice_status_after_receipt(conn, invoice_id); sync_contracts_for_invoice(conn, invoice_id); conn.commit()
         flash("Recebimento registrado com sucesso.", "success")
     except (ValueError, sqlite3.Error) as exc:
         conn.rollback(); flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível registrar o recebimento.", "danger")
     finally:
         conn.close()
     return redirect(url_for("detalhe_invoice", invoice_id=invoice_id))
+
+
+@app.route("/invoices/recebimentos", methods=["POST"])
+def registrar_recebimentos_lote():
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        invoice_ids = selected_record_ids(request.form, "registrar recebimentos")
+        ensure_existing_record_ids(conn, "invoices", invoice_ids, "Invoices")
+
+        receipts = []
+        for invoice_id in invoice_ids:
+            summary = invoice_summary(conn, invoice_id)
+            if not summary:
+                raise ValueError("Invoice não encontrada.")
+            amount = summary["saldo_recebimento"]
+            if amount <= SALDO_TOLERANCE:
+                raise ValueError(
+                    f"A Invoice {summary['numero_invoice']} não possui saldo de recebimento."
+                )
+            receipts.append(prepare_invoice_receipt(
+                conn, invoice_id, amount, request.form.get("banco_credito_id"),
+                request.form.get("data_credito"), require_bank=True,
+            ))
+
+        for receipt in receipts:
+            insert_invoice_receipt(conn, receipt)
+        for invoice_id in invoice_ids:
+            refresh_invoice_status_after_receipt(conn, invoice_id)
+            sync_contracts_for_invoice(conn, invoice_id)
+
+        conn.commit()
+        flash(f"{len(receipts)} recebimento(s) registrado(s) com sucesso.", "success")
+    except (ValueError, sqlite3.Error, OverflowError) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível registrar os recebimentos.", "danger")
+    finally:
+        conn.close()
+    return redirect_batch_result(
+        "lista_invoices", excluded_keys={"banco_credito_id", "data_credito"}
+    )
+
 
 @app.route("/invoice/<int:invoice_id>/recebimentos/<int:receipt_id>/editar", methods=["POST"])
 def editar_recebimento_invoice(invoice_id, receipt_id):
@@ -6453,12 +7964,23 @@ def editar_recebimento_invoice(invoice_id, receipt_id):
         receipt = conn.execute("SELECT * FROM recebimentos_invoice WHERE id=? AND invoice_id=?", (receipt_id, invoice_id)).fetchone()
         if not summary or not receipt:
             raise ValueError("Recebimento não encontrado.")
+        if receipt_is_shared(conn, receipt_id):
+            raise ValueError("Este recebimento é compartilhado entre parcelas e não pode ser editado.")
         amount = parse_number(request.form.get("valor_moeda"))
         if decimal_value(amount) <= 0:
             raise ValueError("O valor do recebimento deve ser maior que zero.")
         new_received = summary["total_recebido"] - decimal_value(receipt["valor_moeda"]) + decimal_value(amount)
         validate_invoice_balances(summary, replacement_recebido=new_received)
-        bank = resolve_counterparty(conn, request.form.get("banco_credito_id"))
+        central_header = conn.execute("""
+            SELECT h.banco_credito_id FROM fechamentos_cambio f
+            JOIN fechamentos h ON h.id=f.fechamento_id
+            WHERE f.invoice_id=? LIMIT 1
+        """, (invoice_id,)).fetchone()
+        bank = resolve_counterparty(
+            conn, request.form.get("banco_credito_id"), required=bool(central_header)
+        )
+        if central_header and bank["id"] != central_header["banco_credito_id"]:
+            raise ValueError("O Banco de Crédito deve permanecer igual ao do Fechamento centralizado.")
         data_credito = parse_date(request.form.get("data_credito")) or receipt["data_credito"] or date.today().isoformat()
         if not data_credito:
             raise ValueError("A data de crédito é obrigatória.")
@@ -6468,7 +7990,7 @@ def editar_recebimento_invoice(invoice_id, receipt_id):
         """, (bank["id"] if bank else None, data_credito, amount,
               (request.form.get("documento") or "").strip() or None,
               (request.form.get("observacao") or "").strip() or None, receipt_id, invoice_id))
-        refresh_invoice_status(conn, invoice_id); sync_contracts_for_invoice(conn, invoice_id); conn.commit(); flash("Recebimento atualizado com sucesso.", "success")
+        refresh_invoice_status_after_receipt(conn, invoice_id); sync_contracts_for_invoice(conn, invoice_id); conn.commit(); flash("Recebimento atualizado com sucesso.", "success")
     except (ValueError, sqlite3.Error) as exc:
         conn.rollback(); flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível atualizar o recebimento.", "danger")
     finally:
@@ -6484,8 +8006,23 @@ def excluir_recebimento_invoice(invoice_id, receipt_id):
         receipt = conn.execute("SELECT valor_moeda FROM recebimentos_invoice WHERE id=? AND invoice_id=?", (receipt_id, invoice_id)).fetchone()
         if not summary or not receipt:
             raise ValueError("Recebimento não encontrado.")
+        if receipt_is_shared(conn, receipt_id):
+            raise ValueError("Este recebimento é compartilhado entre parcelas e não pode ser excluído.")
         new_received = summary["total_recebido"] - decimal_value(receipt["valor_moeda"])
         validate_invoice_balances(summary, replacement_recebido=new_received)
+        central_header = conn.execute("""
+            SELECT h.banco_credito_id FROM fechamentos_cambio f
+            JOIN fechamentos h ON h.id=f.fechamento_id
+            WHERE f.invoice_id=? LIMIT 1
+        """, (invoice_id,)).fetchone()
+        if central_header:
+            remaining = conn.execute("""
+                SELECT DISTINCT banco_credito_id FROM recebimentos_invoice
+                WHERE invoice_id=? AND id<>?
+            """, (invoice_id, receipt_id)).fetchall()
+            remaining_ids = {row[0] for row in remaining}
+            if not remaining or None in remaining_ids or remaining_ids != {central_header["banco_credito_id"]}:
+                raise ValueError("Não é possível remover o último recebimento ou alterar os Bancos de Crédito de um Fechamento centralizado.")
         conn.execute("DELETE FROM recebimentos_invoice WHERE id=? AND invoice_id=?", (receipt_id, invoice_id))
         refresh_invoice_status(conn, invoice_id); sync_contracts_for_invoice(conn, invoice_id); conn.commit(); flash("Recebimento excluído com sucesso.", "success")
     except (ValueError, sqlite3.Error) as exc:
@@ -6561,7 +8098,9 @@ def excluir_cambio_invoice(invoice_id, link_id):
         if not conn.execute("""SELECT 1 FROM invoice_contrato_cambio WHERE contrato_id=?
                               UNION ALL
                               SELECT 1 FROM fechamentos_cambio WHERE contrato_id=?
-                              LIMIT 1""", (link["contrato_id"], link["contrato_id"])).fetchone():
+                              UNION ALL
+                              SELECT 1 FROM fechamentos WHERE contrato_id=?
+                              LIMIT 1""", (link["contrato_id"], link["contrato_id"], link["contrato_id"])).fetchone():
             if conn.execute("SELECT 1 FROM due_contratos WHERE contrato_id=?", (link["contrato_id"],)).fetchone():
                 raise ValueError("O Contrato Câmbio possui vínculo direto com DU-E e não pode ficar sem Invoice.")
             conn.execute("DELETE FROM contratos WHERE id=?", (link["contrato_id"],))
@@ -6580,12 +8119,15 @@ def adicionar_fechamento_cambio(invoice_id):
         summary = invoice_summary(conn, invoice_id)
         if not summary:
             raise ValueError("Invoice não encontrada.")
+        if summary["fechamentos_ids"]:
+            raise ValueError("Esta Invoice já pertence a um Fechamento centralizado; use a Gestão de Fechamentos para registrar outro grupo.")
         amount = parse_number(request.form.get("valor_moeda"))
         if decimal_value(amount) <= 0:
             raise ValueError("O valor do fechamento deve ser maior que zero.")
         data_fechamento = parse_date(request.form.get("data_fechamento")) or date.today().isoformat()
         validate_invoice_closing_total(summary, summary["total_fechamentos"] + decimal_value(amount))
         contrato_id = contract_for_fechamento(conn, summary, request.form, data_fechamento)
+        child_id = split_invoice_for_closing(conn, summary, amount)
         conn.execute("""
             INSERT INTO fechamentos_cambio
                 (invoice_id,contrato_id,moeda,valor_moeda,data_fechamento,observacao)
@@ -6596,7 +8138,11 @@ def adicionar_fechamento_cambio(invoice_id):
         ))
         if contrato_id:
             sync_contract_cache(conn, contrato_id)
-        refresh_invoice_status(conn, invoice_id)
+        if child_id:
+            refresh_invoice_status(conn, invoice_id, force=True)
+            refresh_invoice_status(conn, child_id, force=True)
+        else:
+            refresh_invoice_status_after_closing(conn, invoice_id)
         conn.commit()
         flash("Fechamento de câmbio registrado com sucesso.", "success")
     except (ValueError, sqlite3.Error) as exc:
@@ -6618,9 +8164,13 @@ def editar_fechamento_cambio(invoice_id, fechamento_id):
         ).fetchone()
         if not summary or not fechamento:
             raise ValueError("Fechamento de câmbio não encontrado.")
+        if fechamento["fechamento_id"]:
+            raise ValueError("Este item pertence a um grupo centralizado; edite o Fechamento pela Gestão de Fechamentos.")
         amount = parse_number(request.form.get("valor_moeda"))
         if decimal_value(amount) <= 0:
             raise ValueError("O valor do fechamento deve ser maior que zero.")
+        if summary["linhagem"].get("numero_parcela") and decimal_value(amount) != decimal_value(fechamento["valor_moeda"]):
+            raise ValueError("O valor do fechamento de uma parcela gerada não pode ser alterado manualmente.")
         total_fechamentos = (
             summary["total_fechamentos"]
             - decimal_value(fechamento["valor_moeda"])
@@ -6641,7 +8191,7 @@ def editar_fechamento_cambio(invoice_id, fechamento_id):
         ))
         for contract_id in {old_contract_id, contrato_id} - {None}:
             sync_contract_cache(conn, contract_id)
-        refresh_invoice_status(conn, invoice_id)
+        refresh_invoice_status_after_closing(conn, invoice_id)
         conn.commit()
         flash("Fechamento de câmbio atualizado com sucesso.", "success")
     except (ValueError, sqlite3.Error) as exc:
@@ -6657,15 +8207,17 @@ def excluir_fechamento_cambio(invoice_id, fechamento_id):
     try:
         conn.execute("BEGIN IMMEDIATE")
         fechamento = conn.execute(
-            "SELECT contrato_id FROM fechamentos_cambio WHERE id=? AND invoice_id=?",
+            "SELECT contrato_id, fechamento_id FROM fechamentos_cambio WHERE id=? AND invoice_id=?",
             (fechamento_id, invoice_id),
         ).fetchone()
         if not fechamento:
             raise ValueError("Fechamento de câmbio não encontrado.")
+        if fechamento["fechamento_id"]:
+            raise ValueError("Este item pertence a um grupo centralizado; exclua o grupo pela Gestão de Fechamentos.")
         conn.execute("DELETE FROM fechamentos_cambio WHERE id=? AND invoice_id=?", (fechamento_id, invoice_id))
         if fechamento["contrato_id"]:
             sync_contract_cache(conn, fechamento["contrato_id"])
-        refresh_invoice_status(conn, invoice_id)
+        refresh_invoice_status_after_closing(conn, invoice_id)
         conn.commit()
         flash("Fechamento de câmbio excluído com sucesso.", "success")
     except (ValueError, sqlite3.Error) as exc:
@@ -6689,13 +8241,15 @@ def vincular_fechamento_contrato(contrato_id):
         invoice = conn.execute("SELECT * FROM invoices WHERE id=?", (fechamento["invoice_id"],)).fetchone() if fechamento else None
         if not contrato or not fechamento or not invoice:
             raise ValueError("Contrato ou fechamento de câmbio não encontrado.")
+        if fechamento["fechamento_id"]:
+            raise ValueError("Itens de um Fechamento centralizado devem ser geridos pela Gestão de Fechamentos.")
         if contrato["moeda"] != invoice["moeda"] and contract_has_exchange_links(conn, contrato_id):
             raise ValueError("A moeda do Contrato Câmbio deve ser igual à moeda da Invoice.")
         if contrato["moeda"] != invoice["moeda"]:
             conn.execute("UPDATE contratos SET moeda=? WHERE id=?", (invoice["moeda"], contrato_id))
         conn.execute("UPDATE fechamentos_cambio SET contrato_id=? WHERE id=?", (contrato_id, fechamento_id))
         sync_contract_cache(conn, contrato_id)
-        refresh_invoice_status(conn, invoice["id"])
+        refresh_invoice_status_after_closing(conn, invoice["id"])
         conn.commit()
         flash("Fechamento de câmbio vinculado ao Contrato com sucesso.", "success")
     except (ValueError, sqlite3.Error) as exc:
