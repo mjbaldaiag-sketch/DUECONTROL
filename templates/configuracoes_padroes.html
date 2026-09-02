@@ -1,0 +1,16 @@
+{% extends "base.html" %}{% block content %}
+<div class="page-heading"><div><h1>Configurações Padrão</h1><p class="muted">Defina os bancos preenchidos automaticamente nos novos formulários de cada empresa.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
+{% if not empresas %}<div class="flash danger company-help">Cadastre uma empresa antes de configurar os padrões.</div><a class="btn secondary" href="{{ url_for('cadastro_empresas') }}">Cadastrar minhas empresas</a>{% endif %}
+<form method="post" class="form default-settings-form">
+  <h2>Configurar bancos padrão</h2>
+  <label>Empresa*<select name="empresa_id" required><option value="">Selecione uma empresa</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if (form_values.empresa_id|string) == (empresa.id|string) else '' }}>{{ empresa.apelido or empresa.razao_social }} — {{ empresa.cnpj|cnpj }}</option>{% endfor %}</select></label>
+  <fieldset class="default-settings-group"><legend>Baixa de Recebimento</legend><label>Banco Crédito<select name="banco_credito_id"><option value="">Nenhum padrão</option>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if (form_values.banco_credito_id|string) == (banco.id|string) else '' }}>{{ banco.nome }}</option>{% endfor %}</select><small class="muted">Preenchido em novos recebimentos.</small></label></fieldset>
+  <fieldset class="default-settings-group"><legend>Dados da Invoice</legend><label>Banco Referenciado<select name="banco_referenciado_id"><option value="">Nenhum padrão</option>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if (form_values.banco_referenciado_id|string) == (banco.id|string) else '' }}>{{ banco.nome }}</option>{% endfor %}</select><small class="muted">Preenchido em novas Invoices.</small></label></fieldset>
+  <fieldset class="default-settings-group"><legend>Fechamento de Câmbio</legend><label>Banco Liquidação<select name="banco_liquidacao_id"><option value="">Nenhum padrão</option>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if (form_values.banco_liquidacao_id|string) == (banco.id|string) else '' }}>{{ banco.nome }}</option>{% endfor %}</select><small class="muted">Preenchido em novos fechamentos e contratos derivados.</small></label></fieldset>
+  <div class="form-actions"><button>Salvar configurações</button><a class="btn secondary" href="{{ url_for('configuracoes') }}">Cancelar</a></div>
+</form>
+<h2>Padrões por empresa</h2>
+<div class="table-wrap"><table><thead><tr><th>Empresa</th><th>Banco Crédito</th><th>Banco Referenciado</th><th>Banco Liquidação</th><th>Ação</th></tr></thead><tbody>
+{% for item in configuracoes %}<tr><td>{{ item.apelido or item.razao_social }}</td><td>{{ item.banco_credito_nome or '-' }}</td><td>{{ item.banco_referenciado_nome or '-' }}</td><td>{{ item.banco_liquidacao_nome or '-' }}</td><td><a href="{{ url_for('configuracoes_padroes', empresa_id=item.empresa_id) }}">Editar</a></td></tr>{% else %}<tr><td colspan="5" class="empty">Nenhuma empresa cadastrada.</td></tr>{% endfor %}
+</tbody></table></div>
+{% endblock %}

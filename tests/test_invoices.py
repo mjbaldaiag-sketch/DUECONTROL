@@ -649,7 +649,7 @@ class InvoiceFlowTests(unittest.TestCase):
         ))
         conn.close()
 
-    def test_schema_migrates_v1_to_v5_without_recreating_existing_contracts(self):
+    def test_schema_migrates_v1_to_v6_without_recreating_existing_contracts(self):
         migration_path = Path(tempfile.mktemp(prefix="duecontrol_invoice_migration_", suffix=".db"))
         previous_db = app.DB
         try:
@@ -716,7 +716,10 @@ class InvoiceFlowTests(unittest.TestCase):
 
             app.init_db()
             conn = app.db()
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                app.INVOICE_SCHEMA_VERSION,
+            )
             self.assertIsNotNone(conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='fechamentos_cambio'"
             ).fetchone())

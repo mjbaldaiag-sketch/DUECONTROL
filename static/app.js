@@ -254,6 +254,19 @@
     select.addEventListener('change', update);
     update();
   });
+  document.querySelectorAll('[data-invoice-default-bank]').forEach((bankSelect) => {
+    const form = bankSelect.closest('form');
+    const companySelect = form ? form.querySelector('[data-invoice-company-select]') : null;
+    if (!companySelect) return;
+    const applyDefault = () => {
+      if (bankSelect.value) return;
+      const companyOption = companySelect.selectedOptions[0];
+      const defaultBankId = companyOption ? companyOption.dataset.defaultBancoReferenciado : '';
+      if (defaultBankId) bankSelect.value = defaultBankId;
+    };
+    companySelect.addEventListener('change', applyDefault);
+    applyDefault();
+  });
   document.querySelectorAll('[data-competencia-select]').forEach((select) => {
     const form = select.closest('form');
     const empresa = form ? form.querySelector('select[name="empresa_id"]') : null;

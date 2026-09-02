@@ -25,7 +25,7 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 5
+INVOICE_SCHEMA_VERSION = 6
 
 SALDO_TOLERANCE = Decimal("0.005")
 STATUS_PENDENTE = "PENDENTE"
@@ -203,6 +203,23 @@ def init_db():
         nome TEXT NOT NULL COLLATE NOCASE UNIQUE,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS configuracoes_padrao (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        empresa_id INTEGER NOT NULL UNIQUE,
+        banco_credito_id INTEGER,
+        banco_referenciado_id INTEGER,
+        banco_liquidacao_id INTEGER,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE CASCADE,
+        FOREIGN KEY (banco_credito_id) REFERENCES contrapartes(id) ON DELETE SET NULL,
+        FOREIGN KEY (banco_referenciado_id) REFERENCES contrapartes(id) ON DELETE SET NULL,
+        FOREIGN KEY (banco_liquidacao_id) REFERENCES contrapartes(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_configuracoes_padrao_empresa
+        ON configuracoes_padrao(empresa_id);
 
     CREATE TABLE IF NOT EXISTS dues (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1366,6 +1383,42 @@ def contrapartes_for_form(conn):
         FROM contrapartes
         ORDER BY nome
     """).fetchall()
+
+def configuracoes_padrao_for_empresa(conn, empresa_id):
+    """Retorna os bancos padrão da empresa, sem aplicar qualquer fallback."""
+    if empresa_id in (None, ""):
+        return None
+    try:
+        empresa_id = int(empresa_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("""
+        SELECT empresa_id, banco_credito_id, banco_referenciado_id, banco_liquidacao_id
+        FROM configuracoes_padrao
+        WHERE empresa_id=?
+    """, (empresa_id,)).fetchone()
+
+def configuracoes_padrao_por_empresa(conn):
+    """Monta o mapa usado para preencher defaults ao trocar a empresa da Invoice."""
+    rows = conn.execute("""
+        SELECT empresa_id, banco_credito_id, banco_referenciado_id, banco_liquidacao_id
+        FROM configuracoes_padrao
+    """).fetchall()
+    return {row["empresa_id"]: row for row in rows}
+
+def configuracoes_padrao_form_data(form, conn):
+    try:
+        empresa_id = int(form.get("empresa_id"))
+    except (TypeError, ValueError):
+        raise ValueError("Selecione uma empresa cadastrada.")
+    if not conn.execute("SELECT id FROM empresas WHERE id=?", (empresa_id,)).fetchone():
+        raise ValueError("A empresa selecionada não foi encontrada.")
+
+    bancos = {}
+    for field in ("banco_credito_id", "banco_referenciado_id", "banco_liquidacao_id"):
+        banco = contraparte_da_selecao(conn, form.get(field))
+        bancos[field] = banco["id"] if banco else None
+    return {"empresa_id": empresa_id, **bancos}
 
 def form_record_id(value, fallback=None):
     if value in (None, ""):
@@ -6276,21 +6329,33 @@ def nova_invoice():
     clientes = clientes_for_form(conn)
     competencias = competencias_for_empresa(conn, None)
     contrapartes = contrapartes_for_form(conn)
+    padroes_por_empresa = configuracoes_padrao_por_empresa(conn)
+    banco_referenciado_id = (
+        form_record_id(request.form.get("banco_referenciado_id"))
+        if request.method == "POST" and "banco_referenciado_id" in request.form
+        else None
+    )
     conn.close()
     return render_template("invoice_form.html", invoice=None, empresas=empresas, clientes=clientes,
                            competencias=competencias,
                            contrapartes=contrapartes,
+                           padroes_por_empresa=padroes_por_empresa,
+                           banco_referenciado_id=banco_referenciado_id,
                            invoice_types=INVOICE_STATUS_TYPES,
                            invoice_statuses=INVOICE_STATUS_LABELS)
 
 @app.route("/invoice/<int:invoice_id>")
 def detalhe_invoice(invoice_id):
-    conn = db(); data = invoice_detail_data(conn, invoice_id); conn.close()
+    conn = db(); data = invoice_detail_data(conn, invoice_id)
     if not data:
+        conn.close()
         return "Invoice não encontrada", 404
     invoice, empresas, clientes, contrapartes, dues, contratos = data
+    padroes = configuracoes_padrao_for_empresa(conn, invoice["empresa_id"])
+    conn.close()
     return render_template("invoice_detail.html", invoice=invoice, empresas=empresas, clientes=clientes,
                            contrapartes=contrapartes, dues=dues, contratos=contratos,
+                           padroes=padroes,
                            invoice_types=INVOICE_STATUS_TYPES)
 
 @app.route("/invoice/<int:invoice_id>/editar", methods=["GET", "POST"])
@@ -6333,10 +6398,18 @@ def editar_invoice(invoice_id):
     clientes = clientes_for_form(conn)
     competencias = competencias_for_empresa(conn, None)
     contrapartes = contrapartes_for_form(conn)
+    padroes_por_empresa = configuracoes_padrao_por_empresa(conn)
+    banco_referenciado_id = (
+        form_record_id(request.form.get("banco_referenciado_id"))
+        if request.method == "POST" and "banco_referenciado_id" in request.form
+        else current["banco_referenciado_id"]
+    )
     conn.close()
     return render_template("invoice_form.html", invoice=current, empresas=empresas, clientes=clientes,
                            competencias=competencias,
                            contrapartes=contrapartes,
+                           padroes_por_empresa=padroes_por_empresa,
+                           banco_referenciado_id=banco_referenciado_id,
                            invoice_types=INVOICE_STATUS_TYPES,
                            invoice_statuses=INVOICE_STATUS_LABELS)
 
