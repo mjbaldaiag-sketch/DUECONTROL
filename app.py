@@ -25,12 +25,18 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 10
+INVOICE_SCHEMA_VERSION = 12
 
 SALDO_TOLERANCE = Decimal("0.005")
 STATUS_PENDENTE = "PENDENTE"
 STATUS_CONCLUIDO = "CONCLUÍDO"
 STATUS_PARCIAL = "PARCIAL"
+CATEGORIA_CAMBIO_EXPORTACAO = "Câmbio Exportação"
+CATEGORIA_CAMBIO_FINANCEIRO = "Câmbio Financeiro"
+CATEGORIAS_CAMBIO = (
+    CATEGORIA_CAMBIO_EXPORTACAO,
+    CATEGORIA_CAMBIO_FINANCEIRO,
+)
 INVOICE_STATUS_AGUARDANDO_RECEBIMENTO = "AGUARDANDO_RECEBIMENTO"
 # Mantido como alias de compatibilidade com o estado calculado antigo, que
 # possuía uma opção PARCIAL separada.
@@ -72,6 +78,22 @@ def normalize_invoice_status(value, default=None):
             "Status de Invoice invalido. Use: " + ", ".join(INVOICE_STATUS_OPTIONS) + "."
         )
     return normalized
+
+
+def normalize_cambio_category(value, required=True):
+    """Valida a categoria do fechamento sem degradar acentuação/UTF-8."""
+    category = str(value or "").strip()
+    if not category:
+        if required:
+            raise ValueError("A Categoria Câmbio é obrigatória.")
+        return CATEGORIA_CAMBIO_EXPORTACAO
+    if category not in CATEGORIAS_CAMBIO:
+        raise ValueError(
+            "Selecione uma Categoria Câmbio válida: "
+            + ", ".join(CATEGORIAS_CAMBIO)
+            + "."
+        )
+    return category
 INVOICE_STATUS_TYPES = (
     "PROFORMA", "COMMERCIAL_INVOICE", "SERVICE_INVOICE", "DEBIT_NOTE"
 )
@@ -429,6 +451,7 @@ def init_db():
                     cliente TEXT,
                     cliente_id INTEGER,
                     competencia_id INTEGER,
+                    categoria_cambio TEXT NOT NULL DEFAULT 'Câmbio Exportação',
                     saldo_zerado_manual INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (banco_liquidacao_id) REFERENCES contrapartes(id) ON DELETE SET NULL
                 )
@@ -452,6 +475,7 @@ def init_db():
                 cliente_id INTEGER NOT NULL,
                 banco_credito_id INTEGER NOT NULL,
                 moeda TEXT NOT NULL,
+                categoria_cambio TEXT NOT NULL DEFAULT 'Câmbio Exportação',
                 data_fechamento TEXT NOT NULL,
                 data_liquidacao TEXT NOT NULL,
                 banco_liquidacao_id INTEGER NOT NULL,
@@ -602,6 +626,16 @@ def init_db():
             conn.execute("ALTER TABLE fechamentos ADD COLUMN taxa_cambio REAL")
         if "valor_brl" not in header_columns:
             conn.execute("ALTER TABLE fechamentos ADD COLUMN valor_brl REAL")
+        if "categoria_cambio" not in header_columns:
+            conn.execute(
+                "ALTER TABLE fechamentos ADD COLUMN categoria_cambio TEXT "
+                "NOT NULL DEFAULT 'Câmbio Exportação'"
+            )
+        conn.execute(
+            "UPDATE fechamentos SET categoria_cambio=? "
+            "WHERE categoria_cambio IS NULL OR TRIM(categoria_cambio)=''",
+            (CATEGORIA_CAMBIO_EXPORTACAO,),
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fechamentos_cambio_fechamento ON fechamentos_cambio(fechamento_id)")
         conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_fechamentos_cambio_grupo_invoice
                        ON fechamentos_cambio(fechamento_id, invoice_id)
@@ -718,6 +752,37 @@ def init_db():
             conn.execute("ALTER TABLE contratos ADD COLUMN cliente_id INTEGER")
         if "saldo_zerado_manual" not in contrato_columns:
             conn.execute("ALTER TABLE contratos ADD COLUMN saldo_zerado_manual INTEGER NOT NULL DEFAULT 0")
+        if "categoria_cambio" not in contrato_columns:
+            conn.execute(
+                "ALTER TABLE contratos ADD COLUMN categoria_cambio TEXT "
+                "NOT NULL DEFAULT 'Câmbio Exportação'"
+            )
+        conn.execute(
+            "UPDATE contratos SET categoria_cambio=? "
+            "WHERE categoria_cambio IS NULL OR TRIM(categoria_cambio)=''",
+            (CATEGORIA_CAMBIO_EXPORTACAO,),
+        )
+        conn.execute(
+            """
+            UPDATE contratos
+            SET categoria_cambio=(
+                SELECT h.categoria_cambio
+                FROM fechamentos h
+                WHERE h.contrato_id=contratos.id
+                  AND h.categoria_cambio IN (?, ?)
+                ORDER BY h.id DESC
+                LIMIT 1
+            )
+            WHERE EXISTS (
+                SELECT 1
+                FROM fechamentos h
+                WHERE h.contrato_id=contratos.id
+                  AND h.categoria_cambio IN (?, ?)
+            )
+            """,
+            (CATEGORIA_CAMBIO_EXPORTACAO, CATEGORIA_CAMBIO_FINANCEIRO,
+             CATEGORIA_CAMBIO_EXPORTACAO, CATEGORIA_CAMBIO_FINANCEIRO),
+        )
         if "competencia_id" not in contrato_columns:
             conn.execute("ALTER TABLE contratos ADD COLUMN competencia_id INTEGER")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contratos_data_contrato ON contratos(data_contrato)")
@@ -1824,6 +1889,10 @@ def update_due_status(conn, due_id):
 def update_contract_status(conn, contrato_id):
     row = conn.execute(f"""
         SELECT c.valor_moeda, c.saldo_zerado_manual,
+               COALESCE(NULLIF(TRIM(c.categoria_cambio), ''),
+                        (SELECT h.categoria_cambio FROM fechamentos h
+                         WHERE h.contrato_id=c.id ORDER BY h.id DESC LIMIT 1),
+                        'Câmbio Exportação') AS categoria_cambio,
                {contract_total_sql("c")} AS valor_moeda_consolidado,
                COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END), 0) AS vinculado
         FROM contratos c
@@ -1834,8 +1903,18 @@ def update_contract_status(conn, contrato_id):
     if not row:
         return None
     total = decimal_value(row["valor_moeda_consolidado"])
-    saldo = Decimal("0") if row["saldo_zerado_manual"] else contract_balance(total, row["vinculado"])
-    status = STATUS_CONCLUIDO if row["saldo_zerado_manual"] else status_from_balance(saldo, row["vinculado"])
+    categoria = normalize_cambio_category(row["categoria_cambio"], required=False)
+    financeiro = categoria == CATEGORIA_CAMBIO_FINANCEIRO
+    saldo = (
+        Decimal("0")
+        if row["saldo_zerado_manual"] or financeiro
+        else contract_balance(total, row["vinculado"])
+    )
+    status = (
+        STATUS_CONCLUIDO
+        if row["saldo_zerado_manual"] or financeiro
+        else status_from_balance(saldo, row["vinculado"])
+    )
     conn.execute("UPDATE contratos SET status=? WHERE id=?", (status, contrato_id))
     return status
 
@@ -1864,8 +1943,20 @@ def decorate_contract(row):
     data["valor_moeda"] = decimal_value(data.get("valor_moeda"))
     data["vinculado"] = decimal_value(data.get("vinculado"))
     data["saldo_zerado_manual"] = bool(data.get("saldo_zerado_manual"))
-    data["saldo"] = Decimal("0") if data["saldo_zerado_manual"] else contract_balance(data.get("valor_moeda"), data["vinculado"])
-    data["status"] = STATUS_CONCLUIDO if data["saldo_zerado_manual"] else status_from_balance(data["saldo"], data["vinculado"])
+    data["categoria_cambio"] = normalize_cambio_category(
+        data.get("categoria_cambio"), required=False
+    )
+    financeiro = data["categoria_cambio"] == CATEGORIA_CAMBIO_FINANCEIRO
+    data["saldo"] = (
+        Decimal("0")
+        if data["saldo_zerado_manual"] or financeiro
+        else contract_balance(data.get("valor_moeda"), data["vinculado"])
+    )
+    data["status"] = (
+        STATUS_CONCLUIDO
+        if data["saldo_zerado_manual"] or financeiro
+        else status_from_balance(data["saldo"], data["vinculado"])
+    )
     return data
 
 @app.template_filter("ndf_status_class")
@@ -2111,6 +2202,10 @@ def render_ptax_page(previsao=None, consulta=None):
 def contract_summary(conn, contrato_id):
     row = conn.execute(f"""
         SELECT c.id, c.numero_contrato, c.moeda, c.valor_moeda, c.status,
+               COALESCE(NULLIF(TRIM(c.categoria_cambio), ''),
+                        (SELECT h.categoria_cambio FROM fechamentos h
+                         WHERE h.contrato_id=c.id ORDER BY h.id DESC LIMIT 1),
+                        'Câmbio Exportação') AS categoria_cambio,
                {contract_total_sql("c")} AS valor_moeda_consolidado,
                c.saldo_zerado_manual,
                COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0) AS vinculado
@@ -2157,27 +2252,89 @@ def index():
         "contratos_sem_vinculo": conn.execute("""
             SELECT COUNT(*) FROM contratos c
             WHERE NOT EXISTS (SELECT 1 FROM due_contratos v WHERE v.contrato_id=c.id)
-        """).fetchone()[0],
+              AND COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), 'Câmbio Exportação')<>?
+        """, (CATEGORIA_CAMBIO_FINANCEIRO,)).fetchone()[0],
     }
     conn.close()
     return render_template("index.html", dues=dues, contratos=contratos, resumo=resumo)
 
+def contratos_filtros_valores(args):
+    """Retorna os valores brutos dos filtros exibidos na lista de contratos."""
+    return {
+        "numero_contrato": (args.get("numero_contrato") or "").strip(),
+        "empresa_id": form_record_id(args.get("empresa_id")),
+        "cliente_id": form_record_id(args.get("cliente_id")),
+        "categoria_cambio": (args.get("categoria_cambio") or "").strip(),
+        "data_contrato_de": (args.get("data_contrato_de") or "").strip(),
+        "data_contrato_ate": (args.get("data_contrato_ate") or "").strip(),
+        "data_liquidacao_de": (args.get("data_liquidacao_de") or "").strip(),
+        "data_liquidacao_ate": (args.get("data_liquidacao_ate") or "").strip(),
+        "status": (args.get("status") or "").strip(),
+    }
+
+
 def contratos_filtros(args):
-    empresa_id = form_record_id(args.get("empresa_id"))
-    competencia_id = form_record_id(args.get("competencia_id"))
-    numero_contrato = (args.get("numero_contrato") or "").strip()
+    filtros = contratos_filtros_valores(args)
     where, params = [], []
-    if numero_contrato:
-        where.append("c.numero_contrato LIKE ?"); params.append(f"%{numero_contrato}%")
-    if empresa_id:
-        where.append("e.id=?"); params.append(empresa_id)
-    if competencia_id:
-        where.append("c.competencia_id=?"); params.append(competencia_id)
+    if filtros["numero_contrato"]:
+        where.append("c.numero_contrato LIKE ?")
+        params.append(f"%{filtros['numero_contrato']}%")
+    if filtros["empresa_id"]:
+        where.append("e.id=?")
+        params.append(filtros["empresa_id"])
+    if filtros["cliente_id"]:
+        where.append("c.cliente_id=?")
+        params.append(filtros["cliente_id"])
+    if filtros["categoria_cambio"]:
+        if filtros["categoria_cambio"] not in CATEGORIAS_CAMBIO:
+            raise ValueError(
+                "Selecione uma Categoria Câmbio válida: "
+                + ", ".join(CATEGORIAS_CAMBIO)
+                + "."
+            )
+        where.append("COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), ?) = ?")
+        params.extend([CATEGORIA_CAMBIO_EXPORTACAO, filtros["categoria_cambio"]])
+    if filtros["status"]:
+        status_options = (STATUS_PENDENTE, STATUS_PARCIAL, STATUS_CONCLUIDO)
+        if filtros["status"] not in status_options:
+            raise ValueError(
+                "Selecione um status válido: " + ", ".join(status_options) + "."
+            )
+        where.append("c.status=?")
+        params.append(filtros["status"])
+
+    datas = {
+        "data_contrato_de": "c.data_contrato >= ?",
+        "data_contrato_ate": "c.data_contrato <= ?",
+        "data_liquidacao_de": "c.data_liquidacao >= ?",
+        "data_liquidacao_ate": "c.data_liquidacao <= ?",
+    }
+    datas_parseadas = {}
+    for campo, expressao in datas.items():
+        valor = filtros[campo]
+        if valor:
+            datas_parseadas[campo] = parse_date(valor)
+            where.append(expressao)
+            params.append(datas_parseadas[campo])
+
+    for inicio, fim, descricao in (
+        ("data_contrato_de", "data_contrato_ate", "Data do contrato"),
+        ("data_liquidacao_de", "data_liquidacao_ate", "Data de liquidação"),
+    ):
+        if (
+            inicio in datas_parseadas
+            and fim in datas_parseadas
+            and datas_parseadas[inicio] > datas_parseadas[fim]
+        ):
+            raise ValueError(
+                f"O período de {descricao} não pode ter a data inicial posterior à data final."
+            )
+
     clause = " WHERE " + " AND ".join(where) if where else ""
-    return empresa_id, competencia_id, clause, params
+    return filtros, clause, params
 
 def consulta_contratos(conn, args):
-    empresa_id, competencia_id, clause, params = contratos_filtros(args)
+    filtros, clause, params = contratos_filtros(args)
     rows = conn.execute(f"""
         SELECT c.*, e.id AS empresa_id_filtro, e.razao_social AS empresa_razao_social,
                e.apelido AS empresa_apelido, comp.descricao AS competencia_descricao,
@@ -2190,19 +2347,30 @@ def consulta_contratos(conn, args):
         {clause}
         GROUP BY c.id ORDER BY """ + empresa_order_sql("e") + """, c.id DESC
     """, params).fetchall()
-    return rows, empresa_id, competencia_id
+    return rows, filtros
 
 @app.route("/contratos")
 def lista_contratos():
     conn = db()
-    rows, empresa_id, competencia_id = consulta_contratos(conn, request.args)
+    filtros = contratos_filtros_valores(request.args)
+    try:
+        rows, filtros = consulta_contratos(conn, request.args)
+    except ValueError as exc:
+        flash(str(exc), "danger")
+        rows = []
     contratos = [decorate_contract(row) for row in rows]
     empresas = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
-    competencias = conn.execute("""SELECT id, descricao, data_inicial, data_final, empresa_id
-        FROM competencias ORDER BY data_inicial DESC, descricao, id""").fetchall()
+    clientes = clientes_for_form(conn)
     conn.close()
-    return render_template("contratos.html", contratos=contratos, empresas=empresas, competencias=competencias,
-                           empresa_id=empresa_id, competencia_id=competencia_id)
+    return render_template(
+        "contratos.html",
+        contratos=contratos,
+        empresas=empresas,
+        clientes=clientes,
+        categorias_cambio=CATEGORIAS_CAMBIO,
+        status_options=(STATUS_PENDENTE, STATUS_PARCIAL, STATUS_CONCLUIDO),
+        **filtros,
+    )
 
 @app.route("/contratos/excluir-lote", methods=["POST"])
 def excluir_contratos_lote():
@@ -2272,7 +2440,11 @@ def exportar_contratos():
     from openpyxl.utils import get_column_letter
 
     conn = db()
-    rows, _, _ = consulta_contratos(conn, request.args)
+    try:
+        rows, _ = consulta_contratos(conn, request.args)
+    except ValueError as exc:
+        conn.close()
+        return str(exc), 400
     contrato_ids = [row["id"] for row in rows]
     vinculos = []
     if contrato_ids:
@@ -2310,6 +2482,7 @@ def exportar_contratos():
         "data_liquidacao": "Data de liquidação", "cnpj": "CNPJ", "cliente": "Cliente",
         "moeda": "Moeda", "valor_moeda": "Valor na moeda", "taxa_cambio": "Taxa de câmbio",
         "valor_reais": "Valor em reais", "status": "Status", "saldo_zerado_manual": "Saldo zerado manualmente",
+        "categoria_cambio": "Categoria Câmbio",
         "observacao": "Observação", "created_at": "Criado em", "competencia_id": "Competência ID",
         "empresa_id_filtro": "Empresa ID", "empresa_razao_social": "Empresa - Razão social",
         "empresa_apelido": "Empresa - Apelido", "competencia_descricao": "Competência",
@@ -2670,6 +2843,7 @@ def build_contract_report_context(args, forced_granularity=None):
                 c.valor_moeda, {contract_total_sql("c")} AS valor_moeda_consolidado,
                 c.taxa_cambio, c.valor_reais, c.cliente, c.cliente_id,
                 c.banco, c.banco_credito, c.banco_liquidacao, c.competencia_id,
+                c.categoria_cambio,
                 e.id AS empresa_id, e.razao_social AS empresa_razao_social,
                 e.apelido AS empresa_apelido, e.prioridade AS empresa_prioridade,
                 comp.descricao AS competencia_descricao,
@@ -2789,6 +2963,260 @@ def build_contract_report_context(args, forced_granularity=None):
         "por_empresa": por_empresa, "por_cliente": por_cliente, "por_banco": por_banco,
         "data_emissao": datetime.now().strftime("%d/%m/%Y %H:%M"),
     }
+
+
+CONTRACT_LINK_REPORT_COLUMNS = (
+    "EMPRESA", "DATA LANÇAMENTO", "CNPJ", "BANCO", "CONTRATO", "VALOR EM USD",
+    "TRADING", "DUE", "CHAVE DE ACESSO", "VALOR UTILIZADO",
+)
+
+
+def consulta_vinculos_contratos(conn, args):
+    """Consulta os vínculos contrato–DUE com os filtros dos relatórios."""
+    filters = parse_report_filters(args)
+    where = [
+        "c.status = ?",
+        "COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), ?) = ?",
+    ]
+    params = [STATUS_CONCLUIDO, CATEGORIA_CAMBIO_EXPORTACAO, CATEGORIA_CAMBIO_EXPORTACAO]
+    if filters["inicio"]:
+        where.append("c.data_contrato >= ?")
+        params.append(filters["inicio"])
+    if filters["fim"]:
+        where.append("c.data_contrato <= ?")
+        params.append(filters["fim"])
+    if filters["numero_contrato"]:
+        where.append("c.numero_contrato LIKE ?")
+        params.append(f"%{filters['numero_contrato']}%")
+    if filters["moeda"]:
+        where.append("c.moeda = ?")
+        params.append(filters["moeda"])
+    if filters["empresa_id"]:
+        where.append("e.id = ?")
+        params.append(filters["empresa_id"])
+    if filters["competencia_id"]:
+        where.append("c.competencia_id = ?")
+        params.append(filters["competencia_id"])
+
+    # O CNPJ do contrato continua sendo a fonte principal. Alguns registros
+    # antigos, porém, foram gravados sem esse campo; nesses casos a DUE
+    # vinculada preserva o CNPJ da mesma empresa e permite recuperar o
+    # vínculo sem alterar os dados do contrato.
+    contract_cnpj_sql = (
+        "COALESCE(NULLIF(TRIM(c.cnpj), ''), NULLIF(TRIM(d.cnpj), ''))"
+    )
+    contract_cnpj_normalized_sql = (
+        "REPLACE(REPLACE(REPLACE(REPLACE("
+        + contract_cnpj_sql
+        + ",'.',''),'/',''),'-',''),' ','')"
+    )
+    company_cnpj_normalized_sql = (
+        "REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(e.cnpj,''),'.',''),'/',''),'-',''),' ','')"
+    )
+    rows = conn.execute(f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(e.apelido), ''), NULLIF(TRIM(e.razao_social), ''),
+                     'Empresa não identificada') AS empresa,
+            MAX(m.data_movimentacao) AS data_lancamento,
+            {contract_cnpj_sql} AS cnpj,
+            COALESCE(NULLIF(TRIM(c.banco_liquidacao), ''),
+                     NULLIF(TRIM(c.banco_credito), ''),
+                     NULLIF(TRIM(c.banco), '')) AS banco,
+            c.numero_contrato AS contrato,
+            {contract_total_sql("c")} AS valor_usd,
+            COALESCE(NULLIF(TRIM(cl.nome), ''), NULLIF(TRIM(c.cliente), '')) AS trading,
+            d.numero_due AS due,
+            d.chave_acesso,
+            COALESCE(SUM(m.valor), v.valor_vinculado) AS valor_utilizado,
+            c.id AS contrato_id,
+            v.id AS vinculo_id
+        FROM due_contratos v
+        JOIN contratos c ON c.id=v.contrato_id
+        JOIN dues d ON d.id=v.due_id
+        JOIN empresas e
+          ON {contract_cnpj_normalized_sql} = {company_cnpj_normalized_sql}
+        LEFT JOIN clientes cl ON cl.id=c.cliente_id
+        LEFT JOIN due_movimentacoes m
+          ON m.due_contrato_id=v.id AND m.tipo='VINCULACAO'
+        WHERE {' AND '.join(where)}
+        GROUP BY v.id
+        ORDER BY """ + empresa_order_sql("e") + """,
+                 c.numero_contrato, d.numero_due, v.id
+    """, params).fetchall()
+    return rows, filters
+
+
+def contrato_vinculo_report_data(args):
+    conn = db()
+    try:
+        rows, filters = consulta_vinculos_contratos(conn, args)
+        empresas = conn.execute(
+            "SELECT id, razao_social, apelido, cnpj, prioridade "
+            "FROM empresas ORDER BY " + empresa_order_sql()
+        ).fetchall()
+        competencias = conn.execute("""
+            SELECT comp.id, comp.empresa_id, comp.descricao,
+                   comp.data_inicial, comp.data_final,
+                   e.apelido, e.razao_social,
+                   e.prioridade AS empresa_prioridade
+            FROM competencias comp
+            JOIN empresas e ON e.id=comp.empresa_id
+            ORDER BY """ + empresa_order_sql("e") + """,
+                   comp.data_inicial DESC, comp.descricao, comp.id
+        """).fetchall()
+        moedas = [
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT moeda FROM contratos "
+                "WHERE moeda IS NOT NULL AND TRIM(moeda) <> '' ORDER BY moeda"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    vinculos = []
+    for row in rows:
+        item = dict(row)
+        item["empresa"] = item.get("empresa") or "Empresa não identificada"
+        item["cnpj"] = format_cnpj(item.get("cnpj")) or "Não informado"
+        item["banco"] = item.get("banco") or "Não informado"
+        item["trading"] = item.get("trading") or "Não informado"
+        item["chave_acesso"] = item.get("chave_acesso") or "Não informada"
+        item["valor_usd"] = decimal_value(item.get("valor_usd"))
+        item["valor_utilizado"] = decimal_value(item.get("valor_utilizado"))
+        vinculos.append(item)
+
+    selected_empresa = next(
+        (item for item in empresas if item["id"] == filters["empresa_id"]), None
+    )
+    selected_competencia = next(
+        (item for item in competencias if item["id"] == filters["competencia_id"]), None
+    )
+    empresa_label = (
+        selected_empresa["apelido"] or selected_empresa["razao_social"]
+        if selected_empresa else "Todas as empresas"
+    )
+    safra_label = selected_competencia["descricao"] if selected_competencia else "Todas as safras"
+    return {
+        "vinculos": vinculos,
+        "total_registros": len(vinculos),
+        "empresas": empresas,
+        "competencias": competencias,
+        "moedas": moedas,
+        "empresa_id": filters["empresa_id"],
+        "competencia_id": filters["competencia_id"],
+        "empresa_label": empresa_label,
+        "safra_label": safra_label,
+        "numero_contrato": filters["numero_contrato"],
+        "moeda": filters["moeda"],
+        "periodo": filters["periodo"],
+        "data_de": filters["data_de"],
+        "data_ate": filters["data_ate"],
+        "periodo_label": report_period_range_label(
+            filters["inicio"], filters["fim"], filters["periodo"]
+        ),
+    }
+
+
+def contrato_vinculo_report_excel_value(value, field):
+    if value is None:
+        return None
+    if field == "data_lancamento":
+        normalized = normalize_date(value)
+        if not normalized:
+            return None
+        try:
+            return date.fromisoformat(normalized)
+        except ValueError:
+            return value
+    if field in {"valor_usd", "valor_utilizado"}:
+        return float(value) if isinstance(value, Decimal) else float(decimal_value(value))
+    return value
+
+
+def exportar_relatorio_vinculos_excel(args):
+    import pandas as pd
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    conn = db()
+    try:
+        rows, _ = consulta_vinculos_contratos(conn, args)
+    finally:
+        conn.close()
+
+    fields = (
+        ("empresa", "EMPRESA"),
+        ("data_lancamento", "DATA LANÇAMENTO"),
+        ("cnpj", "CNPJ"),
+        ("banco", "BANCO"),
+        ("contrato", "CONTRATO"),
+        ("valor_usd", "VALOR EM USD"),
+        ("trading", "TRADING"),
+        ("due", "DUE"),
+        ("chave_acesso", "CHAVE DE ACESSO"),
+        ("valor_utilizado", "VALOR UTILIZADO"),
+    )
+    data = []
+    for row in rows:
+        item = dict(row)
+        item["empresa"] = item.get("empresa") or "Empresa não identificada"
+        item["cnpj"] = format_cnpj(item.get("cnpj")) or "Não informado"
+        item["banco"] = item.get("banco") or "Não informado"
+        item["trading"] = item.get("trading") or "Não informado"
+        item["chave_acesso"] = item.get("chave_acesso") or "Não informada"
+        item["valor_usd"] = decimal_value(item.get("valor_usd"))
+        item["valor_utilizado"] = decimal_value(item.get("valor_utilizado"))
+        data.append({
+            label: contrato_vinculo_report_excel_value(item.get(key), key)
+            for key, label in fields
+        })
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        dataframe = pd.DataFrame(data, columns=CONTRACT_LINK_REPORT_COLUMNS)
+        dataframe.to_excel(writer, index=False, sheet_name="Vínculos")
+        worksheet = writer.book["Vínculos"]
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1769AA")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for row in worksheet.iter_rows(min_row=2, min_col=2, max_col=2):
+            row[0].number_format = "dd/mm/yyyy"
+        for row in worksheet.iter_rows(min_row=2, min_col=6, max_col=6):
+            row[0].number_format = "#,##0.00"
+        for row in worksheet.iter_rows(min_row=2, min_col=10, max_col=10):
+            row[0].number_format = "#,##0.00"
+        for column in worksheet.columns:
+            letter = get_column_letter(column[0].column)
+            width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 12), 42)
+            worksheet.column_dimensions[letter].width = width
+    output.seek(0)
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name="relatorio_vinculos_contratos.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/contratos/relatorio-vinculos")
+def relatorio_vinculos_contratos():
+    try:
+        context = contrato_vinculo_report_data(request.args)
+    except ValueError as exc:
+        flash(str(exc), "danger")
+        return redirect(url_for("relatorio_vinculos_contratos"))
+    return render_template("contratos_relatorio_vinculos.html", **context)
+
+
+@app.route("/contratos/relatorio-vinculos/exportar")
+def exportar_relatorio_vinculos_contratos():
+    try:
+        return exportar_relatorio_vinculos_excel(request.args)
+    except ValueError as exc:
+        return str(exc), 400
 
 @app.route("/contratos/relatorios")
 def relatorios_contratos():
@@ -3824,7 +4252,12 @@ def carregar_detalhe_contrato(conn, contrato_id):
            OR h.contrato_id=?
         ORDER BY f.data_fechamento DESC, f.id DESC
     """, (contrato_id, contrato_id)).fetchall()
-    fechamentos_pendentes = conn.execute("""
+    pending_params = [contrato["moeda"]]
+    pending_client_clause = ""
+    if contrato["cliente_id"]:
+        pending_client_clause = " AND i.cliente_id=?"
+        pending_params.append(contrato["cliente_id"])
+    fechamentos_pendentes = conn.execute(f"""
         SELECT f.*, i.numero_invoice, i.tipo_documento, i.data_emissao,
                e.apelido AS empresa_apelido, e.razao_social AS empresa_razao_social,
                cl.nome AS cliente_nome
@@ -3833,12 +4266,14 @@ def carregar_detalhe_contrato(conn, contrato_id):
         JOIN empresas e ON e.id=i.empresa_id
         LEFT JOIN clientes cl ON cl.id=i.cliente_id
         WHERE f.fechamento_id IS NULL AND f.contrato_id IS NULL AND f.moeda=?
+          {pending_client_clause}
         ORDER BY f.data_fechamento, f.id
-    """, (contrato["moeda"],)).fetchall()
+    """, pending_params).fetchall()
     summary = contract_summary(conn, contrato_id)
     contrato = dict(contrato)
     contrato["valor_moeda"] = summary["valor_moeda"]
-    contrato.update({"vinculado": summary["vinculado"], "saldo": summary["saldo"], "status": summary["status"],
+    contrato.update({"categoria_cambio": summary["categoria_cambio"],
+                     "vinculado": summary["vinculado"], "saldo": summary["saldo"], "status": summary["status"],
                      "invoice_links": invoice_links, "fechamentos": fechamentos})
     return contrato, vinculos, summary, fechamentos_pendentes
 
@@ -3881,6 +4316,7 @@ def editar_contrato(contrato_id):
     if request.form.get("derived_contract_form") == "1":
         try:
             metadata = contract_metadata_from_form(request.form, conn)
+            categoria_cambio = normalize_cambio_category(request.form.get("categoria_cambio"))
             numero = metadata["numero_contrato"]
             if not numero:
                 raise ValueError("O número do Contrato Câmbio é obrigatório.")
@@ -3891,11 +4327,16 @@ def editar_contrato(contrato_id):
                 raise ValueError("A data de liquidação não pode ser anterior ao fechamento.")
             conn.execute("""
                 UPDATE contratos SET numero_contrato=?, banco_liquidacao_id=?, banco_liquidacao=?,
-                    data_fechamento=?, data_liquidacao=?, data_contrato=?, taxa_cambio=?, observacao=?
+                    data_fechamento=?, data_liquidacao=?, data_contrato=?, taxa_cambio=?,
+                    observacao=?, categoria_cambio=?
                 WHERE id=?
             """, (numero, metadata["banco_liquidacao_id"], metadata["banco_liquidacao"],
                   metadata["data_fechamento"], metadata["data_liquidacao"], metadata["data_fechamento"],
-                  metadata["taxa_cambio"], metadata["observacao"], contrato_id))
+                  metadata["taxa_cambio"], metadata["observacao"], categoria_cambio, contrato_id))
+            conn.execute(
+                "UPDATE fechamentos SET categoria_cambio=? WHERE contrato_id=?",
+                (categoria_cambio, contrato_id),
+            )
             sync_contract_cache(conn, contrato_id)
             conn.commit(); conn.close()
             flash("Contrato Câmbio atualizado com sucesso.", "success")
@@ -3904,7 +4345,10 @@ def editar_contrato(contrato_id):
             conn.rollback(); flash(str(exc), "danger")
             contrapartes = contrapartes_for_form(conn)
             conn.close()
-            return render_template("contrato_form_derived.html", contrato=dict(contrato), resumo=resumo,
+            form_contrato = dict(contrato)
+            if request.form.get("categoria_cambio"):
+                form_contrato["categoria_cambio"] = request.form.get("categoria_cambio")
+            return render_template("contrato_form_derived.html", contrato=form_contrato, resumo=resumo,
                                    contrapartes=contrapartes), 400
     conn.close()
     flash("Contratos Câmbio são mantidos pelas Invoices vinculadas; edite-os a partir do fluxo de Invoice.", "danger")
@@ -4023,7 +4467,8 @@ def saldo_contrato(contrato_id):
     return jsonify({"id": contrato["id"], "numero_contrato": contrato["numero_contrato"],
                     "moeda": contrato["moeda"], "valor_total": total,
                     "total_vinculado": vinculado, "saldo_disponivel": float(contrato["saldo"]),
-                    "status": contrato["status"]})
+                    "status": contrato["status"],
+                    "categoria_cambio": contrato["categoria_cambio"]})
 
 @app.route("/dues")
 def consulta_dues():
@@ -4375,13 +4820,16 @@ def carregar_detalhe_due(conn, due_id):
                          FROM due_contratos v JOIN contratos c ON c.id=v.contrato_id
                          LEFT JOIN due_movimentacoes m ON m.due_contrato_id=v.id AND m.tipo='VINCULACAO'
                          WHERE v.due_id=? ORDER BY v.id DESC""",(due_id,)).fetchall()
-    contratos=[decorate_contract(row) for row in conn.execute(f"""SELECT c.*, {contract_total_sql("c")} AS valor_moeda_consolidado,
+    contratos=[decorate_contract(row) for row in conn.execute(f"""SELECT c.*,
+                               {contract_total_sql("c")} AS valor_moeda_consolidado,
                                COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0) AS vinculado
                                FROM contratos c LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
                                GROUP BY c.id
                                HAVING c.saldo_zerado_manual=0
                                   AND valor_moeda_consolidado-COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0)>?
-                               ORDER BY c.numero_contrato""", (float(SALDO_TOLERANCE),)).fetchall()]
+                                  AND COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), 'Câmbio Exportação')<>?
+                               ORDER BY c.numero_contrato""",
+                               (float(SALDO_TOLERANCE), CATEGORIA_CAMBIO_FINANCEIRO)).fetchall()]
     utilizado=due_effect(conn, due_id)
     due = decorate_due({**dict(due_row), "utilizado": utilizado})
     due["invoice_links"] = conn.execute("""
@@ -4476,6 +4924,8 @@ def vincular(due_id):
         contrato=contract_summary(conn, contrato_id)
         if not contrato:
             raise ValueError("Contrato Câmbio não encontrado.")
+        if contrato["categoria_cambio"] == CATEGORIA_CAMBIO_FINANCEIRO:
+            raise ValueError("Contratos de Câmbio Financeiro não podem receber vínculos DU-E.")
         if contrato["saldo_zerado_manual"]:
             raise ValueError("O Contrato Câmbio foi zerado manualmente e não pode receber vínculos.")
         if contrato["status"] not in {STATUS_PENDENTE, STATUS_PARCIAL}:
@@ -5121,7 +5571,8 @@ def invoice_summary(conn, invoice_id):
     cambios = conn.execute("""
         SELECT v.*, c.numero_contrato, c.moeda AS contrato_moeda,
                c.banco_liquidacao, c.data_fechamento, c.data_liquidacao,
-               c.taxa_cambio, c.valor_reais AS contrato_valor_reais
+               c.taxa_cambio, c.valor_reais AS contrato_valor_reais,
+               c.categoria_cambio
         FROM invoice_contrato_cambio v
         JOIN contratos c ON c.id=v.contrato_id
         WHERE v.invoice_id=? ORDER BY v.id DESC
@@ -5139,7 +5590,7 @@ def invoice_summary(conn, invoice_id):
                COALESCE(h.contrato_id, f.contrato_id) AS contrato_id_efetivo,
                c.numero_contrato, c.moeda AS contrato_moeda,
                c.banco_liquidacao, c.data_liquidacao, c.taxa_cambio,
-               c.valor_reais AS contrato_valor_reais
+               c.valor_reais AS contrato_valor_reais, c.categoria_cambio
         FROM fechamentos_cambio f
         LEFT JOIN fechamentos h ON h.id=f.fechamento_id
         LEFT JOIN contrapartes bank_credito ON bank_credito.id=h.banco_credito_id
@@ -5952,7 +6403,8 @@ def sync_contract_cache(conn, contrato_id):
     banks = [{"nome": name} for name in sorted(bank_names)]
     total_value = decimal_value(total["total"])
     central_header = conn.execute(
-        "SELECT valor_brl FROM fechamentos WHERE contrato_id=?", (contrato_id,)
+        "SELECT valor_brl, categoria_cambio FROM fechamentos WHERE contrato_id=?",
+        (contrato_id,),
     ).fetchone()
     if central_header and central_header["valor_brl"] is not None:
         valor_reais = decimal_value(central_header["valor_brl"])
@@ -5963,16 +6415,25 @@ def sync_contract_cache(conn, contrato_id):
         SELECT COALESCE(SUM(valor),0) FROM due_movimentacoes
         WHERE contrato_id=? AND tipo='VINCULACAO'
     """, (contrato_id,)).fetchone()[0])
-    saldo = contract_balance(total_value, linked)
-    status = STATUS_CONCLUIDO if contrato["saldo_zerado_manual"] else status_from_balance(saldo, linked)
+    categoria = normalize_cambio_category(contrato["categoria_cambio"], required=False)
+    if (not contrato["categoria_cambio"] or not str(contrato["categoria_cambio"]).strip()) and central_header:
+        categoria = normalize_cambio_category(central_header["categoria_cambio"], required=False)
+    financeiro = categoria == CATEGORIA_CAMBIO_FINANCEIRO
+    saldo = Decimal("0") if financeiro else contract_balance(total_value, linked)
+    status = (
+        STATUS_CONCLUIDO
+        if contrato["saldo_zerado_manual"] or financeiro
+        else status_from_balance(saldo, linked)
+    )
     conn.execute("""
         UPDATE contratos SET valor_moeda=?, valor_reais=?, moeda=COALESCE(?,moeda),
             cnpj=?, cliente=?, cliente_id=?, banco=?, banco_credito=?,
-            data_contrato=COALESCE(data_contrato,data_fechamento), status=?
+            data_contrato=COALESCE(data_contrato,data_fechamento), categoria_cambio=?, status=?
         WHERE id=?
     """, (float(total_value), float(valor_reais) if valor_reais is not None else None,
           total["moeda"] or contrato["moeda"], total["cnpj"], total["cliente"], total["cliente_id"],
-          contrato["banco_liquidacao"], ", ".join(row["nome"] for row in banks) or None, status, contrato_id))
+          contrato["banco_liquidacao"], ", ".join(row["nome"] for row in banks) or None,
+          categoria, status, contrato_id))
     return conn.execute("SELECT * FROM contratos WHERE id=?", (contrato_id,)).fetchone()
 
 def sync_contracts_for_invoice(conn, invoice_id):
@@ -6218,6 +6679,10 @@ def central_closing_invoice(conn, invoice_id):
     data = dict(summary)
     data["banco_credito_id"] = bank["id"]
     data["banco_credito_nome"] = bank["nome"]
+    padroes = configuracoes_padrao_for_empresa(conn, summary["empresa_id"])
+    data["banco_liquidacao_padrao_id"] = (
+        padroes["banco_liquidacao_id"] if padroes else None
+    )
     data["valor_fechamento"] = normalize_balance(summary["saldo_fechamentos"])
     return data
 
@@ -6232,7 +6697,8 @@ def closing_amounts_from_form(form):
 
 
 def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=None,
-                           taxa_cambio=None, banco_liquidacao_id=None, amounts=None):
+                           taxa_cambio=None, banco_liquidacao_id=None,
+                           amounts=None, categoria_cambio=None):
     """Valida a seleção e monta grupos determinísticos sem gravar nada."""
     ids = []
     for raw_id in raw_ids:
@@ -6255,6 +6721,7 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
         raise ValueError("A Data de Liquidação não pode ser anterior à Data de Fechamento.")
     rate = parse_exchange_rate(taxa_cambio)
     banco_liquidacao = resolve_counterparty(conn, banco_liquidacao_id, required=True)
+    categoria = normalize_cambio_category(categoria_cambio)
 
     invoices = [central_closing_invoice(conn, invoice_id) for invoice_id in ids]
     client_ids = {invoice["cliente_id"] for invoice in invoices}
@@ -6294,6 +6761,7 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
             "data_fechamento": fechamento,
             "data_liquidacao": liquidacao,
             "taxa_cambio": rate,
+            "categoria_cambio": categoria,
             "valor_brl": Decimal("0"),
             "banco_liquidacao_id": banco_liquidacao["id"],
             "banco_liquidacao_nome": banco_liquidacao["nome"],
@@ -6655,8 +7123,8 @@ def create_central_closing_contract(conn, group, number):
         INSERT INTO contratos
             (numero_contrato,banco_id,banco,banco_credito,banco_liquidacao_id,
              banco_liquidacao,data_contrato,data_fechamento,data_liquidacao,moeda,
-             valor_moeda,taxa_cambio,valor_reais,status,cliente,cliente_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             valor_moeda,taxa_cambio,valor_reais,status,cliente,cliente_id,categoria_cambio)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         number, group["banco_credito_id"], group["banco_credito_nome"],
         group["banco_credito_nome"], group["banco_liquidacao_id"],
@@ -6664,7 +7132,7 @@ def create_central_closing_contract(conn, group, number):
         group["data_fechamento"], group["data_liquidacao"], group["moeda"],
         float(group["valor_moeda"]), float(group["taxa_cambio"]), float(group["valor_brl"]),
         STATUS_PENDENTE, group["cliente_nome"],
-        group["cliente_id"],
+        group["cliente_id"], group["categoria_cambio"],
     ))
     return cursor.lastrowid
 
@@ -7301,7 +7769,7 @@ def lista_invoices():
                            sort_links=sort_links, previous_args=previous_args, next_args=next_args)
 
 
-def central_closing_page_data(conn):
+def central_closing_page_data(conn, closing_filters=None):
     eligible = []
     for row in conn.execute("SELECT id FROM invoices ORDER BY numero_invoice, id").fetchall():
         try:
@@ -7386,12 +7854,14 @@ def previsualizar_fechamentos_invoices():
             request.form.get("taxa_cambio"),
             request.form.get("banco_liquidacao_id"),
             amounts=closing_amounts_from_form(request.form),
+            categoria_cambio=request.form.get("categoria_cambio"),
         )
         form_data = {
             "data_fechamento": request.form.get("data_fechamento", ""),
             "data_liquidacao": request.form.get("data_liquidacao", ""),
             "taxa_cambio": request.form.get("taxa_cambio", ""),
             "banco_liquidacao_id": request.form.get("banco_liquidacao_id", ""),
+            "categoria_cambio": request.form.get("categoria_cambio", ""),
             "selected_ids": request.form.getlist("selected_ids"),
         }
     except ValueError as exc:
@@ -7416,17 +7886,19 @@ def registrar_fechamentos_invoices():
             request.form.get("taxa_cambio"),
             request.form.get("banco_liquidacao_id"),
             amounts=closing_amounts_from_form(request.form),
+            categoria_cambio=request.form.get("categoria_cambio"),
         )
         for group in groups:
             cursor = conn.execute("""
                 INSERT INTO fechamentos
                     (cliente_id,banco_credito_id,moeda,data_fechamento,data_liquidacao,
-                     banco_liquidacao_id,taxa_cambio,valor_brl)
-                VALUES (?,?,?,?,?,?,?,?)
+                     categoria_cambio,banco_liquidacao_id,taxa_cambio,valor_brl)
+                VALUES (?,?,?,?,?,?,?,?,?)
             """, (
                 group["cliente_id"], group["banco_credito_id"], group["moeda"],
                 group["data_fechamento"], group["data_liquidacao"],
-                group["banco_liquidacao_id"], float(group["taxa_cambio"]),
+                group["categoria_cambio"], group["banco_liquidacao_id"],
+                float(group["taxa_cambio"]),
                 float(group["valor_brl"]),
             ))
             fechamento_id = cursor.lastrowid
@@ -7509,6 +7981,7 @@ def editar_fechamento_invoice(fechamento_id):
         if data_liquidacao < data_fechamento:
             raise ValueError("A Data de Liquidação não pode ser anterior à Data de Fechamento.")
         taxa_cambio = parse_exchange_rate(request.form.get("taxa_cambio"))
+        categoria_cambio = normalize_cambio_category(request.form.get("categoria_cambio"))
         banco_liquidacao = resolve_counterparty(
             conn, request.form.get("banco_liquidacao_id"), required=True
         )
@@ -7517,6 +7990,7 @@ def editar_fechamento_invoice(fechamento_id):
             "data_fechamento": data_fechamento,
             "data_liquidacao": data_liquidacao,
             "taxa_cambio": taxa_cambio,
+            "categoria_cambio": categoria_cambio,
             "valor_brl": closing_brl_value(detail["valor_moeda"], taxa_cambio),
             "banco_liquidacao_id": banco_liquidacao["id"],
             "banco_liquidacao_nome": banco_liquidacao["nome"],
@@ -7530,11 +8004,11 @@ def editar_fechamento_invoice(fechamento_id):
             conn.execute("""
                 UPDATE contratos SET banco_liquidacao_id=?, banco_liquidacao=?,
                     data_contrato=?, data_fechamento=?, data_liquidacao=?,
-                    taxa_cambio=?, valor_reais=?
+                    taxa_cambio=?, valor_reais=?, categoria_cambio=?
                 WHERE id=?
             """, (banco_liquidacao["id"], banco_liquidacao["nome"], data_fechamento,
                   data_fechamento, data_liquidacao, float(taxa_cambio),
-                  float(group["valor_brl"]), contrato_id))
+                  float(group["valor_brl"]), categoria_cambio, contrato_id))
         else:
             contrato_id = create_central_closing_contract(
                 conn, group, request.form.get("numero_novo_contrato")
@@ -7544,10 +8018,11 @@ def editar_fechamento_invoice(fechamento_id):
         conn.execute("""
             UPDATE fechamentos
             SET data_fechamento=?, data_liquidacao=?, banco_liquidacao_id=?,
-                taxa_cambio=?, valor_brl=?
+                taxa_cambio=?, valor_brl=?, categoria_cambio=?
             WHERE id=?
         """, (data_fechamento, data_liquidacao, banco_liquidacao["id"],
-              float(taxa_cambio), float(group["valor_brl"]), fechamento_id))
+              float(taxa_cambio), float(group["valor_brl"]), categoria_cambio,
+              fechamento_id))
         conn.execute("UPDATE fechamentos_cambio SET data_fechamento=? WHERE fechamento_id=?",
                      (data_fechamento, fechamento_id))
         if contrato_id:
@@ -7746,6 +8221,7 @@ def exportar_invoices():
                    c.cliente AS contrato_cliente, c.cliente_id AS contrato_cliente_id,
                    c.moeda AS contrato_moeda, c.valor_moeda AS contrato_valor_moeda,
                    c.taxa_cambio AS contrato_taxa_cambio, c.valor_reais AS contrato_valor_reais,
+                   c.categoria_cambio,
                    c.status AS contrato_status, c.saldo_zerado_manual,
                    c.observacao AS contrato_observacao, c.competencia_id AS contrato_competencia_id,
                    c.created_at AS contrato_criado_em,
@@ -7785,6 +8261,7 @@ def exportar_invoices():
                    c.taxa_cambio AS contrato_taxa_cambio, c.valor_reais AS contrato_valor_reais,
                    h.taxa_cambio AS fechamento_taxa_cambio,
                    h.valor_brl AS fechamento_valor_brl,
+                   COALESCE(h.categoria_cambio, c.categoria_cambio) AS categoria_cambio,
                    c.status AS contrato_status, c.saldo_zerado_manual,
                    c.observacao AS contrato_observacao, c.competencia_id AS contrato_competencia_id,
                    c.created_at AS contrato_criado_em,
@@ -7939,6 +8416,7 @@ def exportar_invoices():
         ("contrato_valor_moeda", "Valor do contrato"), ("contrato_taxa_cambio", "Taxa de cambio"),
         ("contrato_valor_reais", "Valor do contrato em reais"), ("valor_alocado", "Valor alocado"),
         ("contrato_total_alocado", "Total alocado no contrato"), ("contrato_saldo", "Saldo do contrato"),
+        ("categoria_cambio", "Categoria Câmbio"),
         ("contrato_status", "Status do contrato"), ("saldo_zerado_manual", "Saldo zerado manualmente"),
         ("contrato_competencia_id", "Contrato - Competencia ID"),
         ("vinculo_observacao", "Observacao do vinculo"), ("contrato_observacao", "Observacao do contrato"),
@@ -7952,10 +8430,17 @@ def exportar_invoices():
         invoice = invoice_by_id.get(item["invoice_id"])
         item["tipo_documento"] = invoice_type_label(item["tipo_documento"])
         item["invoice_status"] = INVOICE_STATUS_LABELS.get(invoice["status"]) if invoice else None
-        item["contrato_saldo"] = Decimal("0") if item["saldo_zerado_manual"] else contract_balance(
-            item["contrato_valor_moeda"], item["contrato_total_alocado"]
+        item["categoria_cambio"] = normalize_cambio_category(
+            item.get("categoria_cambio"), required=False
         )
-        item["contrato_status"] = item["contrato_status"] or ""
+        financeiro = item["categoria_cambio"] == CATEGORIA_CAMBIO_FINANCEIRO
+        item["contrato_saldo"] = (
+            Decimal("0") if item["saldo_zerado_manual"] or financeiro
+            else contract_balance(item["contrato_valor_moeda"], item["contrato_total_alocado"])
+        )
+        item["contrato_status"] = (
+            STATUS_CONCLUIDO if financeiro else (item["contrato_status"] or "")
+        )
         item["saldo_zerado_manual"] = bool(item["saldo_zerado_manual"])
         change_data.append(mapped_row(item, change_fields))
 
@@ -8531,6 +9016,9 @@ def vincular_fechamento_contrato(contrato_id):
             raise ValueError("Contrato ou fechamento de câmbio não encontrado.")
         if fechamento["fechamento_id"]:
             raise ValueError("Itens de um Fechamento centralizado devem ser geridos pela Gestão de Fechamentos.")
+        if (contrato["cliente_id"] and invoice["cliente_id"]
+                and contrato["cliente_id"] != invoice["cliente_id"]):
+            raise ValueError("O Cliente do fechamento deve ser o mesmo Cliente do Contrato Câmbio.")
         if contrato["moeda"] != invoice["moeda"] and contract_has_exchange_links(conn, contrato_id):
             raise ValueError("A moeda do Contrato Câmbio deve ser igual à moeda da Invoice.")
         if contrato["moeda"] != invoice["moeda"]:

@@ -48,6 +48,35 @@ class InvoiceFlowTests(unittest.TestCase):
         conn.close()
         return invoice["id"]
 
+    def _register_central_closing(self, invoice_id, value, data_fechamento,
+                                  data_liquidacao, banco_liquidacao_id="1",
+                                  taxa_cambio="5,0000", numero_contrato=None,
+                                  categoria_cambio=app.CATEGORIA_CAMBIO_EXPORTACAO):
+        received = self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1",
+            "data_credito": "01/08/2026",
+            "valor_moeda": value,
+        })
+        self.assertEqual(received.status_code, 302)
+        closing_data = {
+            "selected_ids": [str(invoice_id)],
+            "data_fechamento": data_fechamento,
+            "data_liquidacao": data_liquidacao,
+            "taxa_cambio": taxa_cambio,
+            "banco_liquidacao_id": banco_liquidacao_id,
+            "categoria_cambio": categoria_cambio,
+        }
+        if numero_contrato:
+            closing_data["numero_contrato_0"] = numero_contrato
+        response = self.client.post("/invoices/fechamentos", data=closing_data)
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        row = conn.execute(
+            "SELECT * FROM fechamentos WHERE id=(SELECT MAX(id) FROM fechamentos)"
+        ).fetchone()
+        conn.close()
+        return row
+
     def test_invoice_reference_is_saved_and_receipt_defaults_are_editable(self):
         conn = app.db()
         conn.execute("INSERT INTO contrapartes (nome) VALUES (?)", ("Banco Alternativo",))
@@ -1967,7 +1996,7 @@ class InvoiceFlowTests(unittest.TestCase):
         self.client.post("/invoices/fechamentos", data={
             "selected_ids": str(invoice_id), "data_fechamento": "20/08/2026",
             "data_liquidacao": "20/08/2026", "taxa_cambio": "5,0000",
-            "banco_liquidacao_id": "1",
+            "banco_liquidacao_id": "1", "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
         })
 
         response = self.client.post("/invoices/recebimentos", data={
@@ -2341,6 +2370,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "selected_ids": [str(invoice_a), str(invoice_b)],
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,1234", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
         })
         self.assertEqual(response.status_code, 200)
         self.assertIn("Grupo 1", response.get_data(as_text=True))
@@ -2353,7 +2383,9 @@ class InvoiceFlowTests(unittest.TestCase):
         response = self.client.post("/invoices/fechamentos", data={
             "selected_ids": [str(invoice_a), str(invoice_b)],
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
-            "taxa_cambio": "5,1234", "banco_liquidacao_id": "1", "numero_contrato_0": "CENTRAL-001",
+            "taxa_cambio": "5,1234", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "numero_contrato_0": "CENTRAL-001",
         })
         self.assertEqual(response.status_code, 302)
         conn = app.db()
@@ -2395,7 +2427,8 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertIn(f"href=\"/invoices/fechamentos/{header['id']}\"", contract_detail.get_data(as_text=True))
 
         response = self.client.post(f"/invoices/fechamentos/{header['id']}/editar", data={
-            "data_fechamento": "2026-08-22", "data_liquidacao": "2026-08-26", "taxa_cambio": "5,2000", "banco_liquidacao_id": "1",
+            "data_fechamento": "2026-08-22", "data_liquidacao": "2026-08-26", "taxa_cambio": "5,2000",
+            "banco_liquidacao_id": "1", "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
         })
         self.assertEqual(response.status_code, 302)
         response = self.client.post(f"/invoices/fechamentos/{header['id']}/excluir")
@@ -2414,6 +2447,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "selected_ids": [str(invoice_id)],
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
         })
         self.assertEqual(response.status_code, 302)
         conn = app.db()
@@ -2441,6 +2475,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "valor_fechamento_%d" % integral_id: "500,00",
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
             "numero_contrato_grupo_1_USD": "CENTRAL-SPLIT-001",
         })
         self.assertEqual(response.status_code, 302)
@@ -2543,6 +2578,7 @@ class InvoiceFlowTests(unittest.TestCase):
                 "valor_fechamento_%d" % invoice_id: value,
                 "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
                 "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+                "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
             }, follow_redirects=True)
             self.assertIn("valor", response.get_data(as_text=True))
         conn = app.db()
@@ -2563,7 +2599,9 @@ class InvoiceFlowTests(unittest.TestCase):
         response = self.client.post("/invoices/fechamentos", data={
             "selected_ids": [str(invoice_a), str(invoice_b)],
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
-            "taxa_cambio": "5,0000", "banco_liquidacao_id": "1", "numero_contrato_0": "SHOULD-ROLLBACK",
+            "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "numero_contrato_0": "SHOULD-ROLLBACK",
         }, follow_redirects=True)
         self.assertEqual(response.status_code, 200)
         self.assertIn("mesmo Cliente", response.get_data(as_text=True))
@@ -2589,7 +2627,9 @@ class InvoiceFlowTests(unittest.TestCase):
         response = self.client.post("/invoices/fechamentos", data={
             "selected_ids": [str(invoice_a), str(invoice_b)],
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
-            "taxa_cambio": "5,0000", "banco_liquidacao_id": "1", "numero_contrato_0": "DUPLICADO", "numero_contrato_1": "DUPLICADO",
+            "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "numero_contrato_0": "DUPLICADO", "numero_contrato_1": "DUPLICADO",
         }, follow_redirects=True)
         self.assertEqual(response.status_code, 200)
         self.assertIn("número DUPLICADO", response.get_data(as_text=True))
@@ -2602,6 +2642,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "selected_ids": [str(invoice_a), str(invoice_b)],
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
         })
         self.assertEqual(response.status_code, 200)
         self.assertIn("Grupo 2", response.get_data(as_text=True))
@@ -2615,6 +2656,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "selected_ids": [str(invoice_id)],
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
         }, follow_redirects=True)
         self.assertEqual(response.status_code, 200)
         self.assertIn("exatamente um Banco de Crédito", response.get_data(as_text=True))
@@ -2631,6 +2673,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "selected_ids": [str(invoice_id)],
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
         }
         response = self.client.post("/invoices/fechamentos", data=base, follow_redirects=True)
         self.assertIn("Taxa é obrigatória", response.get_data(as_text=True))
@@ -2639,6 +2682,537 @@ class InvoiceFlowTests(unittest.TestCase):
         conn = app.db()
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos").fetchone()[0], 0)
         conn.close()
+
+    def test_registered_closing_filters_are_combined_and_report_uses_them(self):
+        conn = app.db()
+        conn.execute("INSERT INTO clientes (nome, pais) VALUES (?, ?)", ("Cliente Alternativo", "DE"))
+        conn.execute("INSERT INTO contrapartes (nome) VALUES (?)", ("Banco Alternativo",))
+        conn.commit()
+        alternate_bank_id = conn.execute(
+            "SELECT id FROM contrapartes WHERE nome=?", ("Banco Alternativo",)
+        ).fetchone()[0]
+        conn.close()
+
+        first_invoice = self._create_invoice("INV-REPORT-A", "100,00")
+        first = self._register_central_closing(
+            first_invoice, "100,00", "2026-08-10", "2026-08-15",
+            banco_liquidacao_id=str(alternate_bank_id),
+            numero_contrato="CENTRAL-REPORT-A",
+        )
+        second_invoice = self._create_invoice("INV-REPORT-B", "200,00")
+        second = self._register_central_closing(
+            second_invoice, "200,00", "2026-08-11", "2026-08-15",
+        )
+        third_invoice = self._create_invoice(
+            "INV-REPORT-C", "50,00", client_id=2, currency="EUR"
+        )
+        third = self._register_central_closing(
+            third_invoice, "50,00", "2026-08-10", "2026-08-20",
+            banco_liquidacao_id=str(alternate_bank_id),
+        )
+
+        query = (
+            "fechamento_cliente_id=1&fechamento_data_de=10/08/2026&"
+            "fechamento_data_ate=10/08/2026&liquidacao_data_de=15/08/2026&"
+            f"liquidacao_data_ate=15/08/2026&fechamento_banco_liquidacao_id={alternate_bank_id}"
+        )
+        listing = self.client.get(f"/invoices/fechamentos?{query}")
+        self.assertEqual(listing.status_code, 200)
+        listing_html = listing.get_data(as_text=True)
+        self.assertIn(f"/invoices/fechamentos/{first['id']}", listing_html)
+        self.assertNotIn(f"/invoices/fechamentos/{second['id']}", listing_html)
+        self.assertNotIn(f"/invoices/fechamentos/{third['id']}", listing_html)
+        self.assertIn('formtarget="_blank"', listing_html)
+        self.assertIn("/invoices/fechamentos/relatorio", listing_html)
+
+        report = self.client.get(f"/invoices/fechamentos/relatorio?{query}")
+        self.assertEqual(report.status_code, 200)
+        report_html = report.get_data(as_text=True)
+        self.assertIn("Empresa / apelido", report_html)
+        self.assertIn("Cliente", report_html)
+        self.assertIn("Banco de crédito", report_html)
+        self.assertIn("Banco de liquidação", report_html)
+        self.assertLess(report_html.index("Banco de crédito"), report_html.index("Banco de liquidação"))
+        self.assertIn("Data de fechamento", report_html)
+        self.assertIn("Data de liquidação", report_html)
+        self.assertIn("Moeda", report_html)
+        self.assertIn("Valor na moeda original", report_html)
+        self.assertIn("Taxa", report_html)
+        self.assertIn("Valor em BRL", report_html)
+        self.assertIn("Teste", report_html)
+        self.assertIn("Cliente Teste", report_html)
+        self.assertIn("Banco Alternativo", report_html)
+        self.assertIn("USD 100,00", report_html)
+        self.assertIn("500,00", report_html)
+        self.assertNotIn("closing-report-total-grid", report_html)
+        self.assertIn("Total moeda original", report_html)
+        self.assertIn("Total BRL", report_html)
+        self.assertIn("TOTAL POR BANCO", report_html)
+        self.assertIn("TOTAL POR EMPRESA", report_html)
+        self.assertIn("TOTAL POR CLIENTE", report_html)
+        self.assertIn("CENTRAL-REPORT-A", report_html)
+        self.assertIn("Total/subtotal dos valores", report_html)
+        self.assertNotIn("CNPJ", report_html)
+        self.assertNotIn("45765914000181", report_html)
+        self.assertIn("Imprimir / Salvar PDF", report_html)
+        css_response = self.client.get("/static/style.css")
+        try:
+            css = css_response.get_data(as_text=True)
+        finally:
+            css_response.close()
+        self.assertIn(".closing-report-table{table-layout:auto", css)
+        self.assertIn("@page closing-report{size:A4 landscape", css)
+
+        all_report = self.client.get("/invoices/fechamentos/relatorio")
+        self.assertEqual(all_report.status_code, 200)
+        all_report_html = all_report.get_data(as_text=True)
+        self.assertIn("USD 300,00", all_report_html)
+        self.assertIn("EUR 50,00", all_report_html)
+        self.assertIn("1.750,00", all_report_html)
+
+    def test_registered_closing_filters_reject_invalid_or_inverted_dates(self):
+        listing = self.client.get(
+            "/invoices/fechamentos?fechamento_data_de=31/02/2026"
+        )
+        self.assertEqual(listing.status_code, 200)
+        self.assertIn("Data inválida", listing.get_data(as_text=True))
+        self.assertIn("Nenhum Fechamento centralizado registrado", listing.get_data(as_text=True))
+
+        report = self.client.get(
+            "/invoices/fechamentos/relatorio?"
+            "liquidacao_data_de=20/08/2026&liquidacao_data_ate=10/08/2026"
+        )
+        self.assertEqual(report.status_code, 400)
+        self.assertIn("data inicial de liquidação", report.get_data(as_text=True))
+
+    def test_contract_category_migration_backfills_central_financial_contract(self):
+        previous_db = app.DB
+        legacy_path = Path(tempfile.mktemp(prefix="duecontrol_contract_category_migration_", suffix=".db"))
+        try:
+            app.DB = legacy_path
+            app.init_db()
+            conn = app.db()
+            conn.execute("INSERT INTO clientes(nome,pais) VALUES (?,?)", ("Cliente Migração", "BR"))
+            conn.execute("INSERT INTO contrapartes(nome) VALUES (?)", ("Banco Migração",))
+            conn.execute("""
+                INSERT INTO contratos
+                    (numero_contrato,moeda,valor_moeda,valor_reais,status,cliente,cliente_id,
+                     saldo_zerado_manual,categoria_cambio)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, ("MIG-FIN-001", "USD", 75, 375, app.STATUS_PENDENTE,
+                  "Cliente Migração", 1, 0, app.CATEGORIA_CAMBIO_EXPORTACAO))
+            conn.execute("""
+                INSERT INTO fechamentos
+                    (cliente_id,banco_credito_id,moeda,categoria_cambio,data_fechamento,
+                     data_liquidacao,banco_liquidacao_id,taxa_cambio,valor_brl,contrato_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (1, 1, "USD", app.CATEGORIA_CAMBIO_FINANCEIRO, "2026-08-01",
+                  "2026-08-02", 1, 5, 375, 1))
+            conn.execute("""
+                CREATE TABLE contratos_legacy (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    numero_contrato TEXT NOT NULL UNIQUE,
+                    banco_liquidacao_id INTEGER,
+                    banco_liquidacao TEXT,
+                    data_fechamento TEXT,
+                    data_liquidacao TEXT,
+                    moeda TEXT NOT NULL DEFAULT 'USD',
+                    taxa_cambio REAL,
+                    status TEXT NOT NULL DEFAULT 'PENDENTE',
+                    observacao TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    valor_moeda REAL NOT NULL DEFAULT 0,
+                    valor_reais REAL,
+                    banco TEXT,
+                    banco_id INTEGER,
+                    banco_credito TEXT,
+                    data_contrato TEXT,
+                    data_recebimento TEXT,
+                    cnpj TEXT,
+                    cliente TEXT,
+                    cliente_id INTEGER,
+                    competencia_id INTEGER,
+                    saldo_zerado_manual INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                INSERT INTO contratos_legacy
+                SELECT id,numero_contrato,banco_liquidacao_id,banco_liquidacao,data_fechamento,
+                       data_liquidacao,moeda,taxa_cambio,status,observacao,created_at,valor_moeda,
+                       valor_reais,banco,banco_id,banco_credito,data_contrato,data_recebimento,
+                       cnpj,cliente,cliente_id,competencia_id,saldo_zerado_manual
+                FROM contratos
+            """)
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("DROP TABLE contratos")
+            conn.execute("ALTER TABLE contratos_legacy RENAME TO contratos")
+            conn.execute("PRAGMA user_version=11")
+            conn.commit()
+            conn.close()
+
+            app.init_db()
+            conn = app.db()
+            contract = conn.execute(
+                "SELECT categoria_cambio,status,valor_reais,saldo_zerado_manual FROM contratos WHERE id=1"
+            ).fetchone()
+            self.assertEqual(contract["categoria_cambio"], app.CATEGORIA_CAMBIO_FINANCEIRO)
+            self.assertEqual(contract["status"], app.STATUS_CONCLUIDO)
+            self.assertEqual(contract["valor_reais"], 375)
+            self.assertEqual(contract["saldo_zerado_manual"], 0)
+            self.assertEqual(app.contract_summary(conn, 1)["saldo"], app.Decimal("0"))
+            conn.close()
+        finally:
+            app.DB = previous_db
+            legacy_path.unlink(missing_ok=True)
+
+    def test_cambio_category_migration_is_idempotent_and_preserves_legacy_fields(self):
+        previous_db = app.DB
+        legacy_path = Path(tempfile.mktemp(prefix="duecontrol_category_migration_", suffix=".db"))
+        try:
+            conn = sqlite3.connect(legacy_path)
+            conn.execute("""
+                CREATE TABLE fechamentos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cliente_id INTEGER NOT NULL,
+                    banco_credito_id INTEGER NOT NULL,
+                    moeda TEXT NOT NULL,
+                    data_fechamento TEXT NOT NULL,
+                    data_liquidacao TEXT NOT NULL,
+                    banco_liquidacao_id INTEGER NOT NULL,
+                    taxa_cambio REAL,
+                    valor_brl REAL,
+                    contrato_id INTEGER UNIQUE,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                INSERT INTO fechamentos
+                    (cliente_id,banco_credito_id,moeda,data_fechamento,data_liquidacao,
+                     banco_liquidacao_id,taxa_cambio,valor_brl)
+                VALUES (1,2,'USD','2026-08-01','2026-08-02',3,5.1234,512.34)
+            """)
+            conn.execute("PRAGMA user_version=0")
+            conn.commit()
+            conn.close()
+
+            app.DB = legacy_path
+            app.init_db()
+            conn = app.db()
+            first = conn.execute("SELECT * FROM fechamentos").fetchone()
+            first_snapshot = dict(first)
+            self.assertEqual(first["categoria_cambio"], app.CATEGORIA_CAMBIO_EXPORTACAO)
+            self.assertEqual(first["valor_brl"], 512.34)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], app.INVOICE_SCHEMA_VERSION)
+            conn.close()
+
+            app.init_db()
+            conn = app.db()
+            second = conn.execute("SELECT * FROM fechamentos").fetchone()
+            second_snapshot = dict(second)
+            self.assertEqual(second_snapshot, first_snapshot)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos").fetchone()[0], 1)
+            conn.close()
+        finally:
+            app.DB = previous_db
+            legacy_path.unlink(missing_ok=True)
+
+    def test_central_closing_category_is_required_and_limited_to_two_values(self):
+        invoice_id = self._create_invoice("INV-CATEGORY-VALIDATION", "100,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "20/08/2026", "valor_moeda": "100,00",
+        })
+        base = {
+            "selected_ids": [str(invoice_id)], "data_fechamento": "2026-08-21",
+            "data_liquidacao": "2026-08-25", "taxa_cambio": "5,0000",
+            "banco_liquidacao_id": "1",
+        }
+        missing = self.client.post("/invoices/fechamentos", data=base, follow_redirects=True)
+        self.assertIn("Categoria Câmbio é obrigatória", missing.get_data(as_text=True))
+        invalid = self.client.post(
+            "/invoices/fechamentos",
+            data={**base, "categoria_cambio": "Câmbio Turismo"},
+            follow_redirects=True,
+        )
+        self.assertIn("Categoria Câmbio válida", invalid.get_data(as_text=True))
+        page = self.client.get("/invoices/fechamentos")
+        html = page.get_data(as_text=True)
+        self.assertIn('name="categoria_cambio"', html)
+        self.assertIn('name="categoria_cambio" required', html)
+        self.assertEqual(html.count('value="Câmbio Exportação"'), 1)
+        self.assertEqual(html.count('value="Câmbio Financeiro"'), 1)
+        conn = app.db()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos").fetchone()[0], 0)
+        conn.close()
+
+    def test_financial_central_closing_is_concluded_zero_and_excluded_from_due_flow(self):
+        invoice_id = self._create_invoice("INV-FINANCIAL-CATEGORY", "100,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "20/08/2026", "valor_moeda": "100,00",
+        })
+        header = self._register_central_closing(
+            invoice_id, "100,00", "2026-08-21", "2026-08-25",
+            numero_contrato="FINANCIAL-001",
+            categoria_cambio=app.CATEGORIA_CAMBIO_FINANCEIRO,
+        )
+        conn = app.db()
+        contract = conn.execute("SELECT * FROM contratos WHERE id=?", (header["contrato_id"],)).fetchone()
+        self.assertEqual(header["categoria_cambio"], app.CATEGORIA_CAMBIO_FINANCEIRO)
+        self.assertEqual(contract["categoria_cambio"], app.CATEGORIA_CAMBIO_FINANCEIRO)
+        self.assertEqual(contract["status"], app.STATUS_CONCLUIDO)
+        self.assertEqual(contract["saldo_zerado_manual"], 0)
+        summary = app.contract_summary(conn, header["contrato_id"])
+        self.assertEqual(summary["categoria_cambio"], app.CATEGORIA_CAMBIO_FINANCEIRO)
+        self.assertEqual(summary["saldo"], app.Decimal("0"))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM due_contratos").fetchone()[0], 0)
+        conn.close()
+
+        balance = self.client.get(f"/contratos/{header['contrato_id']}/saldo")
+        self.assertEqual(balance.status_code, 200)
+        payload = balance.get_json()
+        self.assertEqual(payload["status"], app.STATUS_CONCLUIDO)
+        self.assertEqual(payload["saldo_disponivel"], 0.0)
+        self.assertEqual(payload["categoria_cambio"], app.CATEGORIA_CAMBIO_FINANCEIRO)
+        self.assertIn(app.STATUS_CONCLUIDO, self.client.get("/").get_data(as_text=True))
+        self.assertIn("FINANCIAL-001", self.client.get("/contratos").get_data(as_text=True))
+        self.assertIn(app.CATEGORIA_CAMBIO_FINANCEIRO, self.client.get(
+            f"/invoices/fechamentos/{header['id']}"
+        ).get_data(as_text=True))
+        due_page = self.client.get("/due/1")
+        self.assertNotIn("FINANCIAL-001", due_page.get_data(as_text=True))
+        rejected = self.client.post("/due/1/vincular", data={
+            "contrato_id": str(header["contrato_id"]), "valor_vinculado": "10,00",
+        }, follow_redirects=True)
+        self.assertIn("Câmbio Financeiro", rejected.get_data(as_text=True))
+        conn = app.db()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM due_contratos").fetchone()[0], 0)
+        conn.close()
+
+    def test_financial_category_toggle_recalculates_without_manual_zeroing(self):
+        invoice_id = self._create_invoice("INV-FINANCIAL-TOGGLE", "100,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "20/08/2026", "valor_moeda": "100,00",
+        })
+        header = self._register_central_closing(
+            invoice_id, "100,00", "2026-08-21", "2026-08-25",
+            numero_contrato="TOGGLE-001",
+            categoria_cambio=app.CATEGORIA_CAMBIO_FINANCEIRO,
+        )
+        response = self.client.post(f"/invoices/fechamentos/{header['id']}/editar", data={
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "data_fechamento": "2026-08-22", "data_liquidacao": "2026-08-26",
+            "taxa_cambio": "5,1000", "banco_liquidacao_id": "1",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        contract = conn.execute("SELECT status,saldo_zerado_manual FROM contratos WHERE id=?", (header["contrato_id"],)).fetchone()
+        self.assertEqual(contract["status"], app.STATUS_PENDENTE)
+        self.assertEqual(contract["saldo_zerado_manual"], 0)
+        conn.close()
+
+        response = self.client.post(f"/invoices/fechamentos/{header['id']}/editar", data={
+            "categoria_cambio": app.CATEGORIA_CAMBIO_FINANCEIRO,
+            "data_fechamento": "2026-08-23", "data_liquidacao": "2026-08-27",
+            "taxa_cambio": "5,2000", "banco_liquidacao_id": "1",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        contract = conn.execute("SELECT status,saldo_zerado_manual FROM contratos WHERE id=?", (header["contrato_id"],)).fetchone()
+        self.assertEqual(contract["status"], app.STATUS_CONCLUIDO)
+        self.assertEqual(contract["saldo_zerado_manual"], 0)
+        self.assertEqual(conn.execute("SELECT categoria_cambio FROM fechamentos WHERE id=?", (header["id"],)).fetchone()[0], app.CATEGORIA_CAMBIO_FINANCEIRO)
+        conn.close()
+
+    def test_financial_closing_without_contract_waits_until_contract_is_added(self):
+        invoice_id = self._create_invoice("INV-FINANCIAL-WAITING", "100,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "20/08/2026", "valor_moeda": "100,00",
+        })
+        header = self._register_central_closing(
+            invoice_id, "100,00", "2026-08-21", "2026-08-25",
+            categoria_cambio=app.CATEGORIA_CAMBIO_FINANCEIRO,
+        )
+        conn = app.db()
+        self.assertIsNone(header["contrato_id"])
+        self.assertEqual(
+            conn.execute("SELECT status FROM invoices WHERE id=?", (invoice_id,)).fetchone()[0],
+            app.INVOICE_STATUS_AGUARDANDO_CONTRATO,
+        )
+        conn.close()
+
+        response = self.client.post(f"/invoices/fechamentos/{header['id']}/editar", data={
+            "categoria_cambio": app.CATEGORIA_CAMBIO_FINANCEIRO,
+            "data_fechamento": "2026-08-22", "data_liquidacao": "2026-08-26",
+            "taxa_cambio": "5,1000", "banco_liquidacao_id": "1",
+            "numero_novo_contrato": "FINANCIAL-WAITING-001",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        contract = conn.execute(
+            "SELECT id,status,saldo_zerado_manual FROM contratos WHERE numero_contrato=?",
+            ("FINANCIAL-WAITING-001",),
+        ).fetchone()
+        self.assertEqual(contract["status"], app.STATUS_CONCLUIDO)
+        self.assertEqual(contract["saldo_zerado_manual"], 0)
+        self.assertEqual(
+            conn.execute("SELECT status FROM invoices WHERE id=?", (invoice_id,)).fetchone()[0],
+            app.INVOICE_STATUS_LIQUIDADA,
+        )
+        self.assertEqual(app.contract_summary(conn, contract["id"])["saldo"], app.Decimal("0"))
+        conn.close()
+
+    def test_legacy_contract_category_can_be_edited_and_recalculated(self):
+        invoice_id = self._create_invoice("INV-LEGACY-CATEGORY", "100,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "20/08/2026", "valor_moeda": "100,00",
+        })
+        response = self.client.post(f"/invoice/{invoice_id}/cambio", data={
+            "numero_contrato": "LEGACY-CATEGORY-001", "banco_liquidacao_id": "1",
+            "data_fechamento": "20/08/2026", "taxa_cambio": "5,1000",
+            "valor_alocado": "100,00",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        contract = conn.execute(
+            "SELECT * FROM contratos WHERE numero_contrato=?", ("LEGACY-CATEGORY-001",)
+        ).fetchone()
+        self.assertEqual(contract["categoria_cambio"], app.CATEGORIA_CAMBIO_EXPORTACAO)
+        contract_id = contract["id"]
+        conn.close()
+
+        edit_page = self.client.get(f"/contrato/{contract_id}/editar")
+        self.assertEqual(edit_page.status_code, 200)
+        edit_html = edit_page.get_data(as_text=True)
+        self.assertIn('name="categoria_cambio" required', edit_html)
+        self.assertEqual(edit_html.count('value="Câmbio Exportação"'), 1)
+        self.assertEqual(edit_html.count('value="Câmbio Financeiro"'), 1)
+
+        response = self.client.post(f"/contrato/{contract_id}/editar", data={
+            "derived_contract_form": "1", "numero_contrato": "LEGACY-CATEGORY-001",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_FINANCEIRO,
+            "banco_liquidacao_id": "1", "data_fechamento": "20/08/2026",
+            "data_liquidacao": "25/08/2026", "taxa_cambio": "5,1000",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        contract = conn.execute(
+            "SELECT categoria_cambio,status,saldo_zerado_manual FROM contratos WHERE id=?",
+            (contract_id,),
+        ).fetchone()
+        self.assertEqual(contract["categoria_cambio"], app.CATEGORIA_CAMBIO_FINANCEIRO)
+        self.assertEqual(contract["status"], app.STATUS_CONCLUIDO)
+        self.assertEqual(app.contract_summary(conn, contract_id)["saldo"], app.Decimal("0"))
+        self.assertEqual(contract["saldo_zerado_manual"], 0)
+        conn.close()
+        detail_html = self.client.get(f"/contrato/{contract_id}").get_data(as_text=True)
+        self.assertIn(app.CATEGORIA_CAMBIO_FINANCEIRO, detail_html)
+        self.assertNotIn("LEGACY-CATEGORY-001", self.client.get("/due/1").get_data(as_text=True))
+
+        response = self.client.post(f"/contrato/{contract_id}/editar", data={
+            "derived_contract_form": "1", "numero_contrato": "LEGACY-CATEGORY-001",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "banco_liquidacao_id": "1", "data_fechamento": "20/08/2026",
+            "data_liquidacao": "25/08/2026", "taxa_cambio": "5,1000",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        summary = app.contract_summary(conn, contract_id)
+        self.assertEqual(summary["categoria_cambio"], app.CATEGORIA_CAMBIO_EXPORTACAO)
+        self.assertEqual(summary["status"], app.STATUS_PENDENTE)
+        self.assertEqual(summary["saldo"], app.Decimal("100"))
+        conn.close()
+
+    def test_legacy_closing_link_is_client_scoped_and_inherits_contract_category(self):
+        contract_invoice = self._create_invoice("INV-LEGACY-LINK-CONTRACT", "100,00")
+        self.client.post(f"/invoice/{contract_invoice}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "20/08/2026", "valor_moeda": "100,00",
+        })
+        self.client.post(f"/invoice/{contract_invoice}/cambio", data={
+            "numero_contrato": "LEGACY-LINK-001", "valor_alocado": "100,00",
+        })
+        closing_invoice = self._create_invoice("INV-LEGACY-LINK-CLOSING", "50,00")
+        self.client.post(f"/invoice/{closing_invoice}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "20/08/2026", "valor_moeda": "50,00",
+        })
+        self.client.post(f"/invoice/{closing_invoice}/fechamentos", data={
+            "valor_moeda": "50,00", "data_fechamento": "21/08/2026",
+        })
+        conn = app.db()
+        contract_id = conn.execute(
+            "SELECT id FROM contratos WHERE numero_contrato=?", ("LEGACY-LINK-001",)
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT id FROM fechamentos_cambio WHERE invoice_id=?", (closing_invoice,)
+        ).fetchone()
+        conn.close()
+        detail_html = self.client.get(f"/contrato/{contract_id}").get_data(as_text=True)
+        self.assertIn("INV-LEGACY-LINK-CLOSING", detail_html)
+
+        response = self.client.post(f"/contrato/{contract_id}/fechamentos/vincular", data={
+            "fechamento_id": str(pending["id"]),
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        linked = conn.execute(
+            "SELECT contrato_id FROM fechamentos_cambio WHERE id=?", (pending["id"],)
+        ).fetchone()
+        self.assertEqual(linked["contrato_id"], contract_id)
+        self.assertEqual(
+            app.contract_summary(conn, contract_id)["valor_moeda"], app.Decimal("150")
+        )
+        conn.close()
+
+        conn = app.db()
+        conn.execute("INSERT INTO clientes(nome,pais) VALUES (?,?)", ("Cliente Outro", "BR"))
+        other_client_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        conn.close()
+        other_invoice = self._create_invoice(
+            "INV-LEGACY-LINK-OTHER", "20,00", client_id=other_client_id
+        )
+        self.client.post(f"/invoice/{other_invoice}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "20/08/2026", "valor_moeda": "20,00",
+        })
+        self.client.post(f"/invoice/{other_invoice}/fechamentos", data={
+            "valor_moeda": "20,00", "data_fechamento": "21/08/2026",
+        })
+        conn = app.db()
+        other_pending = conn.execute(
+            "SELECT id FROM fechamentos_cambio WHERE invoice_id=?", (other_invoice,)
+        ).fetchone()
+        conn.close()
+        detail_html = self.client.get(f"/contrato/{contract_id}").get_data(as_text=True)
+        self.assertNotIn("INV-LEGACY-LINK-OTHER", detail_html)
+        response = self.client.post(
+            f"/contrato/{contract_id}/fechamentos/vincular",
+            data={"fechamento_id": str(other_pending["id"])}, follow_redirects=True,
+        )
+        self.assertIn("mesmo Cliente", response.get_data(as_text=True))
+        conn = app.db()
+        self.assertIsNone(conn.execute(
+            "SELECT contrato_id FROM fechamentos_cambio WHERE id=?", (other_pending["id"],)
+        ).fetchone()[0])
+        conn.close()
+
+    def test_legacy_closing_remains_outside_central_registered_listing(self):
+        invoice_id = self._create_invoice("INV-LEGACY-REPORT", "100,00")
+        conn = app.db()
+        conn.execute("""
+            INSERT INTO fechamentos_cambio
+                (invoice_id, moeda, valor_moeda, data_fechamento, observacao)
+            VALUES (?, 'USD', 100, '2026-08-10', 'Fechamento legado')
+        """, (invoice_id,))
+        conn.commit()
+        conn.close()
+
+        listing = self.client.get("/invoices/fechamentos")
+        self.assertEqual(listing.status_code, 200)
+        listing_html = listing.get_data(as_text=True)
+        self.assertIn("Nenhum Fechamento centralizado registrado", listing_html)
+
+        report = self.client.get("/invoices/fechamentos/relatorio")
+        self.assertEqual(report.status_code, 200)
+        self.assertIn("Nenhum Fechamento encontrado para os filtros informados", report.get_data(as_text=True))
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@
     <div class="report-data">
       <div><span>Tipo da operação</span><strong>Não informado</strong></div>
       <div><span>Número do Contrato Câmbio</span><strong>{{ contrato.numero_contrato or '-' }}</strong></div>
+      <div><span>Categoria Câmbio</span><strong>{{ contrato.categoria_cambio or '-' }}</strong></div>
       <div><span>Status</span><strong><span class="status {{ contrato.status|status_class }}">{{ contrato.status or '-' }}</span></strong></div>
       <div><span>Empresa</span><strong>{{ contrato.empresa_apelido or contrato.empresa_razao_social or contrato.cnpj or '-' }}</strong></div>
       <div><span>Cliente</span><strong>{{ contrato.cliente or '-' }}{% if contrato.cliente_pais %} — {{ contrato.cliente_pais|pais_nome }}{% endif %}</strong></div>

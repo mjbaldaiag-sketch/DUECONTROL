@@ -300,6 +300,7 @@
     const dialogForm = dialog ? dialog.querySelector('[data-central-closing-dialog-form]') : null;
     const dialogItems = dialog ? dialog.querySelector('[data-central-closing-items]') : null;
     const dialogContracts = dialog ? dialog.querySelector('[data-central-closing-contracts]') : null;
+    const liquidationBank = dialogForm ? dialogForm.querySelector('[name="banco_liquidacao_id"]') : null;
     const cancel = dialog ? dialog.querySelector('[data-central-cancel]') : null;
     const selected = () => checkboxes.filter((checkbox) => checkbox.checked);
     const closeDialog = () => {
@@ -383,6 +384,16 @@
           label.appendChild(input);
           dialogContracts.appendChild(label);
         });
+      }
+      if (liquidationBank) {
+        const selectedDefaults = selected().map((checkbox) => (
+          checkbox.dataset.invoiceLiquidationBankId || ''
+        ));
+        const defaultBank = selectedDefaults.length > 0
+          && selectedDefaults.every((bankId) => bankId && bankId === selectedDefaults[0])
+          ? selectedDefaults[0]
+          : '';
+        liquidationBank.value = defaultBank;
       }
     };
     const sync = () => {

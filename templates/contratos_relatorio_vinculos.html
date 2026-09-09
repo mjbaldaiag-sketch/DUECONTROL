@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="print-report contract-link-report">
+  <div class="report-actions">
+    <button class="btn" type="button" onclick="window.print()">Imprimir</button>
+    <a class="btn secondary" href="{{ url_for('lista_contratos') }}">Voltar aos Contratos</a>
+  </div>
+
+  <div class="report-title">
+    <h1>Relatório de vínculos</h1>
+    <p class="muted">Contratos concluídos de Câmbio Exportação vinculados a DU-Es.</p>
+  </div>
+
+  <form method="get" action="{{ url_for('relatorio_vinculos_contratos') }}" class="filters report-filters contract-link-report-filters">
+    <label>Empresa<select name="empresa_id"><option value="">Todas as empresas</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if empresa_id == empresa.id else '' }}>{{ empresa.apelido or empresa.razao_social }} &mdash; {{ empresa.cnpj|cnpj }}</option>{% endfor %}</select></label>
+    <label>Safra/Competência<select name="competencia_id"><option value="">Todas as safras</option>{% for competencia in competencias %}<option value="{{ competencia.id }}" {{ 'selected' if competencia_id == competencia.id else '' }}>{{ competencia.descricao }} &mdash; {{ competencia.apelido or competencia.razao_social }} ({{ competencia.data_inicial|date_br }} a {{ competencia.data_final|date_br }})</option>{% endfor %}</select></label>
+    <label>Atalho de período<select name="periodo"><option value="todos" {{ 'selected' if periodo == 'todos' else '' }}>Todo o período</option><option value="30" {{ 'selected' if periodo == '30' else '' }}>Últimos 30 dias</option><option value="90" {{ 'selected' if periodo == '90' else '' }}>Últimos 90 dias</option><option value="180" {{ 'selected' if periodo == '180' else '' }}>Últimos 180 dias</option><option value="365" {{ 'selected' if periodo == '365' else '' }}>Últimos 12 meses</option></select></label>
+    <label>Período inicial<input name="data_de" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ data_de }}"></label>
+    <label>Período final<input name="data_ate" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ data_ate }}"></label>
+    <label>Contrato Câmbio<input name="numero_contrato" value="{{ numero_contrato }}" placeholder="Pesquisar número"></label>
+    <label>Moeda<select name="moeda"><option value="">Todas</option>{% for item in moedas %}<option value="{{ item }}" {{ 'selected' if moeda == item else '' }}>{{ item }}</option>{% endfor %}</select></label>
+    <div class="filter-actions"><button type="submit">Aplicar filtros</button><button class="secondary" type="submit" formaction="{{ url_for('exportar_relatorio_vinculos_contratos') }}">Exportar Excel</button><a class="btn secondary" href="{{ url_for('relatorio_vinculos_contratos') }}">Limpar filtros</a></div>
+  </form>
+
+  <div class="report-context">
+    <span>{{ total_registros }} vínculo(s) encontrado(s)</span>
+    <span>Status: <strong>CONCLUÍDO</strong></span>
+    <span>Categoria: <strong>Câmbio Exportação</strong></span>
+    <span>Período: <strong>{{ periodo_label }}</strong></span>
+    <span>Empresa: <strong>{{ empresa_label }}</strong></span>
+    <span>Safra: <strong>{{ safra_label }}</strong></span>
+  </div>
+
+  <section class="report-section">
+    <div class="table-wrap">
+      <table class="compact-table contract-link-report-table" data-sortable>
+        <thead><tr><th>EMPRESA</th><th data-sort-type="date">DATA LANÇAMENTO</th><th>CNPJ</th><th>BANCO</th><th>CONTRATO</th><th data-sort-type="number">VALOR EM USD</th><th>TRADING</th><th>DUE</th><th>CHAVE DE ACESSO</th><th data-sort-type="number">VALOR UTILIZADO</th></tr></thead>
+        <tbody>
+        {% for vinculo in vinculos %}
+          <tr><td>{{ vinculo.empresa }}</td><td data-sort-value="{{ vinculo.data_lancamento or '' }}">{{ vinculo.data_lancamento|date_br or '-' }}</td><td>{{ vinculo.cnpj }}</td><td>{{ vinculo.banco }}</td><td>{{ vinculo.contrato }}</td><td data-sort-value="{{ vinculo.valor_usd }}">{{ vinculo.valor_usd|money }}</td><td>{{ vinculo.trading }}</td><td>{{ vinculo.due }}</td><td>{{ vinculo.chave_acesso }}</td><td data-sort-value="{{ vinculo.valor_utilizado }}">{{ vinculo.valor_utilizado|money }}</td></tr>
+        {% else %}
+          <tr><td class="empty" colspan="10">Nenhum vínculo encontrado para os filtros informados.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}
