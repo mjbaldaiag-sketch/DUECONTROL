@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Relatório de Fechamentos</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<main class="print-report closing-report">
+  <div class="report-actions">
+    <button class="btn" type="button" onclick="window.print()">Imprimir / Salvar PDF</button>
+    <a class="btn secondary" href="{{ url_for('gestao_fechamentos_invoices') }}">Voltar aos Fechamentos</a>
+  </div>
+
+  <div class="report-title">
+    <h1>Relatório de Fechamentos</h1>
+    <p class="muted">{{ total_registros }} fechamento(s) filtrados.</p>
+  </div>
+
+  <section class="report-section">
+    <table class="compact-table closing-report-table">
+      <thead>
+        <tr>
+          <th>Empresa / apelido</th>
+          <th>Contrato</th>
+          <th>Categoria Câmbio</th>
+          <th>Cliente</th>
+          <th>Banco de crédito</th>
+          <th>Banco de liquidação</th>
+          <th>Data de fechamento</th>
+          <th>Data de liquidação</th>
+          <th>Valor original</th>
+          <th>Taxa</th>
+          <th>Valor em BRL</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for grupo in fechamentos_por_contrato %}
+        {% set fechamento = grupo.fechamento %}
+        <tr>
+          <td>{{ fechamento.empresas_apelidos or '-' }}</td>
+          <td>{{ grupo.nome }}</td>
+          <td>{{ fechamento.categoria_cambio or '-' }}</td>
+          <td>{{ fechamento.cliente_nome or '-' }}</td>
+          <td>{{ fechamento.banco_credito_nome or '-' }}</td>
+          <td>{{ fechamento.banco_liquidacao_nome or '-' }}</td>
+          <td>{{ fechamento.data_fechamento|date_br or '-' }}</td>
+          <td>{{ fechamento.data_liquidacao|date_br or '-' }}</td>
+          <td class="report-number">{{ fechamento.valor_moeda|money }}</td>
+          <td>{{ fechamento.taxa_cambio|rate if fechamento.taxa_cambio is not none else '-' }}</td>
+          <td class="report-number">{{ fechamento.valor_brl|money if fechamento.valor_brl is not none else '-' }}</td>
+        </tr>
+      {% else %}
+        <tr><td class="empty" colspan="11">Nenhum Fechamento encontrado para os filtros informados.</td></tr>
+      {% endfor %}
+      </tbody>
+      <tfoot>
+        <tr class="closing-report-total-row">
+          <td colspan="8"></td>
+          <td class="report-number">{% for total in totais_moeda %}{{ total.valor|money }}{% if not loop.last %} / {% endif %}{% else %}0,00{% endfor %}</td>
+          <td></td>
+          <th class="report-number">{{ total_brl|money }}</th>
+        </tr>
+      </tfoot>
+    </table>
+  </section>
+
+  <section class="report-section closing-report-analytics">
+    <h2>RESUMO POR BANCO / EMPRESA</h2>
+    <table class="compact-table closing-report-summary-table">
+      <thead>
+        <tr><th>Banco / empresa / contrato</th><th>Total em BRL</th></tr>
+      </thead>
+      <tbody>
+      {% for banco in resumo_banco_empresa %}
+        <tr class="closing-report-bank-row">
+          <th>TOTAL {{ banco.nome }}</th>
+          <td class="report-number">{{ banco.total_brl|money }}</td>
+        </tr>
+        {% for empresa in banco.empresas %}
+        <tr class="closing-report-company-row">
+          <td class="closing-report-level-company">{{ empresa.nome }}</td>
+          <td class="report-number">{{ empresa.total_brl|money }}</td>
+        </tr>
+          {% for contrato in empresa.contratos %}
+        <tr class="closing-report-contract-row">
+          <td class="closing-report-level-contract">{{ contrato.nome }}</td>
+          <td class="report-number">{{ contrato.total_brl|money }}</td>
+        </tr>
+          {% endfor %}
+        {% endfor %}
+      {% else %}
+        <tr><td class="empty" colspan="2">Nenhum Banco encontrado.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="report-section closing-report-analytics">
+    <h2>TOTAL POR CLIENTE</h2>
+    <table class="compact-table closing-report-summary-table closing-report-client-table">
+      <thead>
+        <tr><th>Cliente</th><th>Total em BRL</th></tr>
+      </thead>
+      <tbody>
+      {% for cliente in totais_cliente %}
+        <tr>
+          <td>{{ cliente.nome }}</td>
+          <td class="report-number">{{ cliente.total_brl|money }}</td>
+        </tr>
+      {% else %}
+        <tr><td class="empty" colspan="2">Nenhum Cliente encontrado.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</main>
+</body>
+</html>

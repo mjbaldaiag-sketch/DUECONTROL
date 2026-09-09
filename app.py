@@ -6323,24 +6323,93 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
     return groups
 
 
-def central_closing_headers(conn, filters=None):
+def central_closing_filter_context(args):
+    """Normaliza os filtros da tabela de Fechamentos registrados.
+
+    Os nomes recebidos pela tela são prefixados para não interferirem nos
+    filtros da tabela de Invoices elegíveis exibida na mesma página.
+    """
+    raw = {
+        "cliente_id": (args.get("fechamento_cliente_id", "") or "").strip(),
+        "data_fechamento_de": (args.get("fechamento_data_de", "") or "").strip(),
+        "data_fechamento_ate": (args.get("fechamento_data_ate", "") or "").strip(),
+        "data_liquidacao_de": (args.get("liquidacao_data_de", "") or "").strip(),
+        "data_liquidacao_ate": (args.get("liquidacao_data_ate", "") or "").strip(),
+        "banco_liquidacao_id": (args.get("fechamento_banco_liquidacao_id", "") or "").strip(),
+    }
+    query = {}
+    if raw["cliente_id"]:
+        cliente_id = form_record_id(raw["cliente_id"])
+        if not cliente_id:
+            raise ValueError("O Cliente selecionado para os Fechamentos é inválido.")
+        query["cliente_id"] = cliente_id
+    if raw["banco_liquidacao_id"]:
+        banco_id = form_record_id(raw["banco_liquidacao_id"])
+        if not banco_id:
+            raise ValueError("O Banco de Liquidação selecionado é inválido.")
+        query["banco_liquidacao_id"] = banco_id
+
+    for key in (
+        "data_fechamento_de", "data_fechamento_ate",
+        "data_liquidacao_de", "data_liquidacao_ate",
+    ):
+        if raw[key]:
+            query[key] = parse_date(raw[key])
+    if (
+        query.get("data_fechamento_de")
+        and query.get("data_fechamento_ate")
+        and query["data_fechamento_de"] > query["data_fechamento_ate"]
+    ):
+        raise ValueError("A data inicial de fechamento não pode ser posterior à data final.")
+    if (
+        query.get("data_liquidacao_de")
+        and query.get("data_liquidacao_ate")
+        and query["data_liquidacao_de"] > query["data_liquidacao_ate"]
+    ):
+        raise ValueError("A data inicial de liquidação não pode ser posterior à data final.")
+    return {"raw": raw, "query": query}
+
+
+def central_closing_filter_sql(filters=None, alias="h"):
     filters = filters or {}
+    if filters.get("_no_results"):
+        return "WHERE 1=0", []
     clauses = []
     params = []
     if filters.get("cliente_id"):
-        clauses.append("h.cliente_id=?")
+        clauses.append(f"{alias}.cliente_id=?")
         params.append(filters["cliente_id"])
     if filters.get("banco_credito_id"):
-        clauses.append("h.banco_credito_id=?")
+        clauses.append(f"{alias}.banco_credito_id=?")
         params.append(filters["banco_credito_id"])
     if filters.get("moeda"):
-        clauses.append("h.moeda=?")
+        clauses.append(f"{alias}.moeda=?")
         params.append(filters["moeda"])
+    for key, column, operator in (
+        ("data_fechamento_de", "data_fechamento", ">="),
+        ("data_fechamento_ate", "data_fechamento", "<="),
+        ("data_liquidacao_de", "data_liquidacao", ">="),
+        ("data_liquidacao_ate", "data_liquidacao", "<="),
+    ):
+        if filters.get(key):
+            clauses.append(f"{alias}.{column} {operator} ?")
+            params.append(filters[key])
+    if filters.get("banco_liquidacao_id"):
+        clauses.append(f"{alias}.banco_liquidacao_id=?")
+        params.append(filters["banco_liquidacao_id"])
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def central_closing_headers(conn, filters=None):
+    where, params = central_closing_filter_sql(filters)
     return conn.execute(f"""
         SELECT h.*, cl.nome AS cliente_nome,
                bc.nome AS banco_credito_nome, bl.nome AS banco_liquidacao_nome,
                c.numero_contrato, c.status AS contrato_status,
+               MIN(e.prioridade) AS empresa_prioridade,
+               GROUP_CONCAT(DISTINCT COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social))
+                   AS empresas_apelidos,
                COALESCE(SUM(f.valor_moeda), 0) AS valor_moeda
         FROM fechamentos h
         JOIN clientes cl ON cl.id=h.cliente_id
@@ -6348,10 +6417,203 @@ def central_closing_headers(conn, filters=None):
         JOIN contrapartes bl ON bl.id=h.banco_liquidacao_id
         LEFT JOIN contratos c ON c.id=h.contrato_id
         LEFT JOIN fechamentos_cambio f ON f.fechamento_id=h.id
+        LEFT JOIN invoices i ON i.id=f.invoice_id
+        LEFT JOIN empresas e ON e.id=i.empresa_id
         {where}
         GROUP BY h.id
-        ORDER BY h.id DESC
+        ORDER BY CASE WHEN MIN(e.prioridade) IS NULL THEN 1 ELSE 0 END,
+                 MIN(e.prioridade),
+                 CASE WHEN h.valor_brl IS NULL THEN 1 ELSE 0 END,
+                 h.valor_brl DESC, MIN(e.id), h.id DESC
     """, params).fetchall()
+
+
+def central_closing_report_items(conn, filters=None):
+    where, params = central_closing_filter_sql(filters)
+    return conn.execute(f"""
+        SELECT h.id AS fechamento_id,
+               COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social) AS empresa_nome,
+               cl.nome AS cliente_nome, bc.nome AS banco_credito_nome,
+               e.id AS empresa_id, e.prioridade AS empresa_prioridade,
+               c.numero_contrato, f.moeda, f.valor_moeda, h.taxa_cambio
+        FROM fechamentos h
+        JOIN clientes cl ON cl.id=h.cliente_id
+        JOIN contrapartes bc ON bc.id=h.banco_credito_id
+        JOIN fechamentos_cambio f ON f.fechamento_id=h.id
+        JOIN invoices i ON i.id=f.invoice_id
+        JOIN empresas e ON e.id=i.empresa_id
+        LEFT JOIN contratos c ON c.id=h.contrato_id
+        {where}
+        ORDER BY CASE WHEN e.prioridade IS NULL THEN 1 ELSE 0 END,
+                 e.prioridade, h.valor_brl DESC, e.id,
+                 h.id DESC, c.numero_contrato, f.id
+    """, params).fetchall()
+
+
+def closing_report_amounts_by_currency(items, currency_key="moeda", value_key="valor_moeda"):
+    totals = {}
+    for item in items:
+        moeda = str(item[currency_key] or "-").upper()
+        totals[moeda] = totals.get(moeda, Decimal("0")) + decimal_value(item[value_key])
+    return [
+        {"moeda": moeda, "valor": valor}
+        for moeda, valor in sorted(totals.items())
+    ]
+
+
+def closing_report_brl_total(items, value_key="valor_brl"):
+    total = sum(
+        (decimal_value(item.get(value_key)) for item in items),
+        Decimal("0"),
+    )
+    return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def closing_report_group_totals(items, group_key):
+    grouped = {}
+    for item in items:
+        grouped.setdefault(item[group_key] or "-", []).append(item)
+    return [
+        {
+            "nome": nome,
+            "total_brl": closing_report_brl_total(group_items, "valor_brl"),
+        }
+        for nome, group_items in sorted(
+            grouped.items(), key=lambda entry: str(entry[0]).casefold()
+        )
+    ]
+
+
+def closing_report_company_sort_key(row):
+    """Ordena empresas por prioridade e, dentro dela, por BRL decrescente."""
+    base_key = empresa_sort_key({
+        "empresa_nome": row["nome"],
+        "empresa_id": row.get("_id"),
+        "empresa_prioridade": row.get("_prioridade"),
+    })
+    return base_key[:2] + (-decimal_value(row["total_brl"]),) + base_key[2:]
+
+
+def closing_report_contract_sort_key(row):
+    """Ordena contratos pelo maior total BRL, usando o número como desempate."""
+    return (
+        -decimal_value(row["total_brl"]),
+        str(row["nome"]).casefold(),
+    )
+
+
+def closing_report_hierarchy(items):
+    """Agrupa o resumo visual por banco, empresa e contrato."""
+    grouped = {}
+    for item in items:
+        banco = item["banco_credito_nome"] or "-"
+        empresa = item["empresa_nome"] or "-"
+        contrato = item["numero_contrato"] or "Pendente"
+        empresas = grouped.setdefault(banco, {})
+        empresa_data = empresas.setdefault(
+            empresa,
+            {
+                "id": item.get("empresa_id"),
+                "prioridade": item.get("empresa_prioridade"),
+                "contratos": {},
+            },
+        )
+        empresa_data["contratos"].setdefault(contrato, []).append(item)
+
+    bancos = []
+    for banco, empresas in sorted(grouped.items(), key=lambda entry: str(entry[0]).casefold()):
+        empresa_rows = []
+        banco_items = []
+        for empresa_data in empresas.values():
+            for contract_items in empresa_data["contratos"].values():
+                banco_items.extend(contract_items)
+        for empresa, empresa_data in sorted(
+            empresas.items(),
+            key=lambda entry: empresa_sort_key({
+                "empresa_nome": entry[0],
+                "empresa_id": entry[1]["id"],
+                "empresa_prioridade": entry[1]["prioridade"],
+            }),
+        ):
+            contrato_rows = []
+            empresa_items = []
+            contracts = empresa_data["contratos"]
+            for contract_items in contracts.values():
+                empresa_items.extend(contract_items)
+            for contrato, contract_items in contracts.items():
+                contrato_rows.append({
+                    "nome": contrato,
+                    "total_brl": closing_report_brl_total(contract_items),
+                })
+            contrato_rows.sort(key=closing_report_contract_sort_key)
+            empresa_rows.append({
+                "nome": empresa,
+                "total_brl": closing_report_brl_total(empresa_items),
+                "contratos": contrato_rows,
+                "_id": empresa_data["id"],
+                "_prioridade": empresa_data["prioridade"],
+            })
+        empresa_rows.sort(key=closing_report_company_sort_key)
+        for row in empresa_rows:
+            row.pop("_id", None)
+            row.pop("_prioridade", None)
+        bancos.append({
+            "nome": banco,
+            "total_brl": closing_report_brl_total(banco_items),
+            "empresas": empresa_rows,
+        })
+    return bancos
+
+
+def central_closing_report_context(args):
+    filters = central_closing_filter_context(args)
+    conn = db()
+    try:
+        fechamentos = central_closing_headers(conn, filters["query"])
+        report_items = central_closing_report_items(conn, filters["query"])
+    finally:
+        conn.close()
+
+    report_items = [dict(item) for item in report_items]
+    for item in report_items:
+        item["valor_brl"] = (
+            closing_brl_value(item["valor_moeda"], item["taxa_cambio"])
+            if item["taxa_cambio"] is not None
+            else None
+        )
+
+    total_brl = Decimal("0")
+    for fechamento in fechamentos:
+        if fechamento["valor_brl"] is not None:
+            total_brl += decimal_value(fechamento["valor_brl"])
+
+    fechamentos_por_contrato = [
+        {
+            "nome": fechamento["numero_contrato"] or "Pendente",
+            "fechamento": fechamento,
+        }
+        for fechamento in fechamentos
+    ]
+
+    return {
+        "fechamentos": fechamentos,
+        "fechamentos_por_contrato": fechamentos_por_contrato,
+        "closing_filters": filters["raw"],
+        "totais_moeda": closing_report_amounts_by_currency(fechamentos),
+        "total_brl": total_brl,
+        "total_registros": len(fechamentos),
+        "resumo_banco_empresa": closing_report_hierarchy(report_items),
+        "totais_cliente": closing_report_group_totals(
+            [
+                {
+                    "cliente_nome": fechamento["cliente_nome"],
+                    "valor_brl": fechamento["valor_brl"],
+                }
+                for fechamento in fechamentos
+            ],
+            "cliente_nome",
+        ),
+    }
 
 
 def central_closing_detail(conn, fechamento_id):
@@ -7050,7 +7312,7 @@ def central_closing_page_data(conn):
         "eligible_invoices": eligible,
         "clientes": clientes_for_form(conn),
         "contrapartes": contrapartes_for_form(conn),
-        "fechamentos": central_closing_headers(conn),
+        "fechamentos": central_closing_headers(conn, closing_filters),
         "moedas": [row[0] for row in conn.execute(
             "SELECT DISTINCT moeda FROM invoices ORDER BY moeda"
         ).fetchall()],
@@ -7059,9 +7321,28 @@ def central_closing_page_data(conn):
 
 @app.route("/invoices/fechamentos")
 def gestao_fechamentos_invoices():
+    closing_filter_error = None
+    try:
+        closing_filter_context = central_closing_filter_context(request.args)
+        closing_query = closing_filter_context["query"]
+        closing_filters = closing_filter_context["raw"]
+    except ValueError as exc:
+        closing_filter_error = str(exc)
+        closing_query = {"_no_results": True}
+        closing_filters = {
+            "cliente_id": (request.args.get("fechamento_cliente_id", "") or "").strip(),
+            "data_fechamento_de": (request.args.get("fechamento_data_de", "") or "").strip(),
+            "data_fechamento_ate": (request.args.get("fechamento_data_ate", "") or "").strip(),
+            "data_liquidacao_de": (request.args.get("liquidacao_data_de", "") or "").strip(),
+            "data_liquidacao_ate": (request.args.get("liquidacao_data_ate", "") or "").strip(),
+            "banco_liquidacao_id": (
+                request.args.get("fechamento_banco_liquidacao_id", "") or ""
+            ).strip(),
+        }
+        flash(closing_filter_error, "danger")
     conn = db()
     try:
-        data = central_closing_page_data(conn)
+        data = central_closing_page_data(conn, closing_query)
     finally:
         conn.close()
     filters = {
@@ -7077,7 +7358,22 @@ def gestao_fechamentos_invoices():
         and (not filters["moeda"] or invoice["moeda"] == filters["moeda"])
         and (not filters["numero_invoice"] or filters["numero_invoice"].casefold() in str(invoice["numero_invoice"]).casefold())
     ]
-    return render_template("invoice_fechamentos.html", filters=filters, **data)
+    return render_template(
+        "invoice_fechamentos.html",
+        filters=filters,
+        closing_filters=closing_filters,
+        closing_filter_error=closing_filter_error,
+        **data,
+    )
+
+
+@app.route("/invoices/fechamentos/relatorio")
+def relatorio_fechamentos_invoices():
+    try:
+        context = central_closing_report_context(request.args)
+    except ValueError as exc:
+        return str(exc), 400
+    return render_template("invoice_fechamentos_relatorio.html", **context)
 
 
 @app.route("/invoices/fechamentos/preview", methods=["POST"])

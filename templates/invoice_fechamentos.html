@@ -59,6 +59,19 @@
 </dialog>
 
 <h2>Fechamentos registrados</h2>
+<form method="get" action="{{ url_for('gestao_fechamentos_invoices') }}" class="filters registered-closing-filters">
+  <label>Cliente<select name="fechamento_cliente_id"><option value="">Todos</option>{% for cliente in clientes %}<option value="{{ cliente.id }}" {{ 'selected' if closing_filters.cliente_id == cliente.id|string else '' }}>{{ cliente.nome }}</option>{% endfor %}</select></label>
+  <label>Data de fechamento — de<input name="fechamento_data_de" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ closing_filters.data_fechamento_de }}"></label>
+  <label>Data de fechamento — até<input name="fechamento_data_ate" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ closing_filters.data_fechamento_ate }}"></label>
+  <label>Data de liquidação — de<input name="liquidacao_data_de" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ closing_filters.data_liquidacao_de }}"></label>
+  <label>Data de liquidação — até<input name="liquidacao_data_ate" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ closing_filters.data_liquidacao_ate }}"></label>
+  <label>Banco de liquidação<select name="fechamento_banco_liquidacao_id"><option value="">Todos</option>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if closing_filters.banco_liquidacao_id == banco.id|string else '' }}>{{ banco.nome }}</option>{% endfor %}</select></label>
+  <div class="filter-actions">
+    <button type="submit">Filtrar</button>
+    <button class="btn report-filter-btn" type="submit" formaction="{{ url_for('relatorio_fechamentos_invoices') }}" formtarget="_blank">Relatório</button>
+    <a class="btn secondary" href="{{ url_for('gestao_fechamentos_invoices') }}">Limpar</a>
+  </div>
+</form>
 <div class="table-wrap"><table class="compact-table">
   <thead><tr><th>ID</th><th>Cliente</th><th>Banco de Crédito</th><th>Moeda</th><th>Valor</th><th>BRL</th><th>Taxa</th><th>Fechamento</th><th>Liquidação</th><th>Contrato</th><th>Ações</th></tr></thead>
   <tbody>
