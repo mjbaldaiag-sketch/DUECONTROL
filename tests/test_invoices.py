@@ -2451,6 +2451,71 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM contratos WHERE numero_contrato='CENTRAL-001'").fetchone()[0], 0)
         conn.close()
 
+    def test_central_closing_detail_navigates_in_registered_order_and_preserves_filters(self):
+        closings = [
+            self._register_central_closing(
+                self._create_invoice("INV-NAV-LOW", "100,00"),
+                "100,00", "2026-08-10", "2026-08-15",
+            ),
+            self._register_central_closing(
+                self._create_invoice("INV-NAV-HIGH", "300,00"),
+                "300,00", "2026-08-11", "2026-08-16",
+            ),
+            self._register_central_closing(
+                self._create_invoice("INV-NAV-MIDDLE", "200,00"),
+                "200,00", "2026-08-12", "2026-08-17",
+            ),
+        ]
+
+        conn = app.db()
+        ordered = app.central_closing_headers(conn)
+        ordered_ids = [row["id"] for row in ordered]
+        conn.close()
+        self.assertEqual(ordered_ids, [closings[1]["id"], closings[2]["id"], closings[0]["id"]])
+
+        first_html = self.client.get(
+            f"/invoices/fechamentos/{ordered_ids[0]}"
+        ).get_data(as_text=True)
+        self.assertIn('aria-disabled="true">← Anterior</span>', first_html)
+        self.assertIn(
+            f'href="/invoices/fechamentos/{ordered_ids[1]}"', first_html
+        )
+
+        middle_html = self.client.get(
+            f"/invoices/fechamentos/{ordered_ids[1]}"
+        ).get_data(as_text=True)
+        self.assertIn(
+            f'href="/invoices/fechamentos/{ordered_ids[0]}"', middle_html
+        )
+        self.assertIn(
+            f'href="/invoices/fechamentos/{ordered_ids[2]}"', middle_html
+        )
+
+        last_html = self.client.get(
+            f"/invoices/fechamentos/{ordered_ids[2]}"
+        ).get_data(as_text=True)
+        self.assertIn(
+            f'href="/invoices/fechamentos/{ordered_ids[1]}"', last_html
+        )
+        self.assertIn('aria-disabled="true">Próximo →</span>', last_html)
+
+        filtered_query = "fechamento_data_de=11/08/2026"
+        listing_html = self.client.get(
+            f"/invoices/fechamentos?{filtered_query}"
+        ).get_data(as_text=True)
+        self.assertIn("fechamento_data_de=11", listing_html)
+        filtered_detail_html = self.client.get(
+            f"/invoices/fechamentos/{ordered_ids[0]}?{filtered_query}"
+        ).get_data(as_text=True)
+        self.assertIn(
+            f'href="/invoices/fechamentos/{ordered_ids[1]}?fechamento_data_de=11',
+            filtered_detail_html,
+        )
+        self.assertIn(
+            'href="/invoices/fechamentos?fechamento_data_de=11',
+            filtered_detail_html,
+        )
+
     def test_closing_report_aggregates_gross_brl_before_rounding(self):
         invoice_ids = [
             self._create_invoice("INV-GROSS-A", "23544,82"),

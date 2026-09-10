@@ -7128,6 +7128,26 @@ def central_closing_filter_context(args):
     return {"raw": raw, "query": query}
 
 
+CENTRAL_CLOSING_CONTEXT_ARGUMENTS = frozenset({
+    "fechamento_cliente_id",
+    "fechamento_data_de",
+    "fechamento_data_ate",
+    "liquidacao_data_de",
+    "liquidacao_data_ate",
+    "fechamento_banco_liquidacao_id",
+    "fechamentos_page",
+})
+
+
+def central_closing_context_args(args):
+    """Preserva somente o contexto relevante da listagem de Fechamentos."""
+    return {
+        key: value
+        for key, value in args.items()
+        if key in CENTRAL_CLOSING_CONTEXT_ARGUMENTS and value not in (None, "")
+    }
+
+
 def central_closing_filter_sql(filters=None, alias="h"):
     filters = filters or {}
     if filters.get("_no_results"):
@@ -7159,6 +7179,14 @@ def central_closing_filter_sql(filters=None, alias="h"):
     return where, params
 
 
+CENTRAL_CLOSING_ORDER_SQL = """
+    CASE WHEN MIN(e.prioridade) IS NULL THEN 1 ELSE 0 END,
+    MIN(e.prioridade),
+    CASE WHEN h.valor_brl IS NULL THEN 1 ELSE 0 END,
+    h.valor_brl DESC, MIN(e.id), h.id DESC
+"""
+
+
 def central_closing_headers(conn, filters=None, pagination=None):
     where, params = central_closing_filter_sql(filters)
     limit_clause = ""
@@ -7184,11 +7212,37 @@ def central_closing_headers(conn, filters=None, pagination=None):
         LEFT JOIN empresas e ON e.id=i.empresa_id
         {where}
         GROUP BY h.id
-        ORDER BY CASE WHEN MIN(e.prioridade) IS NULL THEN 1 ELSE 0 END,
-                 MIN(e.prioridade),
-                 CASE WHEN h.valor_brl IS NULL THEN 1 ELSE 0 END,
-                 h.valor_brl DESC, MIN(e.id), h.id DESC{limit_clause}
+        ORDER BY {CENTRAL_CLOSING_ORDER_SQL}{limit_clause}
     """, query_params).fetchall()
+
+
+def central_closing_navigation(conn, fechamento_id, filters=None):
+    """Retorna somente os fechamentos vizinhos na ordem oficial da listagem."""
+    where, params = central_closing_filter_sql(filters)
+    row = conn.execute(f"""
+        WITH ranked AS (
+            SELECT h.id,
+                   LAG(h.id) OVER (ORDER BY {CENTRAL_CLOSING_ORDER_SQL}) AS previous_id,
+                   LEAD(h.id) OVER (ORDER BY {CENTRAL_CLOSING_ORDER_SQL}) AS next_id
+            FROM fechamentos h
+            JOIN clientes cl ON cl.id=h.cliente_id
+            JOIN contrapartes bc ON bc.id=h.banco_credito_id
+            JOIN contrapartes bl ON bl.id=h.banco_liquidacao_id
+            LEFT JOIN contratos c ON c.id=h.contrato_id
+            LEFT JOIN fechamentos_cambio f ON f.fechamento_id=h.id
+            LEFT JOIN invoices i ON i.id=f.invoice_id
+            LEFT JOIN empresas e ON e.id=i.empresa_id
+            {where}
+            GROUP BY h.id
+        )
+        SELECT previous_id, next_id
+        FROM ranked
+        WHERE id=?
+    """, [*params, fechamento_id]).fetchone()
+    return {
+        "previous_id": row["previous_id"] if row else None,
+        "next_id": row["next_id"] if row else None,
+    }
 
 
 def central_closing_headers_count(conn, filters=None):
@@ -8155,6 +8209,7 @@ def gestao_fechamentos_invoices():
         "invoice_fechamentos.html",
         filters=filters,
         closing_filters=closing_filters,
+        closing_context_args=central_closing_context_args(request.args),
         closing_filter_error=closing_filter_error,
         eligible_pagination=eligible_pagination,
         closing_pagination=closing_pagination,
@@ -8289,12 +8344,29 @@ def registrar_fechamentos_invoices():
 @app.route("/invoices/fechamentos/<int:fechamento_id>")
 def detalhe_fechamento_invoice(fechamento_id):
     conn = db()
-    detail = central_closing_detail(conn, fechamento_id)
-    contrapartes = contrapartes_for_form(conn)
-    conn.close()
+    try:
+        detail = central_closing_detail(conn, fechamento_id)
+        if detail:
+            contrapartes = contrapartes_for_form(conn)
+            try:
+                closing_filter_context = central_closing_filter_context(request.args)
+                closing_query = closing_filter_context["query"]
+            except ValueError:
+                closing_query = {"_no_results": True}
+            closing_navigation = central_closing_navigation(
+                conn, fechamento_id, closing_query
+            )
+    finally:
+        conn.close()
     if not detail:
         return "Fechamento não encontrado", 404
-    return render_template("invoice_fechamento_detalhe.html", fechamento=detail, contrapartes=contrapartes)
+    return render_template(
+        "invoice_fechamento_detalhe.html",
+        fechamento=detail,
+        contrapartes=contrapartes,
+        closing_navigation=closing_navigation,
+        closing_context_args=central_closing_context_args(request.args),
+    )
 
 
 @app.route("/invoices/fechamentos/<int:fechamento_id>/editar", methods=["POST"])
