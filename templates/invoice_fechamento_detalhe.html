@@ -15,6 +15,35 @@
 </div>
 <h2>Invoices participantes</h2>
 <div class="table-wrap"><table class="compact-table"><thead><tr><th>Invoice</th><th>Empresa</th><th>Moeda</th><th>Valor</th></tr></thead><tbody>{% for item in fechamento['items'] %}<tr><td><a href="{{ url_for('detalhe_invoice', invoice_id=item.invoice_id) }}">{{ item.numero_invoice }}</a></td><td>{{ item.empresa_apelido or item.empresa_razao_social }}</td><td>{{ item.invoice_moeda }}</td><td>{{ item.valor_moeda|money }}</td></tr>{% else %}<tr><td class="empty" colspan="4">Nenhuma Invoice vinculada.</td></tr>{% endfor %}</tbody></table></div>
+{% set auxiliary = namespace(parts=[], invoice_numbers=[]) %}
+{% set cliente_nome = (fechamento.cliente_nome|string|trim) if fechamento.cliente_nome else '' %}
+{% if cliente_nome %}{% set _ = auxiliary.parts.append(cliente_nome) %}{% endif %}
+{% set categoria_cambio = (fechamento.categoria_cambio|string|trim) if fechamento.categoria_cambio else '' %}
+{% if categoria_cambio %}{% set _ = auxiliary.parts.append(categoria_cambio) %}{% endif %}
+{% for item in fechamento['items'] %}
+  {% set numero_invoice = (item.numero_invoice|string|trim) if item.numero_invoice else '' %}
+  {% if numero_invoice %}{% set _ = auxiliary.invoice_numbers.append(numero_invoice) %}{% endif %}
+{% endfor %}
+{% if auxiliary.invoice_numbers %}
+  {% set invoice_prefix = 'INVOICE ' if auxiliary.invoice_numbers|length == 1 else 'INVOICES ' %}
+  {% set _ = auxiliary.parts.append(invoice_prefix ~ auxiliary.invoice_numbers|join(', ')) %}
+{% endif %}
+{% if fechamento.previsao_embarque_dias is not none and (fechamento.previsao_embarque_dias|string|trim) %}
+  {% set _ = auxiliary.parts.append('EMBARQUE ' ~ fechamento.previsao_embarque_dias ~ ' DIAS') %}
+{% endif %}
+{% if fechamento.taxa_cambio is not none and (fechamento.taxa_cambio|string|trim) %}
+  {% set _ = auxiliary.parts.append('TAXA ' ~ (fechamento.taxa_cambio|rate)) %}
+{% endif %}
+{% set auxiliary_text = auxiliary.parts|join(';') %}
+{% if auxiliary_text %}
+<section class="closing-auxiliary-info" aria-labelledby="closing-auxiliary-info-title">
+  <h2 id="closing-auxiliary-info-title">Informações auxiliares</h2>
+  <div class="closing-auxiliary-info-line">
+    <span class="closing-auxiliary-info-text">{{ auxiliary_text }}</span>
+    <button type="button" class="copy-data-btn closing-auxiliary-copy" data-copy-value="{{ auxiliary_text }}" aria-label="Copiar informações auxiliares">Copiar</button>
+  </div>
+</section>
+{% endif %}
 <h2>Editar grupo</h2>
 <form method="post" action="{{ url_for('editar_fechamento_invoice', fechamento_id=fechamento.id) }}" class="form inline-form central-closing-edit-form" data-previsao-embarque-form>
   <label>Categoria Câmbio<select name="categoria_cambio" data-previsao-cambio-category required><option value="Câmbio Exportação" {{ 'selected' if fechamento.categoria_cambio == 'Câmbio Exportação' }}>Câmbio Exportação</option><option value="Câmbio Financeiro" {{ 'selected' if fechamento.categoria_cambio == 'Câmbio Financeiro' }}>Câmbio Financeiro</option></select></label>
