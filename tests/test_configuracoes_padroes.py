@@ -39,12 +39,16 @@ class ConfiguracoesPadraoTests(unittest.TestCase):
         app.DB = self.previous_db
         self.db_path.unlink(missing_ok=True)
 
-    def _save_defaults(self, empresa_id="1", credito="1", referenciado="2", liquidacao="3"):
+    def _save_defaults(
+        self, empresa_id="1", credito="1", referenciado="2", liquidacao="3",
+        previsao="",
+    ):
         return self.client.post("/configuracoes/padroes", data={
             "empresa_id": empresa_id,
             "banco_credito_id": credito,
             "banco_referenciado_id": referenciado,
             "banco_liquidacao_id": liquidacao,
+            "previsao_embarque_dias": previsao,
         })
 
     def _create_invoice(self, number, reference=None, company_id="1", competence_id=None):
@@ -79,26 +83,31 @@ class ConfiguracoesPadraoTests(unittest.TestCase):
         self.assertIn('name="banco_credito_id"', html)
         self.assertIn('name="banco_referenciado_id"', html)
         self.assertIn('name="banco_liquidacao_id"', html)
+        self.assertIn('name="previsao_embarque_dias"', html)
+        self.assertIn('min="1"', html)
+        self.assertIn('max="360"', html)
 
-        self.assertEqual(self._save_defaults().status_code, 302)
-        self.assertEqual(self._save_defaults("2", "1", "2", "3").status_code, 302)
+        self.assertEqual(self._save_defaults(previsao="120").status_code, 302)
+        self.assertEqual(self._save_defaults("2", "1", "2", "3", "240").status_code, 302)
         conn = app.db()
         rows = conn.execute(
-            "SELECT empresa_id,banco_credito_id,banco_referenciado_id,banco_liquidacao_id "
+            "SELECT empresa_id,banco_credito_id,banco_referenciado_id,banco_liquidacao_id,"
+            "previsao_embarque_dias "
             "FROM configuracoes_padrao ORDER BY empresa_id"
         ).fetchall()
         self.assertEqual(
             [tuple(row) for row in rows],
-            [(1, 1, 2, 3), (2, 1, 2, 3)],
+            [(1, 1, 2, 3, 120), (2, 1, 2, 3, 240)],
         )
         conn.close()
 
-        self.assertEqual(self._save_defaults("1", "4", "", "").status_code, 302)
+        self.assertEqual(self._save_defaults("1", "4", "", "", "").status_code, 302)
         conn = app.db()
         self.assertEqual(tuple(conn.execute(
-            "SELECT banco_credito_id,banco_referenciado_id,banco_liquidacao_id "
+            "SELECT banco_credito_id,banco_referenciado_id,banco_liquidacao_id,"
+            "previsao_embarque_dias "
             "FROM configuracoes_padrao WHERE empresa_id=1"
-        ).fetchone()), (4, None, None))
+        ).fetchone()), (4, None, None, None))
         conn.close()
 
         self.assertEqual(self._save_defaults("1", "", "", "").status_code, 302)
@@ -110,6 +119,26 @@ class ConfiguracoesPadraoTests(unittest.TestCase):
             "SELECT id FROM configuracoes_padrao WHERE empresa_id=2"
         ).fetchone())
         conn.close()
+
+    def test_prediction_default_accepts_only_one_to_360_and_can_exist_without_banks(self):
+        self.assertEqual(self._save_defaults("1", "", "", "", "45").status_code, 302)
+        conn = app.db()
+        self.assertEqual(
+            tuple(conn.execute(
+                "SELECT banco_credito_id,banco_referenciado_id,banco_liquidacao_id,"
+                "previsao_embarque_dias FROM configuracoes_padrao WHERE empresa_id=1"
+            ).fetchone()),
+            (None, None, None, 45),
+        )
+        conn.close()
+
+        for invalid in ("0", "361", "1.5", "-1", "texto"):
+            response = self._save_defaults("1", "", "", "", invalid)
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("PREVISÃO EMBARQUE", response.get_data(as_text=True))
+
+        self.assertEqual(self._save_defaults("1", "", "", "", "1").status_code, 302)
+        self.assertEqual(self._save_defaults("1", "", "", "", "360").status_code, 302)
 
     def test_settings_reject_unknown_company_or_bank(self):
         response = self.client.post("/configuracoes/padroes", data={

@@ -1,8 +1,10 @@
 {% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
 {% block content %}
-<div class="page-heading"><div><h1>Listagem de NDFs</h1><p class="muted">{{ ndfs|length }} opera&ccedil;&atilde;o(&otilde;es) cadastrada(s).</p></div><div class="actions"><a class="btn" href="{{ url_for('novo_ndf') }}">+ Nova NDF</a><a class="btn secondary" href="{{ url_for('dashboard_derivativos') }}">Dashboard</a></div></div>
+<div class="page-heading"><div><h1>Listagem de NDFs</h1><p class="muted">{{ ndfs_total }} opera&ccedil;&atilde;o(&otilde;es) cadastrada(s).</p></div><div class="actions"><a class="btn" href="{{ url_for('novo_ndf') }}">+ Nova NDF</a><a class="btn secondary" href="{{ url_for('dashboard_derivativos') }}">Dashboard</a></div></div>
 
 <form method="post" action="{{ url_for('excluir_ndfs_lote') }}" class="batch-form" data-batch-form data-confirm-message="Excluir as {count} NDF(s) selecionadas? Essa operação não possui vínculos operacionais relacionados.">
+{% for key, value in request.args.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
 <div class="batch-toolbar"><span class="muted"><strong data-batch-count>0</strong> selecionado(s) nesta p&aacute;gina</span><button type="submit" class="btn batch-delete" data-batch-submit disabled>Excluir selecionadas</button></div>
 <div class="table-wrap"><table class="compact-table" data-sortable><thead><tr><th class="selection-column" data-sortable="false"><input type="checkbox" data-batch-select-all aria-label="Selecionar todas as NDFs"></th><th data-sort-type="text">ID</th><th data-sort-type="text">Contraparte</th><th data-sort-type="text">Tipo</th><th data-sort-type="date">Data contrata&ccedil;&atilde;o</th><th data-sort-type="date">Vencimento</th><th data-sort-type="text">Moeda</th><th data-sort-type="number">Valor</th><th data-sort-type="number">Taxa</th><th data-sort-type="text">Status</th><th data-sortable="false">A&ccedil;&otilde;es</th></tr></thead><tbody>
 {% for ndf in ndfs %}<tr><td class="selection-column"><input type="checkbox" name="selected_ids" value="{{ ndf.id }}" data-batch-checkbox aria-label="Selecionar NDF {{ ndf.numero_operacao }}"></td><td data-sort-value="{{ ndf.numero_operacao }}"><a href="{{ url_for('detalhe_ndf', ndf_id=ndf.id) }}">{{ ndf.numero_operacao }}</a></td><td>{{ ndf.contraparte }}</td><td>{{ 'Banco' if ndf.tipo == 'BANCO' else 'Trading' }}</td><td>{{ ndf.data_contratacao|date_br }}</td><td>{{ ndf.data_vencimento|date_br }}</td><td>{{ ndf.moeda }}</td><td>{{ ndf.valor_contratado|money }}</td><td>{{ ndf.taxa_contratada|rate }}</td><td><span class="status {{ ndf.status_exibicao|ndf_status_class }}">{{ ndf.status_exibicao }}</span></td><td class="row-actions"><a href="{{ url_for('detalhe_ndf', ndf_id=ndf.id) }}">Ver</a><a href="{{ url_for('editar_ndf', ndf_id=ndf.id) }}">Editar</a></td></tr>
@@ -10,4 +12,5 @@
 </tbody></table></div>
 </form>
 <a class="btn secondary" href="{{ url_for('dashboard_derivativos') }}">Voltar ao Dashboard</a>
+{{ render_pagination(pagination, 'Paginação de NDFs') }}
 {% endblock %}

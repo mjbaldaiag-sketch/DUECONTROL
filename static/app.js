@@ -301,8 +301,51 @@
     const dialogItems = dialog ? dialog.querySelector('[data-central-closing-items]') : null;
     const dialogContracts = dialog ? dialog.querySelector('[data-central-closing-contracts]') : null;
     const liquidationBank = dialogForm ? dialogForm.querySelector('[name="banco_liquidacao_id"]') : null;
+    const categorySelect = dialogForm ? dialogForm.querySelector('[data-central-cambio-category]') : null;
+    const previsaoLabel = dialogForm ? dialogForm.querySelector('[data-previsao-embarque-label]') : null;
+    const previsaoInput = dialogForm ? dialogForm.querySelector('[data-previsao-embarque]') : null;
     const cancel = dialog ? dialog.querySelector('[data-central-cancel]') : null;
     const selected = () => checkboxes.filter((checkbox) => checkbox.checked);
+    const selectedPrevisaoDefault = () => {
+      const defaults = selected().map((checkbox) => checkbox.dataset.invoiceEmbarqueDefault || '');
+      return defaults.length > 0
+        && defaults.every((value) => value && value === defaults[0])
+        ? defaults[0] : '';
+    };
+    const validatePrevisao = () => {
+      if (!previsaoInput) return true;
+      const isExportacao = categorySelect
+        && categorySelect.value === 'Câmbio Exportação';
+      if (!isExportacao) {
+        previsaoInput.setCustomValidity('');
+        previsaoInput.classList.remove('input-invalid');
+        previsaoInput.setAttribute('aria-invalid', 'false');
+        return true;
+      }
+      const raw = previsaoInput.value.trim();
+      const dias = Number(raw);
+      const invalid = !/^[0-9]+$/.test(raw) || !Number.isInteger(dias)
+        || dias < 1 || dias > 360;
+      previsaoInput.setCustomValidity(
+        invalid ? 'Informe um número inteiro entre 1 e 360 dias.' : ''
+      );
+      previsaoInput.classList.toggle('input-invalid', invalid);
+      previsaoInput.setAttribute('aria-invalid', String(invalid));
+      return !invalid;
+    };
+    const syncPrevisao = (applyDefault = false) => {
+      if (!previsaoInput || !previsaoLabel) return;
+      const isExportacao = categorySelect
+        && categorySelect.value === 'Câmbio Exportação';
+      previsaoLabel.hidden = !isExportacao;
+      previsaoInput.disabled = !isExportacao;
+      previsaoInput.required = isExportacao;
+      if (!isExportacao) previsaoInput.value = '';
+      else if (applyDefault && !previsaoInput.value) {
+        previsaoInput.value = selectedPrevisaoDefault();
+      }
+      validatePrevisao();
+    };
     const closeDialog = () => {
       if (!dialog) return;
       if (typeof dialog.close === 'function') dialog.close();
@@ -395,6 +438,10 @@
           : '';
         liquidationBank.value = defaultBank;
       }
+      if (previsaoInput) {
+        previsaoInput.value = selectedPrevisaoDefault();
+        syncPrevisao();
+      }
     };
     const sync = () => {
       const checked = selected();
@@ -430,6 +477,7 @@
       checkboxes.forEach((checkbox) => { checkbox.checked = true; });
       sync();
     });
+    if (categorySelect) categorySelect.addEventListener('change', () => syncPrevisao(true));
     if (submit && dialog) submit.addEventListener('click', () => {
       if (!selected().length || !sameClient(selected())) {
         window.alert('Selecione uma ou mais Invoices do mesmo Cliente.');
@@ -462,6 +510,11 @@
           return;
         }
       }
+      if (!validatePrevisao()) {
+        event.preventDefault();
+        window.alert('Informe a PREVISÃO EMBARQUE com um número inteiro entre 1 e 360 dias.');
+        previsaoInput.focus();
+      }
     });
     form.addEventListener('submit', (event) => {
       if (!selected().length || !sameClient(selected())) {
@@ -469,6 +522,29 @@
         window.alert('Selecione uma ou mais Invoices do mesmo Cliente.');
       }
     });
+    sync();
+  });
+  document.querySelectorAll('form[data-previsao-embarque-form]').forEach((form) => {
+    const category = form.querySelector('[data-previsao-cambio-category]');
+    const label = form.querySelector('[data-previsao-embarque-label]');
+    const input = form.querySelector('[data-previsao-embarque]');
+    if (!category || !label || !input) return;
+    const sync = () => {
+      const isExportacao = category.value === 'Câmbio Exportação';
+      label.hidden = !isExportacao;
+      input.disabled = !isExportacao;
+      input.required = isExportacao;
+      if (!isExportacao) input.value = '';
+      const raw = input.value.trim();
+      const dias = Number(raw);
+      const invalid = isExportacao
+        && (!/^[0-9]+$/.test(raw) || !Number.isInteger(dias) || dias < 1 || dias > 360);
+      input.setCustomValidity(invalid ? 'Informe um número inteiro entre 1 e 360 dias.' : '');
+      input.classList.toggle('input-invalid', invalid);
+      input.setAttribute('aria-invalid', String(invalid));
+    };
+    category.addEventListener('change', sync);
+    input.addEventListener('input', sync);
     sync();
   });
   document.querySelectorAll('[data-invoice-default-bank]').forEach((bankSelect) => {

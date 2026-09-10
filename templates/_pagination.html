@@ -1,0 +1,12 @@
+{% macro render_pagination(pagination, label='Paginação') %}
+{% if pagination.pages > 1 %}
+<nav class="pagination erp-pagination" aria-label="{{ label }}">
+  <span class="pagination-status">Página <strong class="pagination-current">{{ pagination.page }}</strong> de {{ pagination.pages }}</span>
+  <div class="pagination-controls">
+    {% if pagination.page > 1 %}<a class="btn secondary pagination-control" href="{{ url_for(pagination.endpoint, **pagination.first_args) }}" aria-label="Primeira página">« Primeira</a><a class="btn secondary pagination-control" href="{{ url_for(pagination.endpoint, **pagination.previous_args) }}" aria-label="Página anterior">‹ Anterior</a>{% else %}<span class="btn secondary pagination-control is-disabled" aria-disabled="true">« Primeira</span><span class="btn secondary pagination-control is-disabled" aria-disabled="true">‹ Anterior</span>{% endif %}
+    {% for item in pagination.page_items %}{% if item is none %}<span class="pagination-ellipsis" aria-hidden="true">…</span>{% elif item == pagination.page %}<span class="btn pagination-control pagination-number is-current" aria-current="page">{{ item }}</span>{% else %}<a class="btn pagination-control pagination-number" href="{{ url_for(pagination.endpoint, **pagination.page_args[item]) }}" aria-label="Página {{ item }}">{{ item }}</a>{% endif %}{% endfor %}
+    {% if pagination.page < pagination.pages %}<a class="btn pagination-control" href="{{ url_for(pagination.endpoint, **pagination.next_args) }}" aria-label="Próxima página">Próxima ›</a><a class="btn pagination-control" href="{{ url_for(pagination.endpoint, **pagination.last_args) }}" aria-label="Última página">Última »</a>{% else %}<span class="btn pagination-control is-disabled" aria-disabled="true">Próxima ›</span><span class="btn pagination-control is-disabled" aria-disabled="true">Última »</span>{% endif %}
+  </div>
+</nav>
+{% endif %}
+{% endmacro %}

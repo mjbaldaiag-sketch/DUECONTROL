@@ -1,4 +1,6 @@
-{% extends "base.html" %}{% block content %}
+{% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
+{% block content %}
 <div class="page-heading"><div><h1>Gestão de Derivativos</h1><p class="muted">Acompanhe suas operações NDF e os próximos vencimentos.</p></div><a class="btn" href="{{ url_for('novo_ndf') }}">+ Nova NDF</a></div>
 
 <div class="cards"><div>NDFs ativas<strong>{{ resumo.ativas }}</strong></div><div>USD contratado<strong>USD {{ resumo.usd_contratado|money }}</strong></div><div>USD a vencer<strong>USD {{ resumo.usd_a_vencer|money }}</strong></div><div>Resultado estimado<strong>—</strong><span class="muted">Não calculado</span></div></div>
@@ -10,4 +12,5 @@
 {% for ndf in proximos %}<tr><td data-sort-value="{{ ndf.numero_operacao }}"><a href="{{ url_for('detalhe_ndf', ndf_id=ndf.id) }}">{{ ndf.numero_operacao }}</a></td><td>{{ ndf.contraparte }}</td><td>{{ 'Compra' if ndf.posicao == 'COMPRA' else 'Venda' }}</td><td>{{ ndf.data_vencimento|date_br }}</td><td>{{ ndf.moeda }}</td><td>{{ ndf.valor_contratado|money }}</td><td><span class="status {{ ndf.status_exibicao|ndf_status_class }}">{{ ndf.status_exibicao }}</span></td><td><a href="{{ url_for('detalhe_ndf', ndf_id=ndf.id) }}">Ver</a></td></tr>
 {% else %}<tr><td colspan="8" class="empty">Nenhum vencimento em aberto.</td></tr>{% endfor %}
 </tbody></table></div>
+{{ render_pagination(proximos_pagination, 'Paginação de próximos vencimentos') }}
 {% endblock %}

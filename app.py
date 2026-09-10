@@ -25,7 +25,7 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 12
+INVOICE_SCHEMA_VERSION = 13
 
 SALDO_TOLERANCE = Decimal("0.005")
 STATUS_PENDENTE = "PENDENTE"
@@ -37,6 +37,9 @@ CATEGORIAS_CAMBIO = (
     CATEGORIA_CAMBIO_EXPORTACAO,
     CATEGORIA_CAMBIO_FINANCEIRO,
 )
+PREVISAO_EMBARQUE_MIN_DIAS = 1
+PREVISAO_EMBARQUE_MAX_DIAS = 360
+PREVISAO_EMBARQUE_LEGADO_DIAS = 120
 INVOICE_STATUS_AGUARDANDO_RECEBIMENTO = "AGUARDANDO_RECEBIMENTO"
 # Mantido como alias de compatibilidade com o estado calculado antigo, que
 # possuía uma opção PARCIAL separada.
@@ -94,6 +97,21 @@ def normalize_cambio_category(value, required=True):
             + "."
         )
     return category
+
+
+def parse_previsao_embarque_dias(value, required=False):
+    """Valida a previsão de embarque como quantidade inteira de dias."""
+    raw = "" if value is None else str(value).strip()
+    if not raw:
+        if required:
+            raise ValueError("A PREVISÃO EMBARQUE é obrigatória para Câmbio Exportação.")
+        return None
+    if not re.fullmatch(r"[0-9]+", raw):
+        raise ValueError("A PREVISÃO EMBARQUE deve ser um número inteiro entre 1 e 360 dias.")
+    dias = int(raw)
+    if not PREVISAO_EMBARQUE_MIN_DIAS <= dias <= PREVISAO_EMBARQUE_MAX_DIAS:
+        raise ValueError("A PREVISÃO EMBARQUE deve estar entre 1 e 360 dias.")
+    return dias
 INVOICE_STATUS_TYPES = (
     "PROFORMA", "COMMERCIAL_INVOICE", "SERVICE_INVOICE", "DEBIT_NOTE"
 )
@@ -105,6 +123,48 @@ NDF_STATUSES = (NDF_STATUS_ATIVA, NDF_STATUS_LIQUIDADA, NDF_STATUS_CANCELADA)
 NDF_TIPOS = ("BANCO", "TRADING")
 NDF_POSICOES = ("COMPRA", "VENDA")
 PTAX_MOEDAS = ("USD", "EUR")
+TABLE_PAGE_SIZE = 20
+
+
+def build_pagination(args, total, page_param="page", endpoint=None, per_page=TABLE_PAGE_SIZE):
+    """Monta o estado comum de paginação sem descartar filtros ou outras tabelas."""
+    try:
+        page = max(1, int(args.get(page_param, 1)))
+    except (TypeError, ValueError):
+        page = 1
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, pages)
+    base_args = {
+        key: value for key, value in args.items()
+        if key != page_param and value not in (None, "")
+    }
+
+    def page_args(target_page):
+        return {**base_args, page_param: target_page}
+
+    if pages <= 7:
+        page_items = list(range(1, pages + 1))
+    elif page <= 4:
+        page_items = [1, 2, 3, 4, 5, None, pages]
+    elif page >= pages - 3:
+        page_items = [1, None, pages - 4, pages - 3, pages - 2, pages - 1, pages]
+    else:
+        page_items = [1, None, page - 1, page, page + 1, None, pages]
+
+    return {
+        "endpoint": endpoint,
+        "page_param": page_param,
+        "page": page,
+        "pages": pages,
+        "per_page": per_page,
+        "offset": (page - 1) * per_page,
+        "page_items": page_items,
+        "page_args": {item: page_args(item) for item in page_items if item is not None},
+        "first_args": page_args(1),
+        "previous_args": page_args(max(1, page - 1)),
+        "next_args": page_args(min(pages, page + 1)),
+        "last_args": page_args(pages),
+    }
 PTAX_API_URL = "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoMoedaPeriodo"
 PTAX_API_TIMEOUT = 20
 CLIENTE_PAISES = (
@@ -316,6 +376,7 @@ def init_db():
         banco_credito_id INTEGER,
         banco_referenciado_id INTEGER,
         banco_liquidacao_id INTEGER,
+        previsao_embarque_dias INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE CASCADE,
@@ -359,6 +420,7 @@ def init_db():
         valor_reais REAL,
         status TEXT NOT NULL DEFAULT 'PENDENTE',
         saldo_zerado_manual INTEGER NOT NULL DEFAULT 0,
+        previsao_embarque_dias INTEGER,
         observacao TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         ,competencia_id INTEGER
@@ -453,6 +515,7 @@ def init_db():
                     competencia_id INTEGER,
                     categoria_cambio TEXT NOT NULL DEFAULT 'Câmbio Exportação',
                     saldo_zerado_manual INTEGER NOT NULL DEFAULT 0,
+                    previsao_embarque_dias INTEGER,
                     FOREIGN KEY (banco_liquidacao_id) REFERENCES contrapartes(id) ON DELETE SET NULL
                 )
             """)
@@ -481,6 +544,7 @@ def init_db():
                 banco_liquidacao_id INTEGER NOT NULL,
                 taxa_cambio REAL,
                 valor_brl REAL,
+                previsao_embarque_dias INTEGER,
                 contrato_id INTEGER UNIQUE,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT,
@@ -574,6 +638,7 @@ def init_db():
                 valor_moeda REAL NOT NULL CHECK(valor_moeda > 0),
                 data_fechamento TEXT NOT NULL,
                 observacao TEXT,
+                previsao_embarque_dias INTEGER,
                 fechamento_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
@@ -615,11 +680,22 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_fechamentos_contrato ON fechamentos(contrato_id);
             CREATE INDEX IF NOT EXISTS idx_fechamentos_data ON fechamentos(data_fechamento);
         """)
+        configuracoes_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(configuracoes_padrao)")
+        }
+        if "previsao_embarque_dias" not in configuracoes_columns:
+            conn.execute(
+                "ALTER TABLE configuracoes_padrao ADD COLUMN previsao_embarque_dias INTEGER"
+            )
         fechamento_columns = {row[1] for row in conn.execute("PRAGMA table_info(fechamentos_cambio)")}
         if "fechamento_id" not in fechamento_columns:
             conn.execute(
                 "ALTER TABLE fechamentos_cambio ADD COLUMN fechamento_id INTEGER "
                 "REFERENCES fechamentos(id) ON DELETE CASCADE"
+            )
+        if "previsao_embarque_dias" not in fechamento_columns:
+            conn.execute(
+                "ALTER TABLE fechamentos_cambio ADD COLUMN previsao_embarque_dias INTEGER"
             )
         header_columns = {row[1] for row in conn.execute("PRAGMA table_info(fechamentos)")}
         if "taxa_cambio" not in header_columns:
@@ -630,6 +706,10 @@ def init_db():
             conn.execute(
                 "ALTER TABLE fechamentos ADD COLUMN categoria_cambio TEXT "
                 "NOT NULL DEFAULT 'Câmbio Exportação'"
+            )
+        if "previsao_embarque_dias" not in header_columns:
+            conn.execute(
+                "ALTER TABLE fechamentos ADD COLUMN previsao_embarque_dias INTEGER"
             )
         conn.execute(
             "UPDATE fechamentos SET categoria_cambio=? "
@@ -752,6 +832,8 @@ def init_db():
             conn.execute("ALTER TABLE contratos ADD COLUMN cliente_id INTEGER")
         if "saldo_zerado_manual" not in contrato_columns:
             conn.execute("ALTER TABLE contratos ADD COLUMN saldo_zerado_manual INTEGER NOT NULL DEFAULT 0")
+        if "previsao_embarque_dias" not in contrato_columns:
+            conn.execute("ALTER TABLE contratos ADD COLUMN previsao_embarque_dias INTEGER")
         if "categoria_cambio" not in contrato_columns:
             conn.execute(
                 "ALTER TABLE contratos ADD COLUMN categoria_cambio TEXT "
@@ -762,6 +844,60 @@ def init_db():
             "WHERE categoria_cambio IS NULL OR TRIM(categoria_cambio)=''",
             (CATEGORIA_CAMBIO_EXPORTACAO,),
         )
+        if schema_version < INVOICE_SCHEMA_VERSION:
+            conn.execute(
+                """
+                UPDATE fechamentos
+                SET previsao_embarque_dias=?
+                WHERE previsao_embarque_dias IS NULL
+                  AND COALESCE(NULLIF(TRIM(categoria_cambio), ''), ?) = ?
+                """,
+                (
+                    PREVISAO_EMBARQUE_LEGADO_DIAS,
+                    CATEGORIA_CAMBIO_EXPORTACAO,
+                    CATEGORIA_CAMBIO_EXPORTACAO,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE contratos
+                SET previsao_embarque_dias=?
+                WHERE previsao_embarque_dias IS NULL
+                  AND COALESCE(NULLIF(TRIM(categoria_cambio), ''), ?) = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM fechamentos h WHERE h.contrato_id=contratos.id
+                  )
+                """,
+                (
+                    PREVISAO_EMBARQUE_LEGADO_DIAS,
+                    CATEGORIA_CAMBIO_EXPORTACAO,
+                    CATEGORIA_CAMBIO_EXPORTACAO,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE fechamentos_cambio
+                SET previsao_embarque_dias=?
+                WHERE previsao_embarque_dias IS NULL
+                  AND (
+                      EXISTS (
+                          SELECT 1 FROM fechamentos h
+                          WHERE h.id=fechamentos_cambio.fechamento_id
+                            AND h.categoria_cambio=?
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM contratos c
+                          WHERE c.id=fechamentos_cambio.contrato_id
+                            AND c.categoria_cambio=?
+                      )
+                  )
+                """,
+                (
+                    PREVISAO_EMBARQUE_LEGADO_DIAS,
+                    CATEGORIA_CAMBIO_EXPORTACAO,
+                    CATEGORIA_CAMBIO_EXPORTACAO,
+                ),
+            )
         conn.execute(
             """
             UPDATE contratos
@@ -965,10 +1101,16 @@ def parse_exchange_rate(value):
     return rate.quantize(Decimal("0.0001"))
 
 
+def closing_brl_unrounded_value(valor_moeda, taxa_cambio):
+    """Calcula o BRL bruto, sem arredondar cada Invoice individualmente."""
+    return decimal_value(valor_moeda) * decimal_value(taxa_cambio)
+
+
 def closing_brl_value(valor_moeda, taxa_cambio):
-    """Calcula o BRL com Decimal e arredonda apenas na precisão monetária final."""
-    value = decimal_value(valor_moeda) * decimal_value(taxa_cambio)
+    """Calcula o BRL e arredonda apenas na precisão monetária final."""
+    value = closing_brl_unrounded_value(valor_moeda, taxa_cambio)
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
 
 def selected_record_ids(form, operation="excluir"):
     """Validate and deduplicate IDs sent by a batch form."""
@@ -1640,12 +1782,17 @@ def cliente_vinculos(conn, cliente_id):
     """, (cliente_id,)).fetchall()
     return {"invoices": invoices, "contratos": contratos, "ndfs": ndfs}
 
-def clientes_com_vinculos(conn):
-    clientes = conn.execute("""
+def clientes_com_vinculos(conn, pagination=None):
+    query = """
         SELECT id, nome, pais
         FROM clientes
         ORDER BY nome, pais
-    """).fetchall()
+    """
+    params = []
+    if pagination:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([pagination["per_page"], pagination["offset"]])
+    clientes = conn.execute(query, params).fetchall()
     result = []
     for cliente in clientes:
         item = dict(cliente)
@@ -1670,7 +1817,8 @@ def configuracoes_padrao_for_empresa(conn, empresa_id):
     except (TypeError, ValueError):
         return None
     return conn.execute("""
-        SELECT empresa_id, banco_credito_id, banco_referenciado_id, banco_liquidacao_id
+        SELECT empresa_id, banco_credito_id, banco_referenciado_id, banco_liquidacao_id,
+               previsao_embarque_dias
         FROM configuracoes_padrao
         WHERE empresa_id=?
     """, (empresa_id,)).fetchone()
@@ -1678,7 +1826,8 @@ def configuracoes_padrao_for_empresa(conn, empresa_id):
 def configuracoes_padrao_por_empresa(conn):
     """Monta o mapa usado para preencher defaults ao trocar a empresa da Invoice."""
     rows = conn.execute("""
-        SELECT empresa_id, banco_credito_id, banco_referenciado_id, banco_liquidacao_id
+        SELECT empresa_id, banco_credito_id, banco_referenciado_id, banco_liquidacao_id,
+               previsao_embarque_dias
         FROM configuracoes_padrao
     """).fetchall()
     return {row["empresa_id"]: row for row in rows}
@@ -1695,7 +1844,13 @@ def configuracoes_padrao_form_data(form, conn):
     for field in ("banco_credito_id", "banco_referenciado_id", "banco_liquidacao_id"):
         banco = contraparte_da_selecao(conn, form.get(field))
         bancos[field] = banco["id"] if banco else None
-    return {"empresa_id": empresa_id, **bancos}
+    return {
+        "empresa_id": empresa_id,
+        **bancos,
+        "previsao_embarque_dias": parse_previsao_embarque_dias(
+            form.get("previsao_embarque_dias")
+        ),
+    }
 
 def form_record_id(value, fallback=None):
     if value in (None, ""):
@@ -2190,14 +2345,18 @@ def render_ptax_page(previsao=None, consulta=None):
         "data_final": consulta.get("data_final") or "",
     }
     conn = db()
+    historico_total = conn.execute("SELECT COUNT(*) FROM ptax_cotacoes").fetchone()[0]
+    historico_pagination = build_pagination(request.args, historico_total, endpoint="ptax")
     historico = conn.execute("""
         SELECT data_cotacao, moeda, ptax_compra, ptax_venda
         FROM ptax_cotacoes
         ORDER BY data_cotacao DESC, moeda ASC
-    """).fetchall()
+        LIMIT ? OFFSET ?
+    """, (historico_pagination["per_page"], historico_pagination["offset"])).fetchall()
     conn.close()
     return render_template("ptax.html", moedas=PTAX_MOEDAS, consulta=form_values,
-                           previsao=previsao, historico=historico)
+                           previsao=previsao, historico=historico,
+                           historico_pagination=historico_pagination)
 
 def contract_summary(conn, contrato_id):
     row = conn.execute(f"""
@@ -2224,6 +2383,10 @@ init_db()
 @app.route("/")
 def index():
     conn = db()
+    dues_total = conn.execute("SELECT COUNT(*) FROM dues").fetchone()[0]
+    contratos_total = conn.execute("SELECT COUNT(*) FROM contratos").fetchone()[0]
+    dues_pagination = build_pagination(request.args, dues_total, page_param="dues_page", endpoint="index")
+    contratos_pagination = build_pagination(request.args, contratos_total, page_param="contratos_page", endpoint="index")
     dues = [decorate_due(row) for row in conn.execute("""
         SELECT d.*, e.apelido AS empresa_apelido,
                COALESCE(SUM(CASE WHEN m.tipo IN ('UTILIZACAO','VINCULACAO') THEN m.valor ELSE -m.valor END),0) AS utilizado
@@ -2231,7 +2394,8 @@ def index():
         LEFT JOIN due_movimentacoes m ON m.due_id=d.id
         LEFT JOIN empresas e ON e.cnpj=d.cnpj
         GROUP BY d.id ORDER BY """ + empresa_order_sql("e") + """, d.id DESC
-    """).fetchall()]
+        LIMIT ? OFFSET ?
+    """, (dues_pagination["per_page"], dues_pagination["offset"])).fetchall()]
     contratos = [decorate_contract(row) for row in conn.execute(f"""
         SELECT c.*, e.apelido AS empresa_apelido,
                {contract_total_sql("c")} AS valor_moeda_consolidado,
@@ -2240,11 +2404,12 @@ def index():
         LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
         LEFT JOIN empresas e ON e.cnpj=c.cnpj
         GROUP BY c.id ORDER BY """ + empresa_order_sql("e") + """, c.id DESC
-    """).fetchall()]
+        LIMIT ? OFFSET ?
+    """, (contratos_pagination["per_page"], contratos_pagination["offset"])).fetchall()]
     resumo = {
         "invoices": conn.execute("SELECT COUNT(*) FROM invoices").fetchone()[0],
-        "dues": conn.execute("SELECT COUNT(*) FROM dues").fetchone()[0],
-        "contratos": conn.execute("SELECT COUNT(*) FROM contratos").fetchone()[0],
+        "dues": dues_total,
+        "contratos": contratos_total,
         "dues_sem_vinculo": conn.execute("""
             SELECT COUNT(*) FROM dues d
             WHERE NOT EXISTS (SELECT 1 FROM due_contratos v WHERE v.due_id=d.id)
@@ -2256,7 +2421,9 @@ def index():
         """, (CATEGORIA_CAMBIO_FINANCEIRO,)).fetchone()[0],
     }
     conn.close()
-    return render_template("index.html", dues=dues, contratos=contratos, resumo=resumo)
+    return render_template("index.html", dues=dues, contratos=contratos, resumo=resumo,
+                           dues_pagination=dues_pagination,
+                           contratos_pagination=contratos_pagination)
 
 def contratos_filtros_valores(args):
     """Retorna os valores brutos dos filtros exibidos na lista de contratos."""
@@ -2333,11 +2500,31 @@ def contratos_filtros(args):
     clause = " WHERE " + " AND ".join(where) if where else ""
     return filtros, clause, params
 
-def consulta_contratos(conn, args):
+def consulta_contratos(conn, args, paginate=False):
     filtros, clause, params = contratos_filtros(args)
-    rows = conn.execute(f"""
+    pagination = None
+    query_params = list(params)
+    limit_clause = ""
+    if paginate:
+        total = conn.execute(f"""
+            SELECT COUNT(DISTINCT c.id)
+            FROM contratos c
+            LEFT JOIN empresas e ON REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(c.cnpj,''),'.',''),'/',''),'-',''),' ','')=e.cnpj
+            {clause}
+        """, params).fetchone()[0]
+        pagination = build_pagination(args, total, endpoint="lista_contratos")
+        limit_clause = " LIMIT ? OFFSET ?"
+        query_params.extend([pagination["per_page"], pagination["offset"]])
+    query = f"""
         SELECT c.*, e.id AS empresa_id_filtro, e.razao_social AS empresa_razao_social,
                e.apelido AS empresa_apelido, comp.descricao AS competencia_descricao,
+               COALESCE(
+                   (SELECT h.previsao_embarque_dias
+                    FROM fechamentos h
+                    WHERE h.contrato_id=c.id
+                    ORDER BY h.id DESC LIMIT 1),
+                   c.previsao_embarque_dias
+               ) AS previsao_embarque_dias_exibicao,
                {contract_total_sql("c")} AS valor_moeda_consolidado,
                COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0) AS vinculado
         FROM contratos c
@@ -2345,19 +2532,21 @@ def consulta_contratos(conn, args):
         LEFT JOIN competencias comp ON comp.id=c.competencia_id
         LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
         {clause}
-        GROUP BY c.id ORDER BY """ + empresa_order_sql("e") + """, c.id DESC
-    """, params).fetchall()
-    return rows, filtros
+        GROUP BY c.id ORDER BY {empresa_order_sql("e")}, c.id DESC{limit_clause}
+    """
+    rows = conn.execute(query, query_params).fetchall()
+    return (rows, filtros, pagination) if paginate else (rows, filtros)
 
 @app.route("/contratos")
 def lista_contratos():
     conn = db()
     filtros = contratos_filtros_valores(request.args)
     try:
-        rows, filtros = consulta_contratos(conn, request.args)
+        rows, filtros, pagination = consulta_contratos(conn, request.args, paginate=True)
     except ValueError as exc:
         flash(str(exc), "danger")
         rows = []
+        pagination = build_pagination(request.args, 0, endpoint="lista_contratos")
     contratos = [decorate_contract(row) for row in rows]
     empresas = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     clientes = clientes_for_form(conn)
@@ -2369,6 +2558,7 @@ def lista_contratos():
         clientes=clientes,
         categorias_cambio=CATEGORIAS_CAMBIO,
         status_options=(STATUS_PENDENTE, STATUS_PARCIAL, STATUS_CONCLUIDO),
+        pagination=pagination,
         **filtros,
     )
 
@@ -3208,6 +3398,12 @@ def relatorio_vinculos_contratos():
     except ValueError as exc:
         flash(str(exc), "danger")
         return redirect(url_for("relatorio_vinculos_contratos"))
+    pagination = build_pagination(
+        request.args, context["total_registros"], endpoint="relatorio_vinculos_contratos"
+    )
+    start = pagination["offset"]
+    context["vinculos"] = context["vinculos"][start:start + pagination["per_page"]]
+    context["pagination"] = pagination
     return render_template("contratos_relatorio_vinculos.html", **context)
 
 
@@ -3554,30 +3750,37 @@ def dashboard_derivativos():
         FROM ndfs
         WHERE status=?
     """, (hoje, NDF_STATUS_ATIVA)).fetchone()
+    proximos_total = resumo_row["ativas"]
+    proximos_pagination = build_pagination(request.args, proximos_total, endpoint="dashboard_derivativos")
     proximos = [decorate_ndf(row) for row in conn.execute("""
         SELECT *
         FROM ndfs
         WHERE status=?
         ORDER BY CASE WHEN data_vencimento < ? THEN 0 ELSE 1 END,
                  data_vencimento ASC, id DESC
-        LIMIT 5
-    """, (NDF_STATUS_ATIVA, hoje)).fetchall()]
+         LIMIT ? OFFSET ?
+    """, (NDF_STATUS_ATIVA, hoje, proximos_pagination["per_page"], proximos_pagination["offset"])).fetchall()]
     conn.close()
     resumo = {
         "ativas": resumo_row["ativas"],
         "usd_contratado": decimal_value(resumo_row["usd_contratado"]),
         "usd_a_vencer": decimal_value(resumo_row["usd_a_vencer"]),
     }
-    return render_template("derivativos.html", resumo=resumo, proximos=proximos)
+    return render_template("derivativos.html", resumo=resumo, proximos=proximos,
+                           proximos_pagination=proximos_pagination)
 
 @app.route("/derivativos/ndfs")
 def lista_ndfs():
     conn = db()
+    ndfs_total = conn.execute("SELECT COUNT(*) FROM ndfs").fetchone()[0]
+    pagination = build_pagination(request.args, ndfs_total, endpoint="lista_ndfs")
     ndfs = [decorate_ndf(row) for row in conn.execute(
-        "SELECT * FROM ndfs ORDER BY id DESC"
+        "SELECT * FROM ndfs ORDER BY id DESC LIMIT ? OFFSET ?",
+        (pagination["per_page"], pagination["offset"])
     ).fetchall()]
     conn.close()
-    return render_template("ndfs.html", ndfs=ndfs)
+    return render_template("ndfs.html", ndfs=ndfs, ndfs_total=ndfs_total,
+                           pagination=pagination)
 
 @app.route("/ndf/novo", methods=["GET", "POST"])
 def novo_ndf():
@@ -3786,11 +3989,13 @@ def configuracoes_padroes():
             "banco_credito_id": request.form.get("banco_credito_id", ""),
             "banco_referenciado_id": request.form.get("banco_referenciado_id", ""),
             "banco_liquidacao_id": request.form.get("banco_liquidacao_id", ""),
+            "previsao_embarque_dias": request.form.get("previsao_embarque_dias", ""),
         }
         try:
             data = configuracoes_padrao_form_data(request.form, conn)
             if all(data[field] is None for field in (
-                "banco_credito_id", "banco_referenciado_id", "banco_liquidacao_id"
+                "banco_credito_id", "banco_referenciado_id", "banco_liquidacao_id",
+                "previsao_embarque_dias",
             )):
                 conn.execute(
                     "DELETE FROM configuracoes_padrao WHERE empresa_id=?",
@@ -3799,16 +4004,19 @@ def configuracoes_padroes():
             else:
                 conn.execute("""
                     INSERT INTO configuracoes_padrao
-                        (empresa_id,banco_credito_id,banco_referenciado_id,banco_liquidacao_id,updated_at)
-                    VALUES (?,?,?,?,CURRENT_TIMESTAMP)
+                        (empresa_id,banco_credito_id,banco_referenciado_id,banco_liquidacao_id,
+                         previsao_embarque_dias,updated_at)
+                    VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
                     ON CONFLICT(empresa_id) DO UPDATE SET
                         banco_credito_id=excluded.banco_credito_id,
                         banco_referenciado_id=excluded.banco_referenciado_id,
                         banco_liquidacao_id=excluded.banco_liquidacao_id,
+                        previsao_embarque_dias=excluded.previsao_embarque_dias,
                         updated_at=CURRENT_TIMESTAMP
                 """, (
                     data["empresa_id"], data["banco_credito_id"],
                     data["banco_referenciado_id"], data["banco_liquidacao_id"],
+                    data["previsao_embarque_dias"],
                 ))
             conn.commit()
             conn.close()
@@ -3833,24 +4041,36 @@ def configuracoes_padroes():
             "banco_credito_id": str(padroes["banco_credito_id"]) if padroes and padroes["banco_credito_id"] else "",
             "banco_referenciado_id": str(padroes["banco_referenciado_id"]) if padroes and padroes["banco_referenciado_id"] else "",
             "banco_liquidacao_id": str(padroes["banco_liquidacao_id"]) if padroes and padroes["banco_liquidacao_id"] else "",
+            "previsao_embarque_dias": (
+                str(padroes["previsao_embarque_dias"])
+                if padroes and padroes["previsao_embarque_dias"] is not None
+                else ""
+            ),
         }
+    configuracoes_total = conn.execute("SELECT COUNT(*) FROM empresas").fetchone()[0]
+    configuracoes_pagination = build_pagination(
+        request.args, configuracoes_total, endpoint="configuracoes_padroes"
+    )
     configuracoes = conn.execute("""
         SELECT e.id AS empresa_id, e.razao_social, e.apelido,
                cp.nome AS banco_credito_nome,
                br.nome AS banco_referenciado_nome,
-               bl.nome AS banco_liquidacao_nome
+               bl.nome AS banco_liquidacao_nome,
+               p.previsao_embarque_dias
         FROM empresas e
         LEFT JOIN configuracoes_padrao p ON p.empresa_id=e.id
         LEFT JOIN contrapartes cp ON cp.id=p.banco_credito_id
         LEFT JOIN contrapartes br ON br.id=p.banco_referenciado_id
         LEFT JOIN contrapartes bl ON bl.id=p.banco_liquidacao_id
-        ORDER BY """ + empresa_order_sql("e")
+        ORDER BY """ + empresa_order_sql("e") + " LIMIT ? OFFSET ?",
+        (configuracoes_pagination["per_page"], configuracoes_pagination["offset"])
     ).fetchall()
     conn.close()
     return render_template(
         "configuracoes_padroes.html", empresas=empresas,
         contrapartes=contrapartes, form_values=form_values,
         configuracoes=configuracoes,
+        pagination=configuracoes_pagination,
     )
 
 @app.route("/configuracoes/empresas", methods=["GET", "POST"])
@@ -3873,7 +4093,13 @@ def cadastro_empresas():
         except ValueError as exc:
             conn.rollback()
             flash(str(exc), "danger")
-    empresas = conn.execute("SELECT id, razao_social, cnpj, apelido, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
+    empresas_total = conn.execute("SELECT COUNT(*) FROM empresas").fetchone()[0]
+    pagination = build_pagination(request.args, empresas_total, endpoint="cadastro_empresas")
+    empresas = conn.execute(
+        "SELECT id, razao_social, cnpj, apelido, prioridade FROM empresas ORDER BY "
+        + empresa_order_sql() + " LIMIT ? OFFSET ?",
+        (pagination["per_page"], pagination["offset"])
+    ).fetchall()
     conn.close()
     form_values = {
         "razao_social": request.form.get("razao_social", "") if request.method == "POST" else "",
@@ -3882,7 +4108,8 @@ def cadastro_empresas():
         "prioridade": request.form.get("prioridade", "") if request.method == "POST" else "",
     }
     return render_template("empresas.html", empresas=empresas,
-                           empresa_em_edicao=None, form_values=form_values)
+                           empresa_em_edicao=None, form_values=form_values,
+                           pagination=pagination)
 
 @app.route("/configuracoes/empresas/<int:empresa_id>/editar", methods=["GET", "POST"])
 def editar_empresa(empresa_id):
@@ -3913,8 +4140,12 @@ def editar_empresa(empresa_id):
             conn.rollback()
             flash(str(exc), "danger")
 
+    empresas_total = conn.execute("SELECT COUNT(*) FROM empresas").fetchone()[0]
+    pagination = build_pagination(request.args, empresas_total, endpoint="cadastro_empresas")
     empresas = conn.execute(
-        "SELECT id, razao_social, cnpj, apelido, prioridade FROM empresas ORDER BY " + empresa_order_sql()
+        "SELECT id, razao_social, cnpj, apelido, prioridade FROM empresas ORDER BY "
+        + empresa_order_sql() + " LIMIT ? OFFSET ?",
+        (pagination["per_page"], pagination["offset"])
     ).fetchall()
     form_values = {
         "razao_social": request.form.get("razao_social", empresa["razao_social"]),
@@ -3924,7 +4155,8 @@ def editar_empresa(empresa_id):
     }
     conn.close()
     return render_template("empresas.html", empresas=empresas,
-                           empresa_em_edicao=empresa, form_values=form_values)
+                           empresa_em_edicao=empresa, form_values=form_values,
+                           pagination=pagination)
 
 @app.route("/configuracoes/clientes", methods=["GET", "POST"])
 def cadastro_clientes():
@@ -3956,11 +4188,14 @@ def cadastro_clientes():
         except ValueError as exc:
             conn.rollback()
             flash(str(exc), "danger")
-    clientes = clientes_com_vinculos(conn)
+    clientes_total = conn.execute("SELECT COUNT(*) FROM clientes").fetchone()[0]
+    pagination = build_pagination(request.args, clientes_total, endpoint="cadastro_clientes")
+    clientes = clientes_com_vinculos(conn, pagination)
     conn.close()
     return render_template(
         "clientes.html", clientes=clientes, paises=CLIENTE_PAISES_ORDENADOS,
         nome=nome, pais_selecionado=pais_selecionado, cliente_em_edicao=None,
+        pagination=pagination,
     )
 
 @app.route("/configuracoes/clientes/<int:cliente_id>/editar", methods=["GET", "POST"])
@@ -4001,11 +4236,14 @@ def editar_cliente(cliente_id):
             conn.rollback()
             flash("Não foi possível atualizar o cliente.", "danger")
 
-    clientes = clientes_com_vinculos(conn)
+    clientes_total = conn.execute("SELECT COUNT(*) FROM clientes").fetchone()[0]
+    pagination = build_pagination(request.args, clientes_total, endpoint="cadastro_clientes")
+    clientes = clientes_com_vinculos(conn, pagination)
     conn.close()
     return render_template(
         "clientes.html", clientes=clientes, paises=CLIENTE_PAISES_ORDENADOS,
         nome=nome, pais_selecionado=pais_selecionado, cliente_em_edicao=cliente,
+        pagination=pagination,
     )
 
 @app.route("/configuracoes/clientes/<int:cliente_id>/excluir", methods=["POST"])
@@ -4063,13 +4301,17 @@ def cadastro_contrapartes():
         except ValueError as exc:
             conn.rollback()
             flash(str(exc), "danger")
+    contrapartes_total = conn.execute("SELECT COUNT(*) FROM contrapartes").fetchone()[0]
+    pagination = build_pagination(request.args, contrapartes_total, endpoint="cadastro_contrapartes")
     contrapartes = conn.execute("""
         SELECT id, nome
         FROM contrapartes
         ORDER BY nome
-    """).fetchall()
+        LIMIT ? OFFSET ?
+    """, (pagination["per_page"], pagination["offset"])).fetchall()
     conn.close()
-    return render_template("contrapartes.html", contrapartes=contrapartes, nome=nome)
+    return render_template("contrapartes.html", contrapartes=contrapartes, nome=nome,
+                           pagination=pagination)
 
 @app.route("/configuracoes/competencias", methods=["GET", "POST"])
 def cadastro_competencias():
@@ -4089,13 +4331,17 @@ def cadastro_competencias():
         except sqlite3.Error as exc:
             conn.rollback(); flash(f"Não foi possível salvar a competência: {exc}", "danger")
         competencia = dict(request.form)
+    competencias_total = conn.execute("SELECT COUNT(*) FROM competencias").fetchone()[0]
+    pagination = build_pagination(request.args, competencias_total, endpoint="cadastro_competencias")
     competencias = conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
         e.razao_social, e.apelido, e.prioridade AS empresa_prioridade
         FROM competencias c JOIN empresas e ON e.id=c.empresa_id
-        ORDER BY """ + empresa_order_sql("e") + ", c.data_inicial DESC, c.descricao, c.id""").fetchall()
+        ORDER BY """ + empresa_order_sql("e") + ", c.data_inicial DESC, c.descricao, c.id LIMIT ? OFFSET ?""",
+        (pagination["per_page"], pagination["offset"])).fetchall()
     empresas = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     conn.close()
-    return render_template("competencias.html", competencia=competencia, competencias=competencias, empresas=empresas, statuses=COMPETENCIA_STATUSES)
+    return render_template("competencias.html", competencia=competencia, competencias=competencias, empresas=empresas,
+                           statuses=COMPETENCIA_STATUSES, pagination=pagination)
 
 @app.route("/configuracoes/competencias/<int:competencia_id>/editar", methods=["GET", "POST"])
 def editar_competencia(competencia_id):
@@ -4118,12 +4364,16 @@ def editar_competencia(competencia_id):
             conn.rollback(); flash(f"Não foi possível salvar a competência: {exc}", "danger")
         competencia = dict(request.form); competencia["id"] = competencia_id
     empresas = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
+    competencias_total = conn.execute("SELECT COUNT(*) FROM competencias").fetchone()[0]
+    pagination = build_pagination(request.args, competencias_total, endpoint="cadastro_competencias")
     competencias = conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
         e.razao_social, e.apelido, e.prioridade AS empresa_prioridade
         FROM competencias c JOIN empresas e ON e.id=c.empresa_id
-        ORDER BY """ + empresa_order_sql("e") + ", c.data_inicial DESC, c.descricao, c.id""").fetchall()
+        ORDER BY """ + empresa_order_sql("e") + ", c.data_inicial DESC, c.descricao, c.id LIMIT ? OFFSET ?""",
+        (pagination["per_page"], pagination["offset"])).fetchall()
     conn.close()
-    return render_template("competencias.html", competencia=competencia, competencias=competencias, empresas=empresas, statuses=COMPETENCIA_STATUSES)
+    return render_template("competencias.html", competencia=competencia, competencias=competencias, empresas=empresas,
+                           statuses=COMPETENCIA_STATUSES, pagination=pagination)
 
 @app.route("/configuracoes/competencias/<int:competencia_id>/encerrar", methods=["POST"])
 def encerrar_competencia(competencia_id):
@@ -4209,7 +4459,14 @@ def carregar_detalhe_contrato(conn, contrato_id):
     contrato = conn.execute("""
         SELECT c.*, cl.pais AS cliente_pais,
                e.razao_social AS empresa_razao_social,
-               e.apelido AS empresa_apelido, e.prioridade AS empresa_prioridade
+               e.apelido AS empresa_apelido, e.prioridade AS empresa_prioridade,
+               COALESCE(
+                   (SELECT h.previsao_embarque_dias
+                    FROM fechamentos h
+                    WHERE h.contrato_id=c.id
+                    ORDER BY h.id DESC LIMIT 1),
+                   c.previsao_embarque_dias
+               ) AS previsao_embarque_dias_exibicao
         FROM contratos c
         LEFT JOIN clientes cl ON cl.id=c.cliente_id
         LEFT JOIN empresas e ON e.cnpj=c.cnpj
@@ -4317,6 +4574,20 @@ def editar_contrato(contrato_id):
         try:
             metadata = contract_metadata_from_form(request.form, conn)
             categoria_cambio = normalize_cambio_category(request.form.get("categoria_cambio"))
+            central_header = conn.execute(
+                """
+                SELECT previsao_embarque_dias
+                FROM fechamentos
+                WHERE contrato_id=?
+                """,
+                (contrato_id,),
+            ).fetchone()
+            central_previsao = None
+            if central_header and categoria_cambio == CATEGORIA_CAMBIO_EXPORTACAO:
+                central_previsao = parse_previsao_embarque_dias(
+                    central_header["previsao_embarque_dias"],
+                    required=True,
+                )
             numero = metadata["numero_contrato"]
             if not numero:
                 raise ValueError("O número do Contrato Câmbio é obrigatório.")
@@ -4333,9 +4604,18 @@ def editar_contrato(contrato_id):
             """, (numero, metadata["banco_liquidacao_id"], metadata["banco_liquidacao"],
                   metadata["data_fechamento"], metadata["data_liquidacao"], metadata["data_fechamento"],
                   metadata["taxa_cambio"], metadata["observacao"], categoria_cambio, contrato_id))
+            if categoria_cambio == CATEGORIA_CAMBIO_FINANCEIRO:
+                conn.execute(
+                    "UPDATE contratos SET previsao_embarque_dias=NULL WHERE id=?",
+                    (contrato_id,),
+                )
             conn.execute(
-                "UPDATE fechamentos SET categoria_cambio=? WHERE contrato_id=?",
-                (categoria_cambio, contrato_id),
+                """
+                UPDATE fechamentos
+                SET categoria_cambio=?, previsao_embarque_dias=?
+                WHERE contrato_id=?
+                """,
+                (categoria_cambio, central_previsao, contrato_id),
             )
             sync_contract_cache(conn, contrato_id)
             conn.commit(); conn.close()
@@ -4506,33 +4786,25 @@ def consulta_dues():
     sort = request.args.get("sort", "data_due")
     sort = sort if sort in sort_fields else "data_due"
     direction = "ASC" if request.args.get("direction", "desc").lower() == "asc" else "DESC"
-    try:
-        page = max(1, int(request.args.get("page", 1)))
-    except ValueError:
-        page = 1
-    per_page = 20
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     conn = db()
     total = conn.execute(f"SELECT COUNT(*) FROM dues d{clause}", params).fetchone()[0]
-    pages = max(1, (total + per_page - 1) // per_page)
-    page = min(page, pages)
+    pagination = build_pagination(request.args, total, endpoint="consulta_dues")
     dues = [decorate_due(row) for row in conn.execute(f"""
         SELECT d.*, COALESCE(SUM(CASE WHEN m.tipo IN ('UTILIZACAO','VINCULACAO') THEN m.valor ELSE -m.valor END),0) AS utilizado
         FROM dues d LEFT JOIN due_movimentacoes m ON m.due_id=d.id
         {clause} GROUP BY d.id ORDER BY {sort_fields[sort]} {direction}, d.id DESC
         LIMIT ? OFFSET ?
-    """, params + [per_page, (page - 1) * per_page]).fetchall()]
+    """, params + [pagination["per_page"], pagination["offset"]]).fetchall()]
     moedas = [row[0] for row in conn.execute("SELECT DISTINCT moeda FROM dues WHERE moeda IS NOT NULL ORDER BY moeda")]
     conn.close()
     sort_links = {}
     for key in sort_fields:
         next_direction = "asc" if sort == key and direction == "DESC" else "desc"
         sort_links[key] = {**filters, "sort": key, "direction": next_direction}
-    previous_args = {**filters, "sort": sort, "direction": direction, "page": page - 1}
-    next_args = {**filters, "sort": sort, "direction": direction, "page": page + 1}
-    return render_template("due_consulta.html", dues=dues, total=total, page=page, pages=pages,
+    return render_template("due_consulta.html", dues=dues, total=total,
                            filters=filters, moedas=moedas, sort=sort, direction=direction,
-                           sort_links=sort_links, previous_args=previous_args, next_args=next_args,
+                           sort_links=sort_links, pagination=pagination,
                            status_concluido=STATUS_CONCLUIDO, status_parcial=STATUS_PARCIAL)
 
 @app.route("/dues/excluir-lote", methods=["POST"])
@@ -6683,6 +6955,9 @@ def central_closing_invoice(conn, invoice_id):
     data["banco_liquidacao_padrao_id"] = (
         padroes["banco_liquidacao_id"] if padroes else None
     )
+    data["previsao_embarque_dias_padrao"] = (
+        padroes["previsao_embarque_dias"] if padroes else None
+    )
     data["valor_fechamento"] = normalize_balance(summary["saldo_fechamentos"])
     return data
 
@@ -6698,7 +6973,8 @@ def closing_amounts_from_form(form):
 
 def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=None,
                            taxa_cambio=None, banco_liquidacao_id=None,
-                           amounts=None, categoria_cambio=None):
+                           amounts=None, categoria_cambio=None,
+                           previsao_embarque_dias=None):
     """Valida a seleção e monta grupos determinísticos sem gravar nada."""
     ids = []
     for raw_id in raw_ids:
@@ -6727,6 +7003,19 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
     client_ids = {invoice["cliente_id"] for invoice in invoices}
     if len(client_ids) != 1:
         raise ValueError("Todas as Invoices selecionadas devem pertencer ao mesmo Cliente.")
+    if categoria == CATEGORIA_CAMBIO_EXPORTACAO and str(previsao_embarque_dias or "").strip() == "":
+        defaults = [
+            invoice["previsao_embarque_dias_padrao"]
+            for invoice in invoices
+            if invoice["previsao_embarque_dias_padrao"] is not None
+        ]
+        if len(defaults) == len(invoices) and len(set(defaults)) == 1:
+            previsao_embarque_dias = str(defaults[0])
+    previsao = (
+        parse_previsao_embarque_dias(previsao_embarque_dias, required=True)
+        if categoria == CATEGORIA_CAMBIO_EXPORTACAO
+        else None
+    )
 
     groups_by_key = {}
     amounts = amounts or {}
@@ -6762,6 +7051,7 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
             "data_liquidacao": liquidacao,
             "taxa_cambio": rate,
             "categoria_cambio": categoria,
+            "previsao_embarque_dias": previsao,
             "valor_brl": Decimal("0"),
             "banco_liquidacao_id": banco_liquidacao["id"],
             "banco_liquidacao_nome": banco_liquidacao["nome"],
@@ -6869,8 +7159,13 @@ def central_closing_filter_sql(filters=None, alias="h"):
     return where, params
 
 
-def central_closing_headers(conn, filters=None):
+def central_closing_headers(conn, filters=None, pagination=None):
     where, params = central_closing_filter_sql(filters)
+    limit_clause = ""
+    query_params = list(params)
+    if pagination:
+        limit_clause = " LIMIT ? OFFSET ?"
+        query_params.extend([pagination["per_page"], pagination["offset"]])
     return conn.execute(f"""
         SELECT h.*, cl.nome AS cliente_nome,
                bc.nome AS banco_credito_nome, bl.nome AS banco_liquidacao_nome,
@@ -6892,8 +7187,24 @@ def central_closing_headers(conn, filters=None):
         ORDER BY CASE WHEN MIN(e.prioridade) IS NULL THEN 1 ELSE 0 END,
                  MIN(e.prioridade),
                  CASE WHEN h.valor_brl IS NULL THEN 1 ELSE 0 END,
-                 h.valor_brl DESC, MIN(e.id), h.id DESC
-    """, params).fetchall()
+                 h.valor_brl DESC, MIN(e.id), h.id DESC{limit_clause}
+    """, query_params).fetchall()
+
+
+def central_closing_headers_count(conn, filters=None):
+    where, params = central_closing_filter_sql(filters)
+    return conn.execute(f"""
+        SELECT COUNT(DISTINCT h.id)
+        FROM fechamentos h
+        JOIN clientes cl ON cl.id=h.cliente_id
+        JOIN contrapartes bc ON bc.id=h.banco_credito_id
+        JOIN contrapartes bl ON bl.id=h.banco_liquidacao_id
+        LEFT JOIN contratos c ON c.id=h.contrato_id
+        LEFT JOIN fechamentos_cambio f ON f.fechamento_id=h.id
+        LEFT JOIN invoices i ON i.id=f.invoice_id
+        LEFT JOIN empresas e ON e.id=i.empresa_id
+        {where}
+    """, params).fetchone()[0]
 
 
 def central_closing_report_items(conn, filters=None):
@@ -6903,7 +7214,8 @@ def central_closing_report_items(conn, filters=None):
                COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social) AS empresa_nome,
                cl.nome AS cliente_nome, bc.nome AS banco_credito_nome,
                e.id AS empresa_id, e.prioridade AS empresa_prioridade,
-               c.numero_contrato, f.moeda, f.valor_moeda, h.taxa_cambio
+               c.numero_contrato, f.moeda, f.valor_moeda, h.taxa_cambio,
+               h.valor_brl AS fechamento_valor_brl
         FROM fechamentos h
         JOIN clientes cl ON cl.id=h.cliente_id
         JOIN contrapartes bc ON bc.id=h.banco_credito_id
@@ -6930,10 +7242,19 @@ def closing_report_amounts_by_currency(items, currency_key="moeda", value_key="v
 
 
 def closing_report_brl_total(items, value_key="valor_brl"):
-    total = sum(
-        (decimal_value(item.get(value_key)) for item in items),
-        Decimal("0"),
-    )
+    """Soma o valor de cada Fechamento uma única vez no resumo."""
+    total = Decimal("0")
+    fechamento_ids = set()
+    for item in items:
+        fechamento_id = item.get("fechamento_id")
+        fechamento_valor_brl = item.get("fechamento_valor_brl")
+        if fechamento_id is not None and fechamento_valor_brl is not None:
+            if fechamento_id in fechamento_ids:
+                continue
+            fechamento_ids.add(fechamento_id)
+            total += decimal_value(fechamento_valor_brl)
+        else:
+            total += decimal_value(item.get(value_key))
     return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
@@ -7045,7 +7366,7 @@ def central_closing_report_context(args):
     report_items = [dict(item) for item in report_items]
     for item in report_items:
         item["valor_brl"] = (
-            closing_brl_value(item["valor_moeda"], item["taxa_cambio"])
+            closing_brl_unrounded_value(item["valor_moeda"], item["taxa_cambio"])
             if item["taxa_cambio"] is not None
             else None
         )
@@ -7729,24 +8050,18 @@ def lista_invoices():
     filters = {key: value for key, value in request.args.items() if key not in {"sort", "direction", "page"} and value}
     clause, params = invoice_filter_query(request.args)
     sort_fields, sort, direction = invoice_sorting(request.args)
-    try:
-        page = max(1, int(request.args.get("page", 1)))
-    except ValueError:
-        page = 1
-    per_page = 20
     conn = db()
     for row in conn.execute("SELECT id FROM invoices").fetchall():
         refresh_invoice_status(conn, row["id"])
     conn.commit()
     total = conn.execute(f"SELECT COUNT(*) FROM invoices i{clause}", params).fetchone()[0]
-    pages = max(1, (total + per_page - 1) // per_page)
-    page = min(page, pages)
+    pagination = build_pagination(request.args, total, endpoint="lista_invoices")
     rows = conn.execute(f"""
         SELECT i.id FROM invoices i
         LEFT JOIN empresas e ON e.id=i.empresa_id
         {clause}
         ORDER BY {empresa_order_sql("e")}, {sort_fields[sort]} {direction}, i.id DESC LIMIT ? OFFSET ?
-    """, params + [per_page, (page - 1) * per_page]).fetchall()
+    """, params + [pagination["per_page"], pagination["offset"]]).fetchall()
     invoices = []
     for row in rows:
         item = invoice_summary(conn, row["id"])
@@ -7760,16 +8075,14 @@ def lista_invoices():
     sort_links = {}
     for key in sort_fields:
         sort_links[key] = {**filters, "sort": key, "direction": "asc" if sort == key and direction == "DESC" else "desc"}
-    previous_args = {**filters, "sort": sort, "direction": direction, "page": page - 1}
-    next_args = {**filters, "sort": sort, "direction": direction, "page": page + 1}
-    return render_template("invoices.html", invoices=invoices, total=total, page=page, pages=pages,
+    return render_template("invoices.html", invoices=invoices, total=total,
                            filters=filters, empresas=empresas, clientes=clientes, competencias=competencias,
                            contrapartes=contrapartes, moedas=moedas,
                            invoice_statuses=INVOICE_STATUS_LABELS, sort=sort, direction=direction,
-                           sort_links=sort_links, previous_args=previous_args, next_args=next_args)
+                           sort_links=sort_links, pagination=pagination)
 
 
-def central_closing_page_data(conn, closing_filters=None):
+def central_closing_page_data(conn, closing_filters=None, closing_pagination=None):
     eligible = []
     for row in conn.execute("SELECT id FROM invoices ORDER BY numero_invoice, id").fetchall():
         try:
@@ -7780,7 +8093,7 @@ def central_closing_page_data(conn, closing_filters=None):
         "eligible_invoices": eligible,
         "clientes": clientes_for_form(conn),
         "contrapartes": contrapartes_for_form(conn),
-        "fechamentos": central_closing_headers(conn, closing_filters),
+        "fechamentos": central_closing_headers(conn, closing_filters, closing_pagination),
         "moedas": [row[0] for row in conn.execute(
             "SELECT DISTINCT moeda FROM invoices ORDER BY moeda"
         ).fetchall()],
@@ -7810,7 +8123,12 @@ def gestao_fechamentos_invoices():
         flash(closing_filter_error, "danger")
     conn = db()
     try:
-        data = central_closing_page_data(conn, closing_query)
+        closing_total = central_closing_headers_count(conn, closing_query)
+        closing_pagination = build_pagination(
+            request.args, closing_total, page_param="fechamentos_page",
+            endpoint="gestao_fechamentos_invoices",
+        )
+        data = central_closing_page_data(conn, closing_query, closing_pagination)
     finally:
         conn.close()
     filters = {
@@ -7826,11 +8144,20 @@ def gestao_fechamentos_invoices():
         and (not filters["moeda"] or invoice["moeda"] == filters["moeda"])
         and (not filters["numero_invoice"] or filters["numero_invoice"].casefold() in str(invoice["numero_invoice"]).casefold())
     ]
+    eligible_pagination = build_pagination(
+        request.args, len(data["eligible_invoices"]), page_param="eligible_page",
+        endpoint="gestao_fechamentos_invoices",
+    )
+    start = eligible_pagination["offset"]
+    end = start + eligible_pagination["per_page"]
+    data["eligible_invoices"] = data["eligible_invoices"][start:end]
     return render_template(
         "invoice_fechamentos.html",
         filters=filters,
         closing_filters=closing_filters,
         closing_filter_error=closing_filter_error,
+        eligible_pagination=eligible_pagination,
+        closing_pagination=closing_pagination,
         **data,
     )
 
@@ -7855,6 +8182,7 @@ def previsualizar_fechamentos_invoices():
             request.form.get("banco_liquidacao_id"),
             amounts=closing_amounts_from_form(request.form),
             categoria_cambio=request.form.get("categoria_cambio"),
+            previsao_embarque_dias=request.form.get("previsao_embarque_dias"),
         )
         form_data = {
             "data_fechamento": request.form.get("data_fechamento", ""),
@@ -7862,6 +8190,9 @@ def previsualizar_fechamentos_invoices():
             "taxa_cambio": request.form.get("taxa_cambio", ""),
             "banco_liquidacao_id": request.form.get("banco_liquidacao_id", ""),
             "categoria_cambio": request.form.get("categoria_cambio", ""),
+            "previsao_embarque_dias": str(groups[0]["previsao_embarque_dias"])
+            if groups and groups[0]["previsao_embarque_dias"] is not None
+            else "",
             "selected_ids": request.form.getlist("selected_ids"),
         }
     except ValueError as exc:
@@ -7887,19 +8218,22 @@ def registrar_fechamentos_invoices():
             request.form.get("banco_liquidacao_id"),
             amounts=closing_amounts_from_form(request.form),
             categoria_cambio=request.form.get("categoria_cambio"),
+            previsao_embarque_dias=request.form.get("previsao_embarque_dias"),
         )
         for group in groups:
             cursor = conn.execute("""
                 INSERT INTO fechamentos
                     (cliente_id,banco_credito_id,moeda,data_fechamento,data_liquidacao,
-                     categoria_cambio,banco_liquidacao_id,taxa_cambio,valor_brl)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                     categoria_cambio,banco_liquidacao_id,taxa_cambio,valor_brl,
+                     previsao_embarque_dias)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
             """, (
                 group["cliente_id"], group["banco_credito_id"], group["moeda"],
                 group["data_fechamento"], group["data_liquidacao"],
                 group["categoria_cambio"], group["banco_liquidacao_id"],
                 float(group["taxa_cambio"]),
                 float(group["valor_brl"]),
+                group["previsao_embarque_dias"],
             ))
             fechamento_id = cursor.lastrowid
             number = request.form.get(
@@ -7982,6 +8316,13 @@ def editar_fechamento_invoice(fechamento_id):
             raise ValueError("A Data de Liquidação não pode ser anterior à Data de Fechamento.")
         taxa_cambio = parse_exchange_rate(request.form.get("taxa_cambio"))
         categoria_cambio = normalize_cambio_category(request.form.get("categoria_cambio"))
+        previsao_embarque_dias = (
+            parse_previsao_embarque_dias(
+                request.form.get("previsao_embarque_dias"), required=True
+            )
+            if categoria_cambio == CATEGORIA_CAMBIO_EXPORTACAO
+            else None
+        )
         banco_liquidacao = resolve_counterparty(
             conn, request.form.get("banco_liquidacao_id"), required=True
         )
@@ -7991,6 +8332,7 @@ def editar_fechamento_invoice(fechamento_id):
             "data_liquidacao": data_liquidacao,
             "taxa_cambio": taxa_cambio,
             "categoria_cambio": categoria_cambio,
+            "previsao_embarque_dias": previsao_embarque_dias,
             "valor_brl": closing_brl_value(detail["valor_moeda"], taxa_cambio),
             "banco_liquidacao_id": banco_liquidacao["id"],
             "banco_liquidacao_nome": banco_liquidacao["nome"],
@@ -8018,11 +8360,12 @@ def editar_fechamento_invoice(fechamento_id):
         conn.execute("""
             UPDATE fechamentos
             SET data_fechamento=?, data_liquidacao=?, banco_liquidacao_id=?,
-                taxa_cambio=?, valor_brl=?, categoria_cambio=?
+                taxa_cambio=?, valor_brl=?, categoria_cambio=?,
+                previsao_embarque_dias=?
             WHERE id=?
         """, (data_fechamento, data_liquidacao, banco_liquidacao["id"],
               float(taxa_cambio), float(group["valor_brl"]), categoria_cambio,
-              fechamento_id))
+              previsao_embarque_dias, fechamento_id))
         conn.execute("UPDATE fechamentos_cambio SET data_fechamento=? WHERE fechamento_id=?",
                      (data_fechamento, fechamento_id))
         if contrato_id:

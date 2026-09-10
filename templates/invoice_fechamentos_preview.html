@@ -8,12 +8,14 @@
   <input type="hidden" name="taxa_cambio" value="{{ form_data.taxa_cambio }}">
   <input type="hidden" name="banco_liquidacao_id" value="{{ form_data.banco_liquidacao_id }}">
   <input type="hidden" name="categoria_cambio" value="{{ form_data.categoria_cambio }}">
+  <input type="hidden" name="previsao_embarque_dias" value="{{ form_data.previsao_embarque_dias }}">
   <label>Categoria Câmbio<select disabled required aria-label="Categoria Câmbio selecionada"><option value="Câmbio Exportação" {{ 'selected' if form_data.categoria_cambio == 'Câmbio Exportação' }}>Câmbio Exportação</option><option value="Câmbio Financeiro" {{ 'selected' if form_data.categoria_cambio == 'Câmbio Financeiro' }}>Câmbio Financeiro</option></select></label>
   <div class="detail-grid central-closing-preview-summary">
     <div><span>Data de Fechamento</span><strong>{{ form_data.data_fechamento|date_br }}</strong></div>
     <div><span>Data de Liquidação</span><strong>{{ form_data.data_liquidacao|date_br }}</strong></div>
     <div><span>Taxa</span><strong>{{ form_data.taxa_cambio|rate }}</strong></div>
     <div><span>Categoria Câmbio</span><strong>{{ form_data.categoria_cambio }}</strong></div>
+    {% if form_data.categoria_cambio == 'Câmbio Exportação' %}<div><span>PREVISÃO EMBARQUE</span><strong>{{ form_data.previsao_embarque_dias ~ ' dias' if form_data.previsao_embarque_dias else '-' }}</strong></div>{% endif %}
     <div><span>Grupos</span><strong>{{ groups|length }}</strong></div>
   </div>
   {% for group in groups %}

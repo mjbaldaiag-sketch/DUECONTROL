@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
 {% block content %}
 <div class="page-heading"><div><h1>Gest&atilde;o de DU-Es</h1><p class="muted">{{ total }} registro(s) encontrado(s)</p></div><div class="actions"><a class="btn" href="{{ url_for('nova_due') }}">+ Nova DU-E</a><a class="btn secondary" href="{{ url_for('modelo_dues') }}">Baixar modelo Excel</a></div></div>
 <div class="import-box"><form class="inline" action="{{ url_for('importar_dues') }}" method="post" enctype="multipart/form-data"><input type="file" name="arquivo" accept=".xlsx,.xls" required><button>Importar Excel</button></form><span class="muted">Use as colunas do modelo para validar os registros corretamente.</span></div>
@@ -28,5 +29,5 @@
 {% else %}<tr><td colspan="10" class="empty">Nenhuma DU-E encontrada para os filtros informados.</td></tr>{% endfor %}
 </tbody></table></div>
 </form>
-{% if pages > 1 %}<div class="pagination"><span>P&aacute;gina {{ page }} de {{ pages }}</span><div>{% if page > 1 %}<a class="btn secondary" href="{{ url_for('consulta_dues', **previous_args) }}">Anterior</a>{% endif %}{% if page < pages %}<a class="btn" href="{{ url_for('consulta_dues', **next_args) }}">Pr&oacute;xima</a>{% endif %}</div></div>{% endif %}
+{{ render_pagination(pagination, 'Paginação de DU-Es') }}
 {% endblock %}

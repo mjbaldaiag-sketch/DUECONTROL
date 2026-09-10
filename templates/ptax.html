@@ -1,4 +1,6 @@
-{% extends "base.html" %}{% block content %}
+{% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
+{% block content %}
 <div class="page-heading"><div><h1>PTAX</h1><p class="muted">Consulte e mantenha o histórico de PTAX do Banco Central.</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('dashboard_derivativos') }}">Derivativos</a><a class="btn secondary" href="{{ url_for('lista_ndfs') }}">NDFs</a></div></div>
 
 <form method="post" action="{{ url_for('consultar_ptax') }}" class="filters">
@@ -22,4 +24,5 @@
 <div class="table-wrap"><table class="compact-table" data-sortable><thead><tr><th data-sort-type="date">Data</th><th data-sort-type="text">Moeda</th><th data-sort-type="number">PTAX Compra</th><th data-sort-type="number">PTAX Venda</th></tr></thead><tbody>
 {% for cotacao in historico %}<tr><td>{{ cotacao.data_cotacao|date_br }}</td><td>{{ cotacao.moeda }}</td><td>{{ cotacao.ptax_compra|rate }}</td><td>{{ cotacao.ptax_venda|rate }}</td></tr>{% else %}<tr><td colspan="4" class="empty">Nenhuma cotação PTAX armazenada.</td></tr>{% endfor %}
 </tbody></table></div>
+{{ render_pagination(historico_pagination, 'Paginação do histórico de PTAX') }}
 {% endblock %}

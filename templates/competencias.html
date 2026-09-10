@@ -1,4 +1,6 @@
-{% extends "base.html" %}{% block content %}
+{% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
+{% block content %}
 <div class="page-heading"><div><h1>Cadastro de Competências</h1><p class="muted">Gerencie os períodos de competência por empresa.</p></div><div class="actions"><a class="btn" href="#nova-competencia">+ Nova Competência</a><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div></div>
 <form method="post" action="{{ url_for('editar_competencia', competencia_id=competencia.id) if competencia and competencia.id else url_for('cadastro_competencias') }}" class="form" id="nova-competencia">
   <h2>{{ 'Editar competência' if competencia and competencia.id else 'Nova competência' }}</h2>
@@ -12,4 +14,5 @@
 <h2>Competências cadastradas</h2><div class="table-wrap"><table class="compact-table" data-sortable><thead><tr><th>Descrição</th><th>Empresa</th><th>Data inicial</th><th>Data final</th><th>Status</th><th>Ações</th></tr></thead><tbody>
 {% for item in competencias %}<tr><td>{{ item.descricao }}</td><td>{{ item.apelido or item.razao_social }}</td><td>{{ item.data_inicial|date_br }}</td><td>{{ item.data_final|date_br }}</td><td><span class="status {{ 'status-pendente' if item.status == 'ABERTA' else 'status-concluido' }}">{{ 'Aberta' if item.status == 'ABERTA' else 'Encerrada' }}</span></td><td class="row-actions"><a href="{{ url_for('editar_competencia', competencia_id=item.id) }}">Editar</a>{% if item.status == 'ABERTA' %}<form method="post" action="{{ url_for('encerrar_competencia', competencia_id=item.id) }}" onsubmit="return confirm('Encerrar esta competência?');"><button class="link-danger" type="submit">Encerrar</button></form>{% endif %}<form method="post" action="{{ url_for('excluir_competencia', competencia_id=item.id) }}" onsubmit="return confirm('Excluir esta competência?');"><button class="link-danger" type="submit">Excluir</button></form></td></tr>{% else %}<tr><td colspan="6" class="empty">Nenhuma competência cadastrada.</td></tr>{% endfor %}
 </tbody></table></div>
+{{ render_pagination(pagination, 'Paginação de competências') }}
 {% endblock %}

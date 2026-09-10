@@ -31,10 +31,12 @@ class InvoiceFlowTests(unittest.TestCase):
         self.db_path.unlink(missing_ok=True)
 
     def _create_invoice(self, number="INV-001", value="1000,00", commercial=None, client_id=1,
-                        currency="USD", banco_referenciado_id=None):
+                        currency="USD", banco_referenciado_id=None, empresa_id=1,
+                        competencia_id=1):
         data = {
-            "empresa_id": "1", "numero_invoice": number, "tipo_documento": "COMMERCIAL_INVOICE",
-            "competencia_id": "1", "cliente_id": str(client_id), "data_emissao": "01/08/2026", "moeda": currency,
+            "empresa_id": str(empresa_id), "numero_invoice": number, "tipo_documento": "COMMERCIAL_INVOICE",
+            "competencia_id": str(competencia_id), "cliente_id": str(client_id),
+            "data_emissao": "01/08/2026", "moeda": currency,
             "valor_moeda": value,
         }
         if commercial is not None:
@@ -66,6 +68,8 @@ class InvoiceFlowTests(unittest.TestCase):
             "banco_liquidacao_id": banco_liquidacao_id,
             "categoria_cambio": categoria_cambio,
         }
+        if categoria_cambio == app.CATEGORIA_CAMBIO_EXPORTACAO:
+            closing_data["previsao_embarque_dias"] = "120"
         if numero_contrato:
             closing_data["numero_contrato_0"] = numero_contrato
         response = self.client.post("/invoices/fechamentos", data=closing_data)
@@ -2371,6 +2375,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,1234", "banco_liquidacao_id": "1",
             "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
         })
         self.assertEqual(response.status_code, 200)
         self.assertIn("Grupo 1", response.get_data(as_text=True))
@@ -2385,6 +2390,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,1234", "banco_liquidacao_id": "1",
             "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
             "numero_contrato_0": "CENTRAL-001",
         })
         self.assertEqual(response.status_code, 302)
@@ -2394,11 +2400,13 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(header["contrato_id"], 1)
         self.assertEqual(app.Decimal(str(header["taxa_cambio"])), app.Decimal("5.1234"))
         self.assertEqual(app.Decimal(str(header["valor_brl"])), app.Decimal("768.51"))
+        self.assertEqual(header["previsao_embarque_dias"], 120)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos_cambio WHERE fechamento_id=?", (header["id"],)).fetchone()[0], 2)
-        contract = conn.execute("SELECT valor_moeda, taxa_cambio, valor_reais FROM contratos WHERE id=?", (header["contrato_id"],)).fetchone()
+        contract = conn.execute("SELECT valor_moeda, taxa_cambio, valor_reais, previsao_embarque_dias FROM contratos WHERE id=?", (header["contrato_id"],)).fetchone()
         self.assertEqual(app.Decimal(str(contract["valor_moeda"])), app.Decimal("150"))
         self.assertEqual(app.Decimal(str(contract["taxa_cambio"])), app.Decimal("5.1234"))
         self.assertEqual(app.Decimal(str(contract["valor_reais"])), app.Decimal("768.51"))
+        self.assertIsNone(contract["previsao_embarque_dias"])
         self.assertEqual(app.invoice_summary(conn, invoice_a)["saldo_fechamentos"], app.Decimal("0"))
         self.assertEqual(
             conn.execute("SELECT status FROM invoices WHERE id=?", (invoice_a,)).fetchone()[0],
@@ -2416,6 +2424,8 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertIn(f"Fechamento {header['id']}", detail.get_data(as_text=True))
         self.assertIn("5,1234", detail.get_data(as_text=True))
         self.assertIn("768,51", detail.get_data(as_text=True))
+        self.assertIn("PREVISÃO EMBARQUE", detail.get_data(as_text=True))
+        self.assertIn("120 dias", detail.get_data(as_text=True))
         listing = self.client.get("/invoices/fechamentos")
         self.assertEqual(listing.status_code, 200)
         self.assertIn("5,1234", listing.get_data(as_text=True))
@@ -2425,10 +2435,13 @@ class InvoiceFlowTests(unittest.TestCase):
         contract_detail = self.client.get(f"/contrato/{header['contrato_id']}")
         self.assertEqual(contract_detail.status_code, 200)
         self.assertIn(f"href=\"/invoices/fechamentos/{header['id']}\"", contract_detail.get_data(as_text=True))
+        self.assertIn("PREVISÃO EMBARQUE", contract_detail.get_data(as_text=True))
+        self.assertIn("120 dias", contract_detail.get_data(as_text=True))
 
         response = self.client.post(f"/invoices/fechamentos/{header['id']}/editar", data={
             "data_fechamento": "2026-08-22", "data_liquidacao": "2026-08-26", "taxa_cambio": "5,2000",
             "banco_liquidacao_id": "1", "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
         })
         self.assertEqual(response.status_code, 302)
         response = self.client.post(f"/invoices/fechamentos/{header['id']}/excluir")
@@ -2437,6 +2450,118 @@ class InvoiceFlowTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos").fetchone()[0], 0)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM contratos WHERE numero_contrato='CENTRAL-001'").fetchone()[0], 0)
         conn.close()
+
+    def test_closing_report_aggregates_gross_brl_before_rounding(self):
+        invoice_ids = [
+            self._create_invoice("INV-GROSS-A", "23544,82"),
+            self._create_invoice("INV-GROSS-B", "23544,82"),
+            self._create_invoice("INV-GROSS-C", "40026,19"),
+        ]
+        for invoice_id, value in zip(invoice_ids, ("23544,82", "23544,82", "40026,19")):
+            response = self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+                "banco_credito_id": "1", "data_credito": "20/08/2026",
+                "valor_moeda": value,
+            })
+            self.assertEqual(response.status_code, 302)
+
+        response = self.client.post("/invoices/fechamentos", data={
+            "selected_ids": [str(invoice_id) for invoice_id in invoice_ids],
+            "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
+            "taxa_cambio": "5,1102", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
+            "numero_contrato_0": "630872124",
+        })
+        self.assertEqual(response.status_code, 302)
+
+        conn = app.db()
+        header = conn.execute(
+            "SELECT id, valor_brl FROM fechamentos WHERE id=(SELECT MAX(id) FROM fechamentos)"
+        ).fetchone()
+        self.assertEqual(app.Decimal(str(header["valor_brl"])), app.Decimal("445179.31"))
+        conn.close()
+
+        context = app.central_closing_report_context({})
+        bank = context["resumo_banco_empresa"][0]
+        company = bank["empresas"][0]
+        contract = company["contratos"][0]
+        self.assertEqual(bank["total_brl"], app.Decimal("445179.31"))
+        self.assertEqual(company["total_brl"], app.Decimal("445179.31"))
+        self.assertEqual(contract["total_brl"], app.Decimal("445179.31"))
+
+        report = self.client.get("/invoices/fechamentos/relatorio")
+        self.assertEqual(report.status_code, 200)
+        report_html = report.get_data(as_text=True)
+        self.assertIn("445.179,31", report_html)
+        self.assertNotIn("445.179,32", report_html)
+
+    def test_export_prediction_uses_unanimous_company_default_and_rejects_conflict(self):
+        conn = app.db()
+        conn.execute(
+            "INSERT INTO empresas (razao_social,cnpj,apelido) VALUES (?,?,?)",
+            ("Empresa Dois", "45765914000262", "Empresa Dois"),
+        )
+        conn.execute(
+            "INSERT INTO competencias (empresa_id,descricao,data_inicial,data_final) VALUES (?,?,?,?)",
+            (2, "Agosto/2026", "2026-08-01", "2026-08-31"),
+        )
+        conn.executemany(
+            "INSERT INTO configuracoes_padrao (empresa_id,previsao_embarque_dias) VALUES (?,?)",
+            [(1, 120), (2, 120)],
+        )
+        conn.commit()
+        conn.close()
+
+        invoice_a = self._create_invoice("INV-DEFAULT-A", "100,00")
+        invoice_b = self._create_invoice(
+            "INV-DEFAULT-B", "100,00", empresa_id=2, competencia_id=2
+        )
+        for invoice_id in (invoice_a, invoice_b):
+            self.assertEqual(self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+                "banco_credito_id": "1", "data_credito": "20/08/2026", "valor_moeda": "100,00",
+            }).status_code, 302)
+        response = self.client.post("/invoices/fechamentos", data={
+            "selected_ids": [str(invoice_a), str(invoice_b)],
+            "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
+            "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        header = conn.execute("SELECT previsao_embarque_dias FROM fechamentos").fetchone()
+        self.assertEqual(header["previsao_embarque_dias"], 120)
+        conn.execute(
+            "UPDATE configuracoes_padrao SET previsao_embarque_dias=240 WHERE empresa_id=2"
+        )
+        conn.commit()
+        conn.close()
+
+        conflict_a = self._create_invoice("INV-CONFLICT-A", "100,00")
+        conflict_b = self._create_invoice(
+            "INV-CONFLICT-B", "100,00", empresa_id=2, competencia_id=2
+        )
+        for invoice_id in (conflict_a, conflict_b):
+            self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+                "banco_credito_id": "1", "data_credito": "20/08/2026", "valor_moeda": "100,00",
+            })
+        response = self.client.post("/invoices/fechamentos", data={
+            "selected_ids": [str(conflict_a), str(conflict_b)],
+            "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
+            "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+        }, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("PREVISÃO EMBARQUE", response.get_data(as_text=True))
+        conn = app.db()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos").fetchone()[0], 1)
+        conn.close()
+
+    def test_export_prediction_backend_bounds_are_strict(self):
+        self.assertEqual(app.parse_previsao_embarque_dias("1", required=True), 1)
+        self.assertEqual(app.parse_previsao_embarque_dias("360", required=True), 360)
+        for invalid in ("", "0", "361", "-1", "1.5", "texto"):
+            with self.assertRaises(ValueError):
+                app.parse_previsao_embarque_dias(invalid, required=True)
 
     def test_central_closing_without_contract_persists_awaiting_contract(self):
         invoice_id = self._create_invoice("INV-CENTRAL-PENDING", "100,00")
@@ -2448,6 +2573,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
             "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
         })
         self.assertEqual(response.status_code, 302)
         conn = app.db()
@@ -2476,6 +2602,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
             "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
             "numero_contrato_grupo_1_USD": "CENTRAL-SPLIT-001",
         })
         self.assertEqual(response.status_code, 302)
@@ -2579,6 +2706,7 @@ class InvoiceFlowTests(unittest.TestCase):
                 "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
                 "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
                 "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+                "previsao_embarque_dias": "120",
             }, follow_redirects=True)
             self.assertIn("valor", response.get_data(as_text=True))
         conn = app.db()
@@ -2601,6 +2729,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
             "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
             "numero_contrato_0": "SHOULD-ROLLBACK",
         }, follow_redirects=True)
         self.assertEqual(response.status_code, 200)
@@ -2629,6 +2758,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
             "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
             "numero_contrato_0": "DUPLICADO", "numero_contrato_1": "DUPLICADO",
         }, follow_redirects=True)
         self.assertEqual(response.status_code, 200)
@@ -2643,6 +2773,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
             "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
             "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
         })
         self.assertEqual(response.status_code, 200)
         self.assertIn("Grupo 2", response.get_data(as_text=True))
@@ -2854,12 +2985,17 @@ class InvoiceFlowTests(unittest.TestCase):
             app.init_db()
             conn = app.db()
             contract = conn.execute(
-                "SELECT categoria_cambio,status,valor_reais,saldo_zerado_manual FROM contratos WHERE id=1"
+                "SELECT categoria_cambio,previsao_embarque_dias,status,valor_reais,saldo_zerado_manual "
+                "FROM contratos WHERE id=1"
             ).fetchone()
             self.assertEqual(contract["categoria_cambio"], app.CATEGORIA_CAMBIO_FINANCEIRO)
+            self.assertIsNone(contract["previsao_embarque_dias"])
             self.assertEqual(contract["status"], app.STATUS_CONCLUIDO)
             self.assertEqual(contract["valor_reais"], 375)
             self.assertEqual(contract["saldo_zerado_manual"], 0)
+            self.assertIsNone(conn.execute(
+                "SELECT previsao_embarque_dias FROM fechamentos WHERE id=1"
+            ).fetchone()[0])
             self.assertEqual(app.contract_summary(conn, 1)["saldo"], app.Decimal("0"))
             conn.close()
         finally:
@@ -2902,6 +3038,7 @@ class InvoiceFlowTests(unittest.TestCase):
             first = conn.execute("SELECT * FROM fechamentos").fetchone()
             first_snapshot = dict(first)
             self.assertEqual(first["categoria_cambio"], app.CATEGORIA_CAMBIO_EXPORTACAO)
+            self.assertEqual(first["previsao_embarque_dias"], app.PREVISAO_EMBARQUE_LEGADO_DIAS)
             self.assertEqual(first["valor_brl"], 512.34)
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], app.INVOICE_SCHEMA_VERSION)
             conn.close()
@@ -2911,6 +3048,7 @@ class InvoiceFlowTests(unittest.TestCase):
             second = conn.execute("SELECT * FROM fechamentos").fetchone()
             second_snapshot = dict(second)
             self.assertEqual(second_snapshot, first_snapshot)
+            self.assertEqual(second["previsao_embarque_dias"], app.PREVISAO_EMBARQUE_LEGADO_DIAS)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos").fetchone()[0], 1)
             conn.close()
         finally:
@@ -2958,7 +3096,9 @@ class InvoiceFlowTests(unittest.TestCase):
         conn = app.db()
         contract = conn.execute("SELECT * FROM contratos WHERE id=?", (header["contrato_id"],)).fetchone()
         self.assertEqual(header["categoria_cambio"], app.CATEGORIA_CAMBIO_FINANCEIRO)
+        self.assertIsNone(header["previsao_embarque_dias"])
         self.assertEqual(contract["categoria_cambio"], app.CATEGORIA_CAMBIO_FINANCEIRO)
+        self.assertIsNone(contract["previsao_embarque_dias"])
         self.assertEqual(contract["status"], app.STATUS_CONCLUIDO)
         self.assertEqual(contract["saldo_zerado_manual"], 0)
         summary = app.contract_summary(conn, header["contrato_id"])
@@ -3002,6 +3142,7 @@ class InvoiceFlowTests(unittest.TestCase):
             "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
             "data_fechamento": "2026-08-22", "data_liquidacao": "2026-08-26",
             "taxa_cambio": "5,1000", "banco_liquidacao_id": "1",
+            "previsao_embarque_dias": "120",
         })
         self.assertEqual(response.status_code, 302)
         conn = app.db()
@@ -3014,13 +3155,19 @@ class InvoiceFlowTests(unittest.TestCase):
             "categoria_cambio": app.CATEGORIA_CAMBIO_FINANCEIRO,
             "data_fechamento": "2026-08-23", "data_liquidacao": "2026-08-27",
             "taxa_cambio": "5,2000", "banco_liquidacao_id": "1",
+            "previsao_embarque_dias": "1.5",
         })
         self.assertEqual(response.status_code, 302)
         conn = app.db()
         contract = conn.execute("SELECT status,saldo_zerado_manual FROM contratos WHERE id=?", (header["contrato_id"],)).fetchone()
         self.assertEqual(contract["status"], app.STATUS_CONCLUIDO)
         self.assertEqual(contract["saldo_zerado_manual"], 0)
-        self.assertEqual(conn.execute("SELECT categoria_cambio FROM fechamentos WHERE id=?", (header["id"],)).fetchone()[0], app.CATEGORIA_CAMBIO_FINANCEIRO)
+        closing = conn.execute(
+            "SELECT categoria_cambio,previsao_embarque_dias FROM fechamentos WHERE id=?",
+            (header["id"],),
+        ).fetchone()
+        self.assertEqual(closing["categoria_cambio"], app.CATEGORIA_CAMBIO_FINANCEIRO)
+        self.assertIsNone(closing["previsao_embarque_dias"])
         conn.close()
 
     def test_financial_closing_without_contract_waits_until_contract_is_added(self):

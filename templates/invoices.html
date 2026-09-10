@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
 {% block content %}
 <div class="page-heading"><div><h1>Gestão de Invoices</h1><p class="muted">{{ total }} Invoice(s) encontrada(s)</p></div><div class="actions"><a class="btn" href="{{ url_for('nova_invoice') }}">+ Nova Invoice</a><a class="btn" href="{{ url_for('gestao_fechamentos_invoices') }}">Gestão de Fechamentos</a><a class="btn secondary" href="{{ url_for('modelo_invoices') }}">Baixar modelo Excel</a><a class="btn secondary" href="{{ url_for('relatorios_invoices') }}">Relatórios</a></div></div>
 <div class="import-box"><form class="inline" action="{{ url_for('importar_invoices') }}" method="post" enctype="multipart/form-data"><input type="file" name="arquivo" accept=".xlsx,.xls" required><button>Importar Excel</button></form><span class="muted">Uma linha por Invoice. O modelo aceita recebimento e câmbio já fechado, com campos condicionais por status.</span></div>
@@ -34,5 +35,5 @@
     <div class="form-actions"><button type="submit">Salvar recebimentos</button><button type="button" class="btn secondary" data-batch-receipt-cancel>Cancelar</button></div>
   </form>
 </dialog>
-{% if pages > 1 %}<div class="pagination"><span>Página {{ page }} de {{ pages }}</span><div>{% if page > 1 %}<a class="btn secondary" href="{{ url_for('lista_invoices', **previous_args) }}">Anterior</a>{% endif %}{% if page < pages %}<a class="btn" href="{{ url_for('lista_invoices', **next_args) }}">Próxima</a>{% endif %}</div></div>{% endif %}
+{{ render_pagination(pagination, 'Paginação de invoices') }}
 {% endblock %}

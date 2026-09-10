@@ -6,6 +6,7 @@
   <div><span>Banco de Crédito</span><strong>{{ fechamento.banco_credito_nome }}</strong></div>
   <div><span>Moeda / Total</span><strong>{{ fechamento.moeda }} {{ fechamento.valor_moeda|money }}</strong></div>
   <div><span>Categoria Câmbio</span><strong>{{ fechamento.categoria_cambio }}</strong></div>
+  {% if fechamento.categoria_cambio == 'Câmbio Exportação' %}<div><span>PREVISÃO EMBARQUE</span><strong>{{ fechamento.previsao_embarque_dias ~ ' dias' if fechamento.previsao_embarque_dias is not none else '-' }}</strong></div>{% endif %}
   <div><span>Taxa</span><strong>{{ fechamento.taxa_cambio|rate if fechamento.taxa_cambio is not none else '-' }}</strong></div>
   <div><span>Valor em BRL</span><strong>{{ fechamento.valor_brl|money if fechamento.valor_brl is not none else '-' }}</strong></div>
   <div><span>Data de Fechamento</span><strong>{{ fechamento.data_fechamento|date_br }}</strong></div>
@@ -15,12 +16,13 @@
 <h2>Invoices participantes</h2>
 <div class="table-wrap"><table class="compact-table"><thead><tr><th>Invoice</th><th>Empresa</th><th>Moeda</th><th>Valor</th></tr></thead><tbody>{% for item in fechamento['items'] %}<tr><td><a href="{{ url_for('detalhe_invoice', invoice_id=item.invoice_id) }}">{{ item.numero_invoice }}</a></td><td>{{ item.empresa_apelido or item.empresa_razao_social }}</td><td>{{ item.invoice_moeda }}</td><td>{{ item.valor_moeda|money }}</td></tr>{% else %}<tr><td class="empty" colspan="4">Nenhuma Invoice vinculada.</td></tr>{% endfor %}</tbody></table></div>
 <h2>Editar grupo</h2>
-<form method="post" action="{{ url_for('editar_fechamento_invoice', fechamento_id=fechamento.id) }}" class="form inline-form central-closing-edit-form">
-  <label>Categoria Câmbio<select name="categoria_cambio" required><option value="Câmbio Exportação" {{ 'selected' if fechamento.categoria_cambio == 'Câmbio Exportação' }}>Câmbio Exportação</option><option value="Câmbio Financeiro" {{ 'selected' if fechamento.categoria_cambio == 'Câmbio Financeiro' }}>Câmbio Financeiro</option></select></label>
+<form method="post" action="{{ url_for('editar_fechamento_invoice', fechamento_id=fechamento.id) }}" class="form inline-form central-closing-edit-form" data-previsao-embarque-form>
+  <label>Categoria Câmbio<select name="categoria_cambio" data-previsao-cambio-category required><option value="Câmbio Exportação" {{ 'selected' if fechamento.categoria_cambio == 'Câmbio Exportação' }}>Câmbio Exportação</option><option value="Câmbio Financeiro" {{ 'selected' if fechamento.categoria_cambio == 'Câmbio Financeiro' }}>Câmbio Financeiro</option></select></label>
   <label>Data de Fechamento<input type="date" name="data_fechamento" value="{{ fechamento.data_fechamento }}" required></label>
   <label>Data de Liquidação<input type="date" name="data_liquidacao" value="{{ fechamento.data_liquidacao }}" required></label>
   <label>Taxa<input name="taxa_cambio" data-rate inputmode="decimal" step="0.0001" value="{{ fechamento.taxa_cambio|rate if fechamento.taxa_cambio is not none else '' }}" required></label>
   <label>Banco de Liquidação<select name="banco_liquidacao_id" required>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if banco.id == fechamento.banco_liquidacao_id }}>{{ banco.nome }}</option>{% endfor %}</select></label>
+  <label data-previsao-embarque-label {{ '' if fechamento.categoria_cambio == 'Câmbio Exportação' else 'hidden' }}>PREVISÃO EMBARQUE<input name="previsao_embarque_dias" data-previsao-embarque type="number" min="1" max="360" step="1" inputmode="numeric" value="{{ fechamento.previsao_embarque_dias or '' }}" {{ 'required' if fechamento.categoria_cambio == 'Câmbio Exportação' else 'disabled' }}><small class="muted">Informe de 1 a 360 dias.</small></label>
   {% if not fechamento.contrato_id %}<label>Número novo de Contrato (opcional)<input name="numero_novo_contrato" maxlength="120" placeholder="Deixe vazio para manter pendente"></label>{% else %}<p class="muted">Contrato vinculado: {{ fechamento.numero_contrato }}. Os dados bancários e as datas serão sincronizados.</p>{% endif %}
   <div class="form-actions"><button type="submit">Salvar alterações</button></div>
 </form>
