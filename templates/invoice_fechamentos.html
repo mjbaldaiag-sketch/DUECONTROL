@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_pagination.html" import render_pagination %}
+{% from "_sorting.html" import sortable_header %}
 {% block content %}
 <div class="page-heading">
   <div><h1>Gestão de Fechamentos</h1><p class="muted">Selecione Invoices recebidas com saldo de câmbio disponível.</p></div>
@@ -19,8 +20,8 @@
     <span class="muted">A seleção deve usar um único Cliente. Bancos e moedas diferentes serão separados em grupos.</span>
   </div>
   <div class="table-wrap">
-    <table class="compact-table central-closing-table" data-sortable>
-      <thead><tr><th class="selection-column" data-sortable="false"><input type="checkbox" data-central-select-all aria-label="Selecionar todas"></th><th>Invoice</th><th>Empresa</th><th>Cliente</th><th>Banco de Crédito</th><th>Moeda</th><th data-sort-type="number">Recebido</th><th data-sort-type="number">Saldo disponível</th></tr></thead>
+    <table class="compact-table central-closing-table" data-sortable-server>
+      <thead><tr><th class="selection-column" data-sortable="false"><input type="checkbox" data-central-select-all aria-label="Selecionar todas"></th>{{ sortable_header('Invoice', 'numero_invoice', eligible_sort, eligible_direction, eligible_sort_links) }}{{ sortable_header('Empresa', 'empresa', eligible_sort, eligible_direction, eligible_sort_links) }}{{ sortable_header('Cliente', 'cliente', eligible_sort, eligible_direction, eligible_sort_links) }}{{ sortable_header('Banco de Crédito', 'banco_credito', eligible_sort, eligible_direction, eligible_sort_links) }}{{ sortable_header('Moeda', 'moeda', eligible_sort, eligible_direction, eligible_sort_links) }}{{ sortable_header('Recebido', 'total_recebido', eligible_sort, eligible_direction, eligible_sort_links, 'number') }}{{ sortable_header('Saldo disponível', 'valor_fechamento', eligible_sort, eligible_direction, eligible_sort_links, 'number') }}</tr></thead>
       <tbody>
       {% for invoice in eligible_invoices %}
         <tr>
@@ -75,8 +76,8 @@
     <a class="btn secondary" href="{{ url_for('gestao_fechamentos_invoices') }}">Limpar</a>
   </div>
 </form>
-<div class="table-wrap"><table class="compact-table" data-sortable>
-  <thead><tr><th data-sort-type="number">ID</th><th>Categoria Câmbio</th><th>Cliente</th><th>Banco de Crédito</th><th>Moeda</th><th data-sort-type="number">Valor</th><th data-sort-type="number">BRL</th><th data-sort-type="number">Taxa</th><th data-sort-type="date">Fechamento</th><th data-sort-type="date">Liquidação</th><th>Contrato</th><th data-sortable="false">Ações</th></tr></thead>
+<div class="table-wrap"><table class="compact-table" data-sortable-server>
+  <thead><tr>{{ sortable_header('ID', 'id', closing_sort, closing_direction, closing_sort_links, 'number') }}{{ sortable_header('Categoria Câmbio', 'categoria_cambio', closing_sort, closing_direction, closing_sort_links) }}{{ sortable_header('Cliente', 'cliente', closing_sort, closing_direction, closing_sort_links) }}{{ sortable_header('Banco de Crédito', 'banco_credito', closing_sort, closing_direction, closing_sort_links) }}{{ sortable_header('Moeda', 'moeda', closing_sort, closing_direction, closing_sort_links) }}{{ sortable_header('Valor', 'valor_moeda', closing_sort, closing_direction, closing_sort_links, 'number') }}{{ sortable_header('BRL', 'valor_brl', closing_sort, closing_direction, closing_sort_links, 'number') }}{{ sortable_header('Taxa', 'taxa_cambio', closing_sort, closing_direction, closing_sort_links, 'number') }}{{ sortable_header('Fechamento', 'data_fechamento', closing_sort, closing_direction, closing_sort_links, 'date') }}{{ sortable_header('Liquidação', 'data_liquidacao', closing_sort, closing_direction, closing_sort_links, 'date') }}{{ sortable_header('Contrato', 'contrato', closing_sort, closing_direction, closing_sort_links) }}<th data-sortable="false">Ações</th></tr></thead>
   <tbody>
   {% for fechamento in fechamentos %}
     <tr><td data-sort-value="{{ fechamento.id }}"><a href="{{ url_for('detalhe_fechamento_invoice', fechamento_id=fechamento.id, **closing_context_args) }}">{{ fechamento.id }}</a></td><td>{{ fechamento.categoria_cambio }}</td><td>{{ fechamento.cliente_nome }}</td><td>{{ fechamento.banco_credito_nome }}</td><td>{{ fechamento.moeda }}</td><td data-sort-value="{{ fechamento.valor_moeda }}">{{ fechamento.valor_moeda|money }}</td><td data-sort-value="{{ fechamento.valor_brl if fechamento.valor_brl is not none else '' }}">{{ fechamento.valor_brl|money if fechamento.valor_brl is not none else '-' }}</td><td data-sort-value="{{ fechamento.taxa_cambio if fechamento.taxa_cambio is not none else '' }}">{{ fechamento.taxa_cambio|rate if fechamento.taxa_cambio is not none else '-' }}</td><td data-sort-value="{{ fechamento.data_fechamento or '' }}">{{ fechamento.data_fechamento|date_br }}</td><td data-sort-value="{{ fechamento.data_liquidacao or '' }}">{{ fechamento.data_liquidacao|date_br }}</td><td>{% if fechamento.numero_contrato %}<a href="{{ url_for('detalhe_contrato', contrato_id=fechamento.contrato_id) }}">{{ fechamento.numero_contrato }}</a>{% else %}<span class="muted">Pendente</span>{% endif %}</td><td><a href="{{ url_for('detalhe_fechamento_invoice', fechamento_id=fechamento.id, **closing_context_args) }}">Ver / editar</a></td></tr>

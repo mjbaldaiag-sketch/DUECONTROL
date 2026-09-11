@@ -1,0 +1,3 @@
+{% macro sortable_header(label, key, sort, direction, sort_links, sort_type=None) -%}
+<th class="sortable-server-header" aria-sort="{{ 'ascending' if sort == key and direction == 'ASC' else 'descending' if sort == key else 'none' }}"{% if sort_type %} data-sort-type="{{ sort_type }}"{% endif %}><a href="{{ url_for(request.endpoint, **sort_links[key]) }}">{{ label }}</a></th>
+{%- endmacro %}

@@ -165,6 +165,37 @@ def build_pagination(args, total, page_param="page", endpoint=None, per_page=TAB
         "next_args": page_args(min(pages, page + 1)),
         "last_args": page_args(pages),
     }
+
+
+def build_sorting(args, sort_fields, sort_param="sort", direction_param="direction",
+                  page_param="page", default_sort=None, default_direction="DESC"):
+    """Valida a ordenação de uma tabela e monta os links sem o recorte atual."""
+    raw_sort = args.get(sort_param)
+    sort = raw_sort if raw_sort in sort_fields else default_sort
+    if sort not in sort_fields:
+        sort = None
+    raw_direction = (args.get(direction_param) or default_direction).lower()
+    direction = "ASC" if raw_direction == "asc" else "DESC"
+    base_args = {
+        key: value for key, value in args.items()
+        if key not in {sort_param, direction_param, page_param}
+        and value not in (None, "")
+    }
+    sort_links = {}
+    for key in sort_fields:
+        next_direction = "desc" if sort == key and direction == "ASC" else "asc"
+        sort_links[key] = {
+            **base_args,
+            sort_param: key,
+            direction_param: next_direction,
+        }
+    return sort, direction, sort_links
+
+
+def sort_sql_term(expression, direction, kind="text"):
+    """Ordena valores vazios por último e mantém a direção escolhida."""
+    empty = f"({expression} IS NULL OR TRIM(CAST({expression} AS TEXT))='')"
+    return f"CASE WHEN {empty} THEN 1 ELSE 0 END ASC, {expression} {direction}"
 PTAX_API_URL = "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoMoedaPeriodo"
 PTAX_API_TIMEOUT = 20
 CLIENTE_PAISES = (
@@ -1734,7 +1765,7 @@ def clientes_for_form(conn):
     return conn.execute("""
         SELECT id, nome, pais
         FROM clientes
-        ORDER BY nome, pais
+        ORDER BY nome, pais, id
     """).fetchall()
 
 def cliente_form_data(form, conn, current_id=None):
@@ -1786,7 +1817,7 @@ def clientes_com_vinculos(conn, pagination=None):
     query = """
         SELECT id, nome, pais
         FROM clientes
-        ORDER BY nome, pais
+        ORDER BY nome, pais, id
     """
     params = []
     if pagination:
@@ -1805,7 +1836,7 @@ def contrapartes_for_form(conn):
     return conn.execute("""
         SELECT id, nome
         FROM contrapartes
-        ORDER BY nome
+        ORDER BY nome, id
     """).fetchall()
 
 def configuracoes_padrao_for_empresa(conn, empresa_id):
@@ -2345,18 +2376,35 @@ def render_ptax_page(previsao=None, consulta=None):
         "data_final": consulta.get("data_final") or "",
     }
     conn = db()
+    sort_fields = {
+        "data_cotacao": ("data_cotacao", "date"),
+        "moeda": ("moeda", "text"),
+        "ptax_compra": ("ptax_compra", "number"),
+        "ptax_venda": ("ptax_venda", "number"),
+    }
+    sort, direction, sort_links = build_sorting(
+        request.args, sort_fields,
+        sort_param="historico_sort", direction_param="historico_direction",
+        page_param="page", default_sort=None, default_direction="DESC",
+    )
     historico_total = conn.execute("SELECT COUNT(*) FROM ptax_cotacoes").fetchone()[0]
     historico_pagination = build_pagination(request.args, historico_total, endpoint="ptax")
+    order_sql = (
+        f"{sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, id {direction}"
+        if sort else "data_cotacao DESC, moeda ASC, id DESC"
+    )
     historico = conn.execute("""
-        SELECT data_cotacao, moeda, ptax_compra, ptax_venda
+        SELECT id, data_cotacao, moeda, ptax_compra, ptax_venda
         FROM ptax_cotacoes
-        ORDER BY data_cotacao DESC, moeda ASC
+        ORDER BY """ + order_sql + """
         LIMIT ? OFFSET ?
     """, (historico_pagination["per_page"], historico_pagination["offset"])).fetchall()
     conn.close()
     return render_template("ptax.html", moedas=PTAX_MOEDAS, consulta=form_values,
                            previsao=previsao, historico=historico,
-                           historico_pagination=historico_pagination)
+                           historico_pagination=historico_pagination,
+                           historico_sort=sort, historico_direction=direction,
+                           historico_sort_links=sort_links)
 
 def contract_summary(conn, contrato_id):
     row = conn.execute(f"""
@@ -2380,22 +2428,91 @@ def contract_summary(conn, contrato_id):
 
 init_db()
 
+
+def dashboard_due_sorting(args):
+    fields = {
+        "numero_due": ("d.numero_due", "text"),
+        "empresa": ("e.apelido", "text"),
+        "chave_acesso": ("d.chave_acesso", "text"),
+        "data_due": ("d.created_at", "date"),
+        "cliente": ("d.cliente", "text"),
+        "moeda": ("d.moeda", "text"),
+        "valor_original": ("d.valor_original", "number"),
+        "utilizado": (
+            "COALESCE(SUM(CASE WHEN m.tipo IN ('UTILIZACAO','VINCULACAO') "
+            "THEN m.valor ELSE -m.valor END),0)",
+            "number",
+        ),
+        "saldo": (
+            "d.valor_original - COALESCE(SUM(CASE WHEN m.tipo IN "
+            "('UTILIZACAO','VINCULACAO') THEN m.valor ELSE -m.valor END),0)",
+            "number",
+        ),
+        "status": ("d.status", "text"),
+    }
+    return fields, *build_sorting(
+        args, fields,
+        sort_param="dues_sort", direction_param="dues_direction",
+        page_param="dues_page", default_sort=None, default_direction="DESC",
+    )
+
+
+def dashboard_contract_sorting(args):
+    fields = {
+        "numero_contrato": ("c.numero_contrato", "text"),
+        "categoria_cambio": ("c.categoria_cambio", "text"),
+        "empresa": ("e.apelido", "text"),
+        "banco": ("COALESCE(c.banco, c.banco_credito)", "text"),
+        "data_contrato": ("c.data_contrato", "date"),
+        "data_liquidacao": ("c.data_liquidacao", "date"),
+        "cliente": ("c.cliente", "text"),
+        "moeda": ("c.moeda", "text"),
+        "valor_moeda": ("valor_moeda_consolidado", "number"),
+        "vinculado": ("vinculado", "number"),
+        "saldo": (
+            f"CASE WHEN c.saldo_zerado_manual=1 OR c.categoria_cambio='{CATEGORIA_CAMBIO_FINANCEIRO}' "
+            f"THEN 0 ELSE {contract_total_sql('c')} "
+            "- COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0) END",
+            "number",
+        ),
+        "status": ("c.status", "text"),
+    }
+    return fields, *build_sorting(
+        args, fields,
+        sort_param="contratos_sort", direction_param="contratos_direction",
+        page_param="contratos_page", default_sort=None, default_direction="DESC",
+    )
+
 @app.route("/")
 def index():
     conn = db()
     dues_total = conn.execute("SELECT COUNT(*) FROM dues").fetchone()[0]
     contratos_total = conn.execute("SELECT COUNT(*) FROM contratos").fetchone()[0]
+    dues_sort_fields, dues_sort, dues_direction, dues_sort_links = dashboard_due_sorting(request.args)
+    contratos_sort_fields, contratos_sort, contratos_direction, contratos_sort_links = dashboard_contract_sorting(request.args)
     dues_pagination = build_pagination(request.args, dues_total, page_param="dues_page", endpoint="index")
     contratos_pagination = build_pagination(request.args, contratos_total, page_param="contratos_page", endpoint="index")
-    dues = [decorate_due(row) for row in conn.execute("""
+    dues_order = (
+        f"{sort_sql_term(dues_sort_fields[dues_sort][0], dues_direction, dues_sort_fields[dues_sort][1])}, "
+        f"{empresa_order_sql('e')}, d.id {dues_direction}"
+        if dues_sort else f"{empresa_order_sql('e')}, d.id DESC"
+    )
+    dues_params = []
+    dues = [decorate_due(row) for row in conn.execute(f"""
         SELECT d.*, e.apelido AS empresa_apelido,
                COALESCE(SUM(CASE WHEN m.tipo IN ('UTILIZACAO','VINCULACAO') THEN m.valor ELSE -m.valor END),0) AS utilizado
         FROM dues d
         LEFT JOIN due_movimentacoes m ON m.due_id=d.id
         LEFT JOIN empresas e ON e.cnpj=d.cnpj
-        GROUP BY d.id ORDER BY """ + empresa_order_sql("e") + """, d.id DESC
+        GROUP BY d.id ORDER BY {dues_order}
         LIMIT ? OFFSET ?
-    """, (dues_pagination["per_page"], dues_pagination["offset"])).fetchall()]
+    """, dues_params + [dues_pagination["per_page"], dues_pagination["offset"]]).fetchall()]
+    contratos_order = (
+        f"{sort_sql_term(contratos_sort_fields[contratos_sort][0], contratos_direction, contratos_sort_fields[contratos_sort][1])}, "
+        f"{empresa_order_sql('e')}, c.id {contratos_direction}"
+        if contratos_sort else f"{empresa_order_sql('e')}, c.id DESC"
+    )
+    contratos_params = []
     contratos = [decorate_contract(row) for row in conn.execute(f"""
         SELECT c.*, e.apelido AS empresa_apelido,
                {contract_total_sql("c")} AS valor_moeda_consolidado,
@@ -2403,9 +2520,9 @@ def index():
         FROM contratos c
         LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
         LEFT JOIN empresas e ON e.cnpj=c.cnpj
-        GROUP BY c.id ORDER BY """ + empresa_order_sql("e") + """, c.id DESC
+        GROUP BY c.id ORDER BY {contratos_order}
         LIMIT ? OFFSET ?
-    """, (contratos_pagination["per_page"], contratos_pagination["offset"])).fetchall()]
+    """, contratos_params + [contratos_pagination["per_page"], contratos_pagination["offset"]]).fetchall()]
     resumo = {
         "invoices": conn.execute("SELECT COUNT(*) FROM invoices").fetchone()[0],
         "dues": dues_total,
@@ -2423,7 +2540,12 @@ def index():
     conn.close()
     return render_template("index.html", dues=dues, contratos=contratos, resumo=resumo,
                            dues_pagination=dues_pagination,
-                           contratos_pagination=contratos_pagination)
+                           contratos_pagination=contratos_pagination,
+                           dues_sort=dues_sort, dues_direction=dues_direction,
+                           dues_sort_links=dues_sort_links,
+                           contratos_sort=contratos_sort,
+                           contratos_direction=contratos_direction,
+                           contratos_sort_links=contratos_sort_links)
 
 def contratos_filtros_valores(args):
     """Retorna os valores brutos dos filtros exibidos na lista de contratos."""
@@ -2500,8 +2622,48 @@ def contratos_filtros(args):
     clause = " WHERE " + " AND ".join(where) if where else ""
     return filtros, clause, params
 
+
+def contratos_sorting(args):
+    sort_fields = {
+        "numero_contrato": ("c.numero_contrato", "text"),
+        "categoria_cambio": ("c.categoria_cambio", "text"),
+        "previsao_embarque": ("previsao_embarque_dias_exibicao", "number"),
+        "banco_credito": ("COALESCE(c.banco_credito, c.banco)", "text"),
+        "banco_liquidacao": (
+            "COALESCE(c.banco_liquidacao, c.banco_credito, c.banco)",
+            "text",
+        ),
+        "data_contrato": ("c.data_contrato", "date"),
+        "data_liquidacao": ("c.data_liquidacao", "date"),
+        "cliente": ("c.cliente", "text"),
+        "moeda": ("c.moeda", "text"),
+        "valor_moeda": ("valor_moeda_consolidado", "number"),
+        "taxa_cambio": ("c.taxa_cambio", "number"),
+        "vinculado": ("vinculado", "number"),
+        "saldo": (
+            f"CASE WHEN c.saldo_zerado_manual=1 OR c.categoria_cambio='{CATEGORIA_CAMBIO_FINANCEIRO}' "
+            f"THEN 0 ELSE {contract_total_sql('c')} "
+            "- COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0) END",
+            "number",
+        ),
+        "status": ("c.status", "text"),
+    }
+    sort, direction, sort_links = build_sorting(
+        args, sort_fields, default_sort=None, default_direction="DESC"
+    )
+    return sort_fields, sort, direction, sort_links
+
+
+def contratos_order_sql(sort_fields, sort, direction):
+    if not sort:
+        return f"{empresa_order_sql('e')}, c.id DESC"
+    expression, kind = sort_fields[sort]
+    term = sort_sql_term(expression, direction, kind)
+    return f"{term}, {empresa_order_sql('e')}, c.id {direction}"
+
 def consulta_contratos(conn, args, paginate=False):
     filtros, clause, params = contratos_filtros(args)
+    sort_fields, sort, direction, _ = contratos_sorting(args)
     pagination = None
     query_params = list(params)
     limit_clause = ""
@@ -2532,7 +2694,7 @@ def consulta_contratos(conn, args, paginate=False):
         LEFT JOIN competencias comp ON comp.id=c.competencia_id
         LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
         {clause}
-        GROUP BY c.id ORDER BY {empresa_order_sql("e")}, c.id DESC{limit_clause}
+        GROUP BY c.id ORDER BY {contratos_order_sql(sort_fields, sort, direction)}{limit_clause}
     """
     rows = conn.execute(query, query_params).fetchall()
     return (rows, filtros, pagination) if paginate else (rows, filtros)
@@ -2541,6 +2703,7 @@ def consulta_contratos(conn, args, paginate=False):
 def lista_contratos():
     conn = db()
     filtros = contratos_filtros_valores(request.args)
+    sort_fields, sort, direction, sort_links = contratos_sorting(request.args)
     try:
         rows, filtros, pagination = consulta_contratos(conn, request.args, paginate=True)
     except ValueError as exc:
@@ -2559,6 +2722,9 @@ def lista_contratos():
         categorias_cambio=CATEGORIAS_CAMBIO,
         status_options=(STATUS_PENDENTE, STATUS_PARCIAL, STATUS_CONCLUIDO),
         pagination=pagination,
+        sort=sort,
+        direction=direction,
+        sort_links=sort_links,
         **filtros,
     )
 
@@ -3161,6 +3327,24 @@ CONTRACT_LINK_REPORT_COLUMNS = (
 )
 
 
+def contrato_vinculo_sorting(args):
+    fields = {
+        "empresa": ("empresa", "text"),
+        "data_lancamento": ("data_lancamento", "date"),
+        "cnpj": ("cnpj", "text"),
+        "banco": ("banco", "text"),
+        "contrato": ("contrato", "text"),
+        "valor_usd": ("valor_usd", "number"),
+        "trading": ("trading", "text"),
+        "due": ("due", "text"),
+        "chave_acesso": ("chave_acesso", "text"),
+        "valor_utilizado": ("valor_utilizado", "number"),
+    }
+    return fields, *build_sorting(
+        args, fields, default_sort=None, default_direction="ASC"
+    )
+
+
 def consulta_vinculos_contratos(conn, args):
     """Consulta os vínculos contrato–DUE com os filtros dos relatórios."""
     filters = parse_report_filters(args)
@@ -3203,6 +3387,11 @@ def consulta_vinculos_contratos(conn, args):
     company_cnpj_normalized_sql = (
         "REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(e.cnpj,''),'.',''),'/',''),'-',''),' ','')"
     )
+    sort_fields, sort, direction, _ = contrato_vinculo_sorting(args)
+    order_sql = (
+        f"{sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, v.id {direction}"
+        if sort else f"{empresa_order_sql('e')}, c.numero_contrato, d.numero_due, v.id"
+    )
     rows = conn.execute(f"""
         SELECT
             COALESCE(NULLIF(TRIM(e.apelido), ''), NULLIF(TRIM(e.razao_social), ''),
@@ -3230,8 +3419,7 @@ def consulta_vinculos_contratos(conn, args):
           ON m.due_contrato_id=v.id AND m.tipo='VINCULACAO'
         WHERE {' AND '.join(where)}
         GROUP BY v.id
-        ORDER BY """ + empresa_order_sql("e") + """,
-                 c.numero_contrato, d.numero_due, v.id
+        ORDER BY {order_sql}
     """, params).fetchall()
     return rows, filters
 
@@ -3401,9 +3589,13 @@ def relatorio_vinculos_contratos():
     pagination = build_pagination(
         request.args, context["total_registros"], endpoint="relatorio_vinculos_contratos"
     )
+    _, sort, direction, sort_links = contrato_vinculo_sorting(request.args)
     start = pagination["offset"]
     context["vinculos"] = context["vinculos"][start:start + pagination["per_page"]]
     context["pagination"] = pagination
+    context["sort"] = sort
+    context["direction"] = direction
+    context["sort_links"] = sort_links
     return render_template("contratos_relatorio_vinculos.html", **context)
 
 
@@ -3738,6 +3930,26 @@ def relatorios_contratos_pdf():
     response.headers["Content-Disposition"] = f'inline; filename="{filename}"'
     return response
 
+def ndf_sorting(args, sort_param, direction_param, page_param, default_sort=None):
+    fields = {
+        "numero_operacao": ("numero_operacao", "text"),
+        "contraparte": ("contraparte", "text"),
+        "tipo": ("tipo", "text"),
+        "posicao": ("posicao", "text"),
+        "data_contratacao": ("data_contratacao", "date"),
+        "data_vencimento": ("data_vencimento", "date"),
+        "moeda": ("moeda", "text"),
+        "valor_contratado": ("valor_contratado", "number"),
+        "taxa_contratada": ("taxa_contratada", "number"),
+        "status": ("status", "text"),
+    }
+    return fields, *build_sorting(
+        args, fields, sort_param=sort_param,
+        direction_param=direction_param, page_param=page_param,
+        default_sort=default_sort, default_direction="DESC",
+    )
+
+
 @app.route("/derivativos")
 def dashboard_derivativos():
     hoje = date.today().isoformat()
@@ -3751,15 +3963,25 @@ def dashboard_derivativos():
         WHERE status=?
     """, (hoje, NDF_STATUS_ATIVA)).fetchone()
     proximos_total = resumo_row["ativas"]
+    sort_fields, sort, direction, sort_links = ndf_sorting(
+        request.args, "proximos_sort", "proximos_direction", "page", None
+    )
     proximos_pagination = build_pagination(request.args, proximos_total, endpoint="dashboard_derivativos")
+    if sort:
+        order_sql = f"{sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, id {direction}"
+    else:
+        order_sql = "CASE WHEN data_vencimento < ? THEN 0 ELSE 1 END, data_vencimento ASC, id DESC"
+    query_params = [NDF_STATUS_ATIVA]
+    if not sort:
+        query_params.append(hoje)
+    query_params.extend([proximos_pagination["per_page"], proximos_pagination["offset"]])
     proximos = [decorate_ndf(row) for row in conn.execute("""
         SELECT *
         FROM ndfs
         WHERE status=?
-        ORDER BY CASE WHEN data_vencimento < ? THEN 0 ELSE 1 END,
-                 data_vencimento ASC, id DESC
+        ORDER BY """ + order_sql + """
          LIMIT ? OFFSET ?
-    """, (NDF_STATUS_ATIVA, hoje, proximos_pagination["per_page"], proximos_pagination["offset"])).fetchall()]
+    """, query_params).fetchall()]
     conn.close()
     resumo = {
         "ativas": resumo_row["ativas"],
@@ -3767,20 +3989,30 @@ def dashboard_derivativos():
         "usd_a_vencer": decimal_value(resumo_row["usd_a_vencer"]),
     }
     return render_template("derivativos.html", resumo=resumo, proximos=proximos,
-                           proximos_pagination=proximos_pagination)
+                           proximos_pagination=proximos_pagination,
+                           proximos_sort=sort, proximos_direction=direction,
+                           proximos_sort_links=sort_links)
 
 @app.route("/derivativos/ndfs")
 def lista_ndfs():
     conn = db()
     ndfs_total = conn.execute("SELECT COUNT(*) FROM ndfs").fetchone()[0]
+    sort_fields, sort, direction, sort_links = ndf_sorting(
+        request.args, "sort", "direction", "page", None
+    )
     pagination = build_pagination(request.args, ndfs_total, endpoint="lista_ndfs")
+    order_sql = (
+        f"{sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, id {direction}"
+        if sort else "id DESC"
+    )
     ndfs = [decorate_ndf(row) for row in conn.execute(
-        "SELECT * FROM ndfs ORDER BY id DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM ndfs ORDER BY " + order_sql + " LIMIT ? OFFSET ?",
         (pagination["per_page"], pagination["offset"])
     ).fetchall()]
     conn.close()
     return render_template("ndfs.html", ndfs=ndfs, ndfs_total=ndfs_total,
-                           pagination=pagination)
+                           pagination=pagination, sort=sort,
+                           direction=direction, sort_links=sort_links)
 
 @app.route("/ndf/novo", methods=["GET", "POST"])
 def novo_ndf():
@@ -4306,12 +4538,42 @@ def cadastro_contrapartes():
     contrapartes = conn.execute("""
         SELECT id, nome
         FROM contrapartes
-        ORDER BY nome
+        ORDER BY nome, id
         LIMIT ? OFFSET ?
     """, (pagination["per_page"], pagination["offset"])).fetchall()
     conn.close()
     return render_template("contrapartes.html", contrapartes=contrapartes, nome=nome,
                            pagination=pagination)
+
+def competencias_sorting(args):
+    fields = {
+        "descricao": ("c.descricao", "text"),
+        "empresa": ("COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social)", "text"),
+        "data_inicial": ("c.data_inicial", "date"),
+        "data_final": ("c.data_final", "date"),
+        "status": ("c.status", "text"),
+    }
+    return fields, *build_sorting(
+        args, fields, default_sort=None, default_direction="DESC"
+    )
+
+
+def carregar_competencias_lista(conn, args):
+    sort_fields, sort, direction, sort_links = competencias_sorting(args)
+    total = conn.execute("SELECT COUNT(*) FROM competencias").fetchone()[0]
+    pagination = build_pagination(args, total, endpoint="cadastro_competencias")
+    order_sql = (
+        f"{sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, "
+        f"{empresa_order_sql('e')}, c.id {direction}"
+        if sort else f"{empresa_order_sql('e')}, c.data_inicial DESC, c.descricao, c.id"
+    )
+    competencias = conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
+        e.razao_social, e.apelido, e.prioridade AS empresa_prioridade
+        FROM competencias c JOIN empresas e ON e.id=c.empresa_id
+        ORDER BY """ + order_sql + " LIMIT ? OFFSET ?",
+        (pagination["per_page"], pagination["offset"])).fetchall()
+    return competencias, pagination, sort, direction, sort_links
+
 
 @app.route("/configuracoes/competencias", methods=["GET", "POST"])
 def cadastro_competencias():
@@ -4331,17 +4593,14 @@ def cadastro_competencias():
         except sqlite3.Error as exc:
             conn.rollback(); flash(f"Não foi possível salvar a competência: {exc}", "danger")
         competencia = dict(request.form)
-    competencias_total = conn.execute("SELECT COUNT(*) FROM competencias").fetchone()[0]
-    pagination = build_pagination(request.args, competencias_total, endpoint="cadastro_competencias")
-    competencias = conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
-        e.razao_social, e.apelido, e.prioridade AS empresa_prioridade
-        FROM competencias c JOIN empresas e ON e.id=c.empresa_id
-        ORDER BY """ + empresa_order_sql("e") + ", c.data_inicial DESC, c.descricao, c.id LIMIT ? OFFSET ?""",
-        (pagination["per_page"], pagination["offset"])).fetchall()
+    competencias, pagination, sort, direction, sort_links = carregar_competencias_lista(
+        conn, request.args
+    )
     empresas = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     conn.close()
     return render_template("competencias.html", competencia=competencia, competencias=competencias, empresas=empresas,
-                           statuses=COMPETENCIA_STATUSES, pagination=pagination)
+                           statuses=COMPETENCIA_STATUSES, pagination=pagination,
+                           sort=sort, direction=direction, sort_links=sort_links)
 
 @app.route("/configuracoes/competencias/<int:competencia_id>/editar", methods=["GET", "POST"])
 def editar_competencia(competencia_id):
@@ -4364,16 +4623,13 @@ def editar_competencia(competencia_id):
             conn.rollback(); flash(f"Não foi possível salvar a competência: {exc}", "danger")
         competencia = dict(request.form); competencia["id"] = competencia_id
     empresas = conn.execute("SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
-    competencias_total = conn.execute("SELECT COUNT(*) FROM competencias").fetchone()[0]
-    pagination = build_pagination(request.args, competencias_total, endpoint="cadastro_competencias")
-    competencias = conn.execute("""SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
-        e.razao_social, e.apelido, e.prioridade AS empresa_prioridade
-        FROM competencias c JOIN empresas e ON e.id=c.empresa_id
-        ORDER BY """ + empresa_order_sql("e") + ", c.data_inicial DESC, c.descricao, c.id LIMIT ? OFFSET ?""",
-        (pagination["per_page"], pagination["offset"])).fetchall()
+    competencias, pagination, sort, direction, sort_links = carregar_competencias_lista(
+        conn, request.args
+    )
     conn.close()
     return render_template("competencias.html", competencia=competencia, competencias=competencias, empresas=empresas,
-                           statuses=COMPETENCIA_STATUSES, pagination=pagination)
+                           statuses=COMPETENCIA_STATUSES, pagination=pagination,
+                           sort=sort, direction=direction, sort_links=sort_links)
 
 @app.route("/configuracoes/competencias/<int:competencia_id>/encerrar", methods=["POST"])
 def encerrar_competencia(competencia_id):
@@ -4780,12 +5036,18 @@ def consulta_dues():
             except ValueError as exc:
                 flash(str(exc), "danger")
 
-    sort_fields = {"chave_acesso": "d.chave_acesso", "numero_due": "d.numero_due", "data_due": "d.created_at",
-                   "cliente": "d.cliente", "moeda": "d.moeda",
-                   "valor_original": "d.valor_original", "status": "d.status"}
-    sort = request.args.get("sort", "data_due")
-    sort = sort if sort in sort_fields else "data_due"
-    direction = "ASC" if request.args.get("direction", "desc").lower() == "asc" else "DESC"
+    sort_fields = {
+        "chave_acesso": ("d.chave_acesso", "text"),
+        "numero_due": ("d.numero_due", "text"),
+        "data_due": ("d.created_at", "date"),
+        "cliente": ("d.cliente", "text"),
+        "moeda": ("d.moeda", "text"),
+        "valor_original": ("d.valor_original", "number"),
+        "status": ("d.status", "text"),
+    }
+    sort, direction, sort_links = build_sorting(
+        request.args, sort_fields, default_sort="data_due", default_direction="DESC"
+    )
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     conn = db()
     total = conn.execute(f"SELECT COUNT(*) FROM dues d{clause}", params).fetchone()[0]
@@ -4793,15 +5055,12 @@ def consulta_dues():
     dues = [decorate_due(row) for row in conn.execute(f"""
         SELECT d.*, COALESCE(SUM(CASE WHEN m.tipo IN ('UTILIZACAO','VINCULACAO') THEN m.valor ELSE -m.valor END),0) AS utilizado
         FROM dues d LEFT JOIN due_movimentacoes m ON m.due_id=d.id
-        {clause} GROUP BY d.id ORDER BY {sort_fields[sort]} {direction}, d.id DESC
+        {clause} GROUP BY d.id
+        ORDER BY {sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, d.id {direction}
         LIMIT ? OFFSET ?
     """, params + [pagination["per_page"], pagination["offset"]]).fetchall()]
     moedas = [row[0] for row in conn.execute("SELECT DISTINCT moeda FROM dues WHERE moeda IS NOT NULL ORDER BY moeda")]
     conn.close()
-    sort_links = {}
-    for key in sort_fields:
-        next_direction = "asc" if sort == key and direction == "DESC" else "desc"
-        sort_links[key] = {**filters, "sort": key, "direction": next_direction}
     return render_template("due_consulta.html", dues=dues, total=total,
                            filters=filters, moedas=moedas, sort=sort, direction=direction,
                            sort_links=sort_links, pagination=pagination,
@@ -4848,10 +5107,10 @@ def excluir_dues_lote():
 def write_excel_model_orientations(writer, conn, pandas):
     """Adiciona ao modelo uma lista de referência para preenchimento do Excel."""
     banks = [row["nome"] for row in conn.execute(
-        "SELECT nome FROM contrapartes ORDER BY nome"
+        "SELECT nome FROM contrapartes ORDER BY nome, id"
     ).fetchall()]
     clients = [row["nome"] for row in conn.execute(
-        "SELECT nome FROM clientes ORDER BY nome, pais"
+        "SELECT nome FROM clientes ORDER BY nome, pais, id"
     ).fetchall()]
     companies = conn.execute("SELECT cnpj FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     company_cnpjs = [format_cnpj(row["cnpj"]) for row in companies]
@@ -7136,6 +7395,8 @@ CENTRAL_CLOSING_CONTEXT_ARGUMENTS = frozenset({
     "liquidacao_data_ate",
     "fechamento_banco_liquidacao_id",
     "fechamentos_page",
+    "closing_sort",
+    "closing_direction",
 })
 
 
@@ -7179,15 +7440,51 @@ def central_closing_filter_sql(filters=None, alias="h"):
     return where, params
 
 
-CENTRAL_CLOSING_ORDER_SQL = """
-    CASE WHEN MIN(e.prioridade) IS NULL THEN 1 ELSE 0 END,
-    MIN(e.prioridade),
-    CASE WHEN h.valor_brl IS NULL THEN 1 ELSE 0 END,
-    h.valor_brl DESC, MIN(e.id), h.id DESC
-"""
+def central_closing_sorting(args):
+    sort_fields = {
+        "id": ("h.id", "number"),
+        "categoria_cambio": ("h.categoria_cambio", "text"),
+        "cliente": ("cl.nome", "text"),
+        "banco_credito": ("bc.nome", "text"),
+        "moeda": ("h.moeda", "text"),
+        "valor_moeda": ("COALESCE(SUM(f.valor_moeda), 0)", "number"),
+        "valor_brl": ("h.valor_brl", "number"),
+        "taxa_cambio": ("h.taxa_cambio", "number"),
+        "data_fechamento": ("h.data_fechamento", "date"),
+        "data_liquidacao": ("h.data_liquidacao", "date"),
+        "contrato": ("c.numero_contrato", "text"),
+    }
+    return (sort_fields, *build_sorting(
+        args,
+        sort_fields,
+        sort_param="closing_sort",
+        direction_param="closing_direction",
+        page_param="fechamentos_page",
+        default_sort=None,
+        default_direction="DESC",
+    ))
 
 
-def central_closing_headers(conn, filters=None, pagination=None):
+def central_closing_order_sql(sort=None, direction="DESC"):
+    sort_fields, normalized_sort, _, _ = central_closing_sorting(
+        {"closing_sort": sort, "closing_direction": direction}
+    )
+    if not normalized_sort:
+        return """
+            CASE WHEN MIN(e.prioridade) IS NULL THEN 1 ELSE 0 END,
+            MIN(e.prioridade),
+            CASE WHEN h.valor_brl IS NULL THEN 1 ELSE 0 END,
+            h.valor_brl DESC, MIN(e.id), h.id DESC
+        """
+    expression, kind = sort_fields[normalized_sort]
+    return f"""
+        {sort_sql_term(expression, direction, kind)},
+        CASE WHEN MIN(e.prioridade) IS NULL THEN 1 ELSE 0 END,
+        MIN(e.prioridade), MIN(e.id), h.id {direction}
+    """
+
+
+def central_closing_headers(conn, filters=None, pagination=None, sort=None, direction="DESC"):
     where, params = central_closing_filter_sql(filters)
     limit_clause = ""
     query_params = list(params)
@@ -7212,18 +7509,18 @@ def central_closing_headers(conn, filters=None, pagination=None):
         LEFT JOIN empresas e ON e.id=i.empresa_id
         {where}
         GROUP BY h.id
-        ORDER BY {CENTRAL_CLOSING_ORDER_SQL}{limit_clause}
+        ORDER BY {central_closing_order_sql(sort, direction)}{limit_clause}
     """, query_params).fetchall()
 
 
-def central_closing_navigation(conn, fechamento_id, filters=None):
+def central_closing_navigation(conn, fechamento_id, filters=None, sort=None, direction="DESC"):
     """Retorna somente os fechamentos vizinhos na ordem oficial da listagem."""
     where, params = central_closing_filter_sql(filters)
     row = conn.execute(f"""
         WITH ranked AS (
             SELECT h.id,
-                   LAG(h.id) OVER (ORDER BY {CENTRAL_CLOSING_ORDER_SQL}) AS previous_id,
-                   LEAD(h.id) OVER (ORDER BY {CENTRAL_CLOSING_ORDER_SQL}) AS next_id
+                   LAG(h.id) OVER (ORDER BY {central_closing_order_sql(sort, direction)}) AS previous_id,
+                   LEAD(h.id) OVER (ORDER BY {central_closing_order_sql(sort, direction)}) AS next_id
             FROM fechamentos h
             JOIN clientes cl ON cl.id=h.cliente_id
             JOIN contrapartes bc ON bc.id=h.banco_credito_id
@@ -7833,7 +8130,7 @@ def resolve_invoice_import_banks(conn, rows, bank_overrides=None):
     """Valida bancos na previa e aplica o vinculo escolhido pelo usuario."""
     preview = bank_overrides is None
     bank_overrides = bank_overrides or {}
-    counterparties = conn.execute("SELECT id, nome FROM contrapartes ORDER BY nome").fetchall()
+    counterparties = conn.execute("SELECT id, nome FROM contrapartes ORDER BY nome, id").fetchall()
     fields = (
         ("banco_credito", "Banco de Cr\u00e9dito"),
         ("banco_referenciado", "Banco Referenciado"),
@@ -8089,33 +8386,44 @@ def invoice_filter_query(args):
 
 def invoice_sorting(args):
     sort_fields = {
-        "numero_invoice": "i.numero_invoice", "contrato_comercial": "i.contrato_comercial",
-        "tipo_documento": "i.tipo_documento", "competencia_id": "i.competencia_id",
-        "data_emissao": "i.data_emissao", "moeda": "i.moeda", "valor_moeda": "i.valor_moeda",
-        "status": "i.status",
+        "numero_invoice": ("i.numero_invoice", "text"),
+        "contrato_comercial": ("i.contrato_comercial", "text"),
+        "tipo_documento": ("i.tipo_documento", "text"),
+        "competencia_id": ("i.competencia_id", "number"),
+        "data_emissao": ("i.data_emissao", "date"),
+        "moeda": ("i.moeda", "text"),
+        "valor_moeda": ("i.valor_moeda", "number"),
+        "status": ("i.status", "text"),
     }
-    sort = args.get("sort", "data_emissao")
-    sort = sort if sort in sort_fields else "data_emissao"
-    direction = "ASC" if args.get("direction", "desc").lower() == "asc" else "DESC"
-    return sort_fields, sort, direction
+    sort, direction, sort_links = build_sorting(
+        args, sort_fields, default_sort="data_emissao", default_direction="DESC"
+    )
+    return sort_fields, sort, direction, sort_links
 
 
 @app.route("/invoices")
 def lista_invoices():
     filters = {key: value for key, value in request.args.items() if key not in {"sort", "direction", "page"} and value}
     clause, params = invoice_filter_query(request.args)
-    sort_fields, sort, direction = invoice_sorting(request.args)
+    sort_fields, sort, direction, sort_links = invoice_sorting(request.args)
     conn = db()
     for row in conn.execute("SELECT id FROM invoices").fetchall():
         refresh_invoice_status(conn, row["id"])
     conn.commit()
     total = conn.execute(f"SELECT COUNT(*) FROM invoices i{clause}", params).fetchone()[0]
     pagination = build_pagination(request.args, total, endpoint="lista_invoices")
+    order_sql = (
+        f"{sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, "
+        f"{empresa_order_sql('e')}, i.id {direction}"
+        if request.args.get("sort") in sort_fields
+        else f"{empresa_order_sql('e')}, i.data_emissao {direction}, i.id DESC"
+    )
     rows = conn.execute(f"""
         SELECT i.id FROM invoices i
         LEFT JOIN empresas e ON e.id=i.empresa_id
         {clause}
-        ORDER BY {empresa_order_sql("e")}, {sort_fields[sort]} {direction}, i.id DESC LIMIT ? OFFSET ?
+        ORDER BY {order_sql}
+        LIMIT ? OFFSET ?
     """, params + [pagination["per_page"], pagination["offset"]]).fetchall()
     invoices = []
     for row in rows:
@@ -8127,9 +8435,6 @@ def lista_invoices():
     contrapartes = contrapartes_for_form(conn)
     moedas = [row[0] for row in conn.execute("SELECT DISTINCT moeda FROM invoices ORDER BY moeda").fetchall()]
     conn.commit(); conn.close()
-    sort_links = {}
-    for key in sort_fields:
-        sort_links[key] = {**filters, "sort": key, "direction": "asc" if sort == key and direction == "DESC" else "desc"}
     return render_template("invoices.html", invoices=invoices, total=total,
                            filters=filters, empresas=empresas, clientes=clientes, competencias=competencias,
                            contrapartes=contrapartes, moedas=moedas,
@@ -8137,7 +8442,50 @@ def lista_invoices():
                            sort_links=sort_links, pagination=pagination)
 
 
-def central_closing_page_data(conn, closing_filters=None, closing_pagination=None):
+def eligible_invoice_sorting(args):
+    sort_fields = {
+        "numero_invoice": "numero_invoice",
+        "empresa": "empresa_apelido",
+        "cliente": "cliente_nome",
+        "banco_credito": "banco_credito_nome",
+        "moeda": "moeda",
+        "total_recebido": "total_recebido",
+        "valor_fechamento": "valor_fechamento",
+    }
+    return (sort_fields, *build_sorting(
+        args,
+        sort_fields,
+        sort_param="eligible_sort",
+        direction_param="eligible_direction",
+        page_param="eligible_page",
+        default_sort="numero_invoice",
+        default_direction="ASC",
+    ))
+
+
+def sort_eligible_invoices(invoices, sort, direction):
+    if not sort:
+        return invoices
+    key = eligible_invoice_sorting({})[0][sort]
+
+    def value(item):
+        raw = item.get(key)
+        if sort == "empresa":
+            raw = raw or item.get("empresa_razao_social")
+        if isinstance(raw, str):
+            return raw.casefold()
+        return raw
+
+    populated = [item for item in invoices if value(item) not in (None, "")]
+    empty = [item for item in invoices if value(item) in (None, "")]
+    reverse = direction == "DESC"
+    populated.sort(key=lambda item: (value(item), item["id"]), reverse=reverse)
+    empty.sort(key=lambda item: item["id"], reverse=reverse)
+    return populated + empty
+
+
+def central_closing_page_data(conn, closing_filters=None, closing_pagination=None,
+                              closing_sort=None, closing_direction="DESC"):
     eligible = []
     for row in conn.execute("SELECT id FROM invoices ORDER BY numero_invoice, id").fetchall():
         try:
@@ -8148,7 +8496,10 @@ def central_closing_page_data(conn, closing_filters=None, closing_pagination=Non
         "eligible_invoices": eligible,
         "clientes": clientes_for_form(conn),
         "contrapartes": contrapartes_for_form(conn),
-        "fechamentos": central_closing_headers(conn, closing_filters, closing_pagination),
+        "fechamentos": central_closing_headers(
+            conn, closing_filters, closing_pagination,
+            closing_sort, closing_direction,
+        ),
         "moedas": [row[0] for row in conn.execute(
             "SELECT DISTINCT moeda FROM invoices ORDER BY moeda"
         ).fetchall()],
@@ -8177,13 +8528,18 @@ def gestao_fechamentos_invoices():
         }
         flash(closing_filter_error, "danger")
     conn = db()
+    _, closing_sort, closing_direction, closing_sort_links = central_closing_sorting(request.args)
+    _, eligible_sort, eligible_direction, eligible_sort_links = eligible_invoice_sorting(request.args)
     try:
         closing_total = central_closing_headers_count(conn, closing_query)
         closing_pagination = build_pagination(
             request.args, closing_total, page_param="fechamentos_page",
             endpoint="gestao_fechamentos_invoices",
         )
-        data = central_closing_page_data(conn, closing_query, closing_pagination)
+        data = central_closing_page_data(
+            conn, closing_query, closing_pagination,
+            closing_sort, closing_direction,
+        )
     finally:
         conn.close()
     filters = {
@@ -8199,6 +8555,9 @@ def gestao_fechamentos_invoices():
         and (not filters["moeda"] or invoice["moeda"] == filters["moeda"])
         and (not filters["numero_invoice"] or filters["numero_invoice"].casefold() in str(invoice["numero_invoice"]).casefold())
     ]
+    data["eligible_invoices"] = sort_eligible_invoices(
+        data["eligible_invoices"], eligible_sort, eligible_direction
+    )
     eligible_pagination = build_pagination(
         request.args, len(data["eligible_invoices"]), page_param="eligible_page",
         endpoint="gestao_fechamentos_invoices",
@@ -8213,7 +8572,13 @@ def gestao_fechamentos_invoices():
         closing_context_args=central_closing_context_args(request.args),
         closing_filter_error=closing_filter_error,
         eligible_pagination=eligible_pagination,
+        eligible_sort=eligible_sort,
+        eligible_direction=eligible_direction,
+        eligible_sort_links=eligible_sort_links,
         closing_pagination=closing_pagination,
+        closing_sort=closing_sort,
+        closing_direction=closing_direction,
+        closing_sort_links=closing_sort_links,
         **data,
     )
 
@@ -8349,13 +8714,15 @@ def detalhe_fechamento_invoice(fechamento_id):
         detail = central_closing_detail(conn, fechamento_id)
         if detail:
             contrapartes = contrapartes_for_form(conn)
+            _, closing_sort, closing_direction, _ = central_closing_sorting(request.args)
             try:
                 closing_filter_context = central_closing_filter_context(request.args)
                 closing_query = closing_filter_context["query"]
             except ValueError:
                 closing_query = {"_no_results": True}
             closing_navigation = central_closing_navigation(
-                conn, fechamento_id, closing_query
+                conn, fechamento_id, closing_query,
+                closing_sort, closing_direction,
             )
     finally:
         conn.close()
@@ -8577,13 +8944,19 @@ def exportar_invoices():
     conn.commit()
 
     clause, params = invoice_filter_query(request.args)
-    sort_fields, sort, direction = invoice_sorting(request.args)
+    sort_fields, sort, direction, _ = invoice_sorting(request.args)
+    order_sql = (
+        f"{sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, "
+        f"{empresa_order_sql('e')}, i.id {direction}"
+        if request.args.get("sort") in sort_fields
+        else f"{empresa_order_sql('e')}, i.data_emissao {direction}, i.id DESC"
+    )
     rows = conn.execute(f"""
         SELECT i.id
         FROM invoices i
         LEFT JOIN empresas e ON e.id=i.empresa_id
         {clause}
-        ORDER BY {empresa_order_sql("e")}, {sort_fields[sort]} {direction}, i.id DESC
+        ORDER BY {order_sql}
     """, params).fetchall()
     invoice_ids = [row["id"] for row in rows]
     invoices = [invoice_summary(conn, invoice_id) for invoice_id in invoice_ids]

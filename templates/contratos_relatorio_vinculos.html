@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_pagination.html" import render_pagination %}
+{% from "_sorting.html" import sortable_header %}
 {% block content %}
 <div class="print-report contract-link-report">
   <div class="report-actions">
@@ -34,8 +35,8 @@
 
   <section class="report-section">
     <div class="table-wrap">
-      <table class="compact-table contract-link-report-table" data-sortable>
-        <thead><tr><th>EMPRESA</th><th data-sort-type="date">DATA LANÇAMENTO</th><th>CNPJ</th><th>BANCO</th><th>CONTRATO</th><th data-sort-type="number">VALOR EM USD</th><th>TRADING</th><th>DUE</th><th>CHAVE DE ACESSO</th><th data-sort-type="number">VALOR UTILIZADO</th></tr></thead>
+      <table class="compact-table contract-link-report-table" data-sortable-server>
+        <thead><tr>{{ sortable_header('EMPRESA', 'empresa', sort, direction, sort_links) }}{{ sortable_header('DATA LANÇAMENTO', 'data_lancamento', sort, direction, sort_links, 'date') }}{{ sortable_header('CNPJ', 'cnpj', sort, direction, sort_links) }}{{ sortable_header('BANCO', 'banco', sort, direction, sort_links) }}{{ sortable_header('CONTRATO', 'contrato', sort, direction, sort_links) }}{{ sortable_header('VALOR EM USD', 'valor_usd', sort, direction, sort_links, 'number') }}{{ sortable_header('TRADING', 'trading', sort, direction, sort_links) }}{{ sortable_header('DUE', 'due', sort, direction, sort_links) }}{{ sortable_header('CHAVE DE ACESSO', 'chave_acesso', sort, direction, sort_links) }}{{ sortable_header('VALOR UTILIZADO', 'valor_utilizado', sort, direction, sort_links, 'number') }}</tr></thead>
         <tbody>
         {% for vinculo in vinculos %}
           <tr><td>{{ vinculo.empresa }}</td><td data-sort-value="{{ vinculo.data_lancamento or '' }}">{{ vinculo.data_lancamento|date_br or '-' }}</td><td>{{ vinculo.cnpj }}</td><td>{{ vinculo.banco }}</td><td>{{ vinculo.contrato }}</td><td data-sort-value="{{ vinculo.valor_usd }}">{{ vinculo.valor_usd|money }}</td><td>{{ vinculo.trading }}</td><td>{{ vinculo.due }}</td><td>{{ vinculo.chave_acesso }}</td><td data-sort-value="{{ vinculo.valor_utilizado }}">{{ vinculo.valor_utilizado|money }}</td></tr>
