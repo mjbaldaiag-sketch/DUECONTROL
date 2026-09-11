@@ -7446,6 +7446,7 @@ def central_closing_report_context(args):
         "total_brl": total_brl,
         "total_registros": len(fechamentos),
         "resumo_banco_empresa": closing_report_hierarchy(report_items),
+        "totais_empresa": closing_report_group_totals(report_items, "empresa_nome"),
         "totais_cliente": closing_report_group_totals(
             [
                 {

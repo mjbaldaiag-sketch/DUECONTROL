@@ -9,7 +9,7 @@
 <body>
 <main class="print-report closing-report">
   <div class="report-actions">
-    <button class="btn" type="button" onclick="window.print()">Imprimir / Salvar PDF</button>
+    <button class="btn" type="button" onclick="printClosingReport()">Imprimir / Salvar PDF</button>
     <a class="btn secondary" href="{{ url_for('gestao_fechamentos_invoices') }}">Voltar aos Fechamentos</a>
   </div>
 
@@ -18,7 +18,7 @@
     <p class="muted">{{ total_registros }} fechamento(s) filtrados.</p>
   </div>
 
-  <section class="report-section">
+  <section class="report-section closing-report-main-section">
     <table class="compact-table closing-report-table">
       <thead>
         <tr>
@@ -66,55 +66,126 @@
     </table>
   </section>
 
-  <section class="report-section closing-report-analytics">
-    <h2>RESUMO POR BANCO / EMPRESA</h2>
-    <table class="compact-table closing-report-summary-table">
-      <thead>
-        <tr><th>Banco / empresa / contrato</th><th>Total em BRL</th></tr>
-      </thead>
-      <tbody>
-      {% for banco in resumo_banco_empresa %}
-        <tr class="closing-report-bank-row">
-          <th>TOTAL {{ banco.nome }}</th>
-          <td class="report-number">{{ banco.total_brl|money }}</td>
-        </tr>
-        {% for empresa in banco.empresas %}
-        <tr class="closing-report-company-row">
-          <td class="closing-report-level-company">{{ empresa.nome }}</td>
-          <td class="report-number">{{ empresa.total_brl|money }}</td>
-        </tr>
-          {% for contrato in empresa.contratos %}
-        <tr class="closing-report-contract-row">
-          <td class="closing-report-level-contract">{{ contrato.nome }}</td>
-          <td class="report-number">{{ contrato.total_brl|money }}</td>
-        </tr>
+  <div class="closing-report-summary-page">
+    <div class="closing-report-summary-grid">
+    <section class="report-section closing-report-analytics">
+      <h2>TOTAL POR BANCO / EMPRESA</h2>
+      <table class="compact-table closing-report-summary-table">
+        <thead>
+          <tr><th>Banco / empresa / contrato</th><th>Total em BRL</th></tr>
+        </thead>
+        <tbody>
+        {% for banco in resumo_banco_empresa %}
+          <tr class="closing-report-bank-row">
+            <th>TOTAL {{ banco.nome }}</th>
+            <td class="report-number">{{ banco.total_brl|money }}</td>
+          </tr>
+          {% for empresa in banco.empresas %}
+          <tr class="closing-report-company-row">
+            <td class="closing-report-level-company">{{ empresa.nome }}</td>
+            <td class="report-number">{{ empresa.total_brl|money }}</td>
+          </tr>
+            {% for contrato in empresa.contratos %}
+          <tr class="closing-report-contract-row">
+            <td class="closing-report-level-contract">{{ contrato.nome }}</td>
+            <td class="report-number">{{ contrato.total_brl|money }}</td>
+          </tr>
+            {% endfor %}
           {% endfor %}
+        {% else %}
+          <tr><td class="empty" colspan="2">Nenhum Banco encontrado.</td></tr>
         {% endfor %}
-      {% else %}
-        <tr><td class="empty" colspan="2">Nenhum Banco encontrado.</td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </section>
+        </tbody>
+      </table>
+    </section>
 
-  <section class="report-section closing-report-analytics">
-    <h2>TOTAL POR CLIENTE</h2>
-    <table class="compact-table closing-report-summary-table closing-report-client-table">
-      <thead>
-        <tr><th>Cliente</th><th>Total em BRL</th></tr>
-      </thead>
-      <tbody>
-      {% for cliente in totais_cliente %}
-        <tr>
-          <td>{{ cliente.nome }}</td>
-          <td class="report-number">{{ cliente.total_brl|money }}</td>
-        </tr>
-      {% else %}
-        <tr><td class="empty" colspan="2">Nenhum Cliente encontrado.</td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </section>
+    <section class="report-section closing-report-analytics">
+      <h2>TOTAL POR EMPRESA</h2>
+      <table class="compact-table closing-report-summary-table closing-report-company-total-table">
+        <thead>
+          <tr><th>Empresa</th><th>Total em BRL</th></tr>
+        </thead>
+        <tbody>
+        {% for empresa in totais_empresa %}
+          <tr>
+            <td>{{ empresa.nome }}</td>
+            <td class="report-number">{{ empresa.total_brl|money }}</td>
+          </tr>
+        {% else %}
+          <tr><td class="empty" colspan="2">Nenhuma Empresa encontrada.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="report-section closing-report-analytics">
+      <h2>TOTAL POR CLIENTE</h2>
+      <table class="compact-table closing-report-summary-table closing-report-client-table">
+        <thead>
+          <tr><th>Cliente</th><th>Total em BRL</th></tr>
+        </thead>
+        <tbody>
+        {% for cliente in totais_cliente %}
+          <tr>
+            <td>{{ cliente.nome }}</td>
+            <td class="report-number">{{ cliente.total_brl|money }}</td>
+          </tr>
+        {% else %}
+          <tr><td class="empty" colspan="2">Nenhum Cliente encontrado.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    </div>
+</div>
 </main>
+<script>
+(() => {
+  const MEASURE_CLASS = 'closing-report-print-measure';
+  const COUNTERS_CLASS = 'closing-report-page-counters';
+  const PAGE_HEIGHT_PX = (210 / 25.4 * 96) - (16 / 25.4 * 96);
+
+  const clearPageCounters = () => {
+    document.querySelectorAll(`.${COUNTERS_CLASS}`).forEach((element) => element.remove());
+    document.body.classList.remove(MEASURE_CLASS);
+  };
+
+  const preparePageCounters = () => {
+    const report = document.querySelector('.closing-report');
+    const mainSection = document.querySelector('.closing-report-main-section');
+    const summaryPage = document.querySelector('.closing-report-summary-page');
+    if (!report || !mainSection || !summaryPage || document.body.classList.contains(MEASURE_CLASS)) return;
+
+    document.body.classList.add(MEASURE_CLASS);
+    const mainPages = Math.max(
+      1,
+      Math.ceil(mainSection.getBoundingClientRect().bottom / PAGE_HEIGHT_PX),
+    );
+    const summaryPages = Math.max(
+      1,
+      Math.ceil(summaryPage.getBoundingClientRect().height / PAGE_HEIGHT_PX),
+    );
+    const totalPages = mainPages + summaryPages;
+    const layer = document.createElement('div');
+    layer.className = COUNTERS_CLASS;
+    layer.setAttribute('aria-hidden', 'true');
+    for (let page = 1; page <= totalPages; page += 1) {
+      const counter = document.createElement('span');
+      counter.className = 'closing-report-page-counter';
+      counter.textContent = `${page}/${totalPages}`;
+      counter.style.top = `${(page - 1) * PAGE_HEIGHT_PX + 4}px`;
+      layer.appendChild(counter);
+    }
+    document.body.appendChild(layer);
+  };
+
+  window.printClosingReport = () => {
+    preparePageCounters();
+    window.print();
+  };
+  window.addEventListener('beforeprint', preparePageCounters);
+  window.addEventListener('afterprint', clearPageCounters);
+})();
+</script>
 </body>
 </html>
