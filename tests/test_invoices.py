@@ -3,11 +3,220 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 import sqlite3
-
 import app
 
 
-class InvoiceFlowTests(unittest.TestCase):
+class InvoiceRecompositionTestsMixin:
+    def _create_two_partial_parcels(self, number="INV-RECOMPOSE"):
+        invoice_id = self._create_invoice(number, "1000,00")
+        self.assertEqual(self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "1000,00",
+        }).status_code, 302)
+        self.assertEqual(self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "300,00", "data_fechamento": "11/08/2026",
+        }).status_code, 302)
+        conn = app.db()
+        first_child = conn.execute(
+            "SELECT invoice_id FROM invoice_desdobramentos WHERE invoice_anterior_id=?",
+            (invoice_id,),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(self.client.post(f"/invoice/{first_child}/fechamentos", data={
+            "valor_moeda": "200,00", "data_fechamento": "12/08/2026",
+        }).status_code, 302)
+        conn = app.db()
+        second_child = conn.execute(
+            "SELECT invoice_id FROM invoice_desdobramentos WHERE invoice_anterior_id=?",
+            (first_child,),
+        ).fetchone()[0]
+        conn.close()
+        return invoice_id, first_child, second_child
+
+    def test_deleting_partial_closing_then_leaf_recomposes_without_deleting_receipt(self):
+        invoice_id = self._create_invoice("INV-RECOMPOSE-INDIVIDUAL", "1000,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "1000,00",
+        })
+        self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "300,00", "data_fechamento": "11/08/2026",
+        })
+        conn = app.db()
+        child_id = conn.execute(
+            "SELECT invoice_id FROM invoice_desdobramentos WHERE invoice_anterior_id=?",
+            (invoice_id,),
+        ).fetchone()[0]
+        closing_id = conn.execute(
+            "SELECT id FROM fechamentos_cambio WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0]
+        receipt = conn.execute(
+            "SELECT id, valor_moeda, data_credito FROM recebimentos_invoice WHERE invoice_id=?",
+            (invoice_id,),
+        ).fetchone()
+        conn.close()
+
+        self.assertEqual(self.client.post(
+            f"/invoice/{invoice_id}/fechamentos/{closing_id}/excluir"
+        ).status_code, 302)
+        response = self.client.post(f"/invoice/{child_id}/excluir", follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("excluída", response.get_data(as_text=True))
+
+        conn = app.db()
+        root = conn.execute(
+            "SELECT numero_invoice, valor_moeda FROM invoices WHERE id=?", (invoice_id,)
+        ).fetchone()
+        restored_receipt = conn.execute(
+            "SELECT id, valor_moeda, data_credito FROM recebimentos_invoice WHERE id=?",
+            (receipt["id"],),
+        ).fetchone()
+        allocation = conn.execute(
+            "SELECT invoice_id, valor_moeda FROM invoice_recebimento_alocacoes WHERE recebimento_id=?",
+            (receipt["id"],),
+        ).fetchall()
+        self.assertEqual((root["numero_invoice"], app.Decimal(str(root["valor_moeda"]))),
+                         ("INV-RECOMPOSE-INDIVIDUAL", app.Decimal("1000")))
+        self.assertEqual(dict(restored_receipt), dict(receipt))
+        self.assertEqual(len(allocation), 0)
+        self.assertFalse(app.receipt_is_shared(conn, receipt["id"]))
+        conn.close()
+
+        blocked_root = self.client.post(f"/invoice/{invoice_id}/excluir", follow_redirects=True)
+        self.assertIn("recebimento(s) registrado(s)", blocked_root.get_data(as_text=True))
+        self.assertEqual(self.client.post(
+            f"/invoice/{invoice_id}/recebimentos/{receipt['id']}/excluir"
+        ).status_code, 302)
+        self.assertEqual(self.client.post(f"/invoice/{invoice_id}/excluir").status_code, 302)
+
+    def test_central_partial_closing_can_delete_leaf_after_group_deletion(self):
+        invoice_id = self._create_invoice("INV-RECOMPOSE-CENTRAL", "1000,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "1000,00",
+        })
+        response = self.client.post("/invoices/fechamentos", data={
+            "selected_ids": str(invoice_id),
+            f"valor_fechamento_{invoice_id}": "400,00",
+            "data_fechamento": "2026-08-11", "data_liquidacao": "2026-08-12",
+            "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        header_id = conn.execute("SELECT id FROM fechamentos ORDER BY id DESC LIMIT 1").fetchone()[0]
+        child_id = conn.execute(
+            "SELECT invoice_id FROM invoice_desdobramentos WHERE invoice_anterior_id=?",
+            (invoice_id,),
+        ).fetchone()[0]
+        conn.close()
+
+        self.assertEqual(self.client.post(
+            f"/invoices/fechamentos/{header_id}/excluir"
+        ).status_code, 302)
+        self.assertEqual(self.client.post(f"/invoice/{child_id}/excluir").status_code, 302)
+        conn = app.db()
+        self.assertIsNone(conn.execute("SELECT id FROM invoices WHERE id=?", (child_id,)).fetchone())
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos").fetchone()[0], 0)
+        self.assertEqual(app.Decimal(str(conn.execute(
+            "SELECT valor_moeda FROM invoices WHERE id=?", (invoice_id,)
+        ).fetchone()[0])), app.Decimal("1000"))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM recebimentos_invoice").fetchone()[0], 1)
+        conn.close()
+
+    def test_partial_parcel_batch_deletion_is_leaf_first_and_blocks_non_leaf(self):
+        invoice_id, first_child, second_child = self._create_two_partial_parcels()
+        conn = app.db()
+        closing_ids = [row[0] for row in conn.execute(
+            "SELECT id FROM fechamentos_cambio WHERE invoice_id IN (?,?)",
+            (invoice_id, first_child),
+        ).fetchall()]
+        conn.close()
+        for closing_id in closing_ids:
+            self.assertEqual(self.client.post(
+                f"/invoice/{invoice_id if closing_id == closing_ids[0] else first_child}/fechamentos/{closing_id}/excluir"
+            ).status_code, 302)
+
+        blocked = self.client.post(f"/invoice/{first_child}/excluir", follow_redirects=True)
+        self.assertIn("parcela(s) dependente(s)", blocked.get_data(as_text=True))
+
+        response = self.client.post("/invoices/excluir-lote", data={
+            "selected_ids": [str(first_child), str(second_child)],
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM invoices WHERE id IN (?,?)", (first_child, second_child)
+        ).fetchone()[0], 0)
+        root = conn.execute(
+            "SELECT numero_invoice, valor_moeda FROM invoices WHERE id=?", (invoice_id,)
+        ).fetchone()
+        self.assertEqual(root["numero_invoice"], "INV-RECOMPOSE")
+        self.assertEqual(app.Decimal(str(root["valor_moeda"])), app.Decimal("1000"))
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM invoice_recebimento_alocacoes WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], 0)
+        conn.close()
+
+    def test_partial_parcel_with_own_receipt_remains_blocked(self):
+        invoice_id = self._create_invoice("INV-RECOMPOSE-PROTECTED", "1000,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "1000,00",
+        })
+        self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "400,00", "data_fechamento": "11/08/2026",
+        })
+        conn = app.db()
+        child_id = conn.execute(
+            "SELECT invoice_id FROM invoice_desdobramentos WHERE invoice_anterior_id=?",
+            (invoice_id,),
+        ).fetchone()[0]
+        conn.execute("""
+            INSERT INTO recebimentos_invoice
+                (invoice_id,banco_credito_id,data_credito,moeda,valor_moeda)
+            VALUES (?,1,'2026-08-12','USD',10)
+        """, (child_id,))
+        closing_id = conn.execute(
+            "SELECT id FROM fechamentos_cambio WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+        self.client.post(f"/invoice/{invoice_id}/fechamentos/{closing_id}/excluir")
+
+        response = self.client.post(f"/invoice/{child_id}/excluir", follow_redirects=True)
+        self.assertIn("recebimento(s) registrado(s)", response.get_data(as_text=True))
+        conn = app.db()
+        self.assertIsNotNone(conn.execute("SELECT id FROM invoices WHERE id=?", (child_id,)).fetchone())
+        conn.close()
+
+    def test_unidentified_receipt_allocation_remains_blocked(self):
+        root_id = self._create_invoice("INV-UNIDENTIFIED-ROOT", "100,00")
+        allocation_id = self._create_invoice("INV-UNIDENTIFIED-ALLOCATION", "100,00")
+        self.client.post(f"/invoice/{root_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "100,00",
+        })
+        conn = app.db()
+        receipt_id = conn.execute(
+            "SELECT id FROM recebimentos_invoice WHERE invoice_id=?", (root_id,)
+        ).fetchone()[0]
+        conn.execute("""
+            INSERT INTO invoice_recebimento_alocacoes
+                (invoice_id,recebimento_id,valor_moeda)
+            VALUES (?,?,?)
+        """, (allocation_id, receipt_id, 100))
+        conn.commit()
+        conn.close()
+
+        response = self.client.post(f"/invoice/{allocation_id}/excluir", follow_redirects=True)
+        self.assertIn("aloca", response.get_data(as_text=True))
+        conn = app.db()
+        self.assertIsNotNone(conn.execute(
+            "SELECT id FROM invoice_recebimento_alocacoes WHERE invoice_id=?", (allocation_id,)
+        ).fetchone())
+        self.assertIsNotNone(conn.execute(
+            "SELECT id FROM invoices WHERE id=?", (allocation_id,)
+        ).fetchone())
+        conn.close()
+
+class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
     def setUp(self):
         self.previous_db = app.DB
         self.db_path = Path(tempfile.mktemp(prefix="duecontrol_invoice_test_", suffix=".db"))
@@ -2776,6 +2985,196 @@ class InvoiceFlowTests(unittest.TestCase):
             self.assertIn("valor", response.get_data(as_text=True))
         conn = app.db()
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos").fetchone()[0], 0)
+        conn.close()
+
+    def test_partial_receipt_without_manual_writeoff_remains_blocked_from_split(self):
+        invoice_id = self._create_invoice("INV-SPLIT-PENDING-RECEIPT", "10000,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "7000,00",
+        })
+
+        response = self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "4000,00", "data_fechamento": "12/08/2026",
+        }, follow_redirects=True)
+        self.assertIn("totalmente recebida", response.get_data(as_text=True))
+
+        conn = app.db()
+        summary = app.invoice_summary(conn, invoice_id)
+        self.assertEqual(summary["saldo_recebimento"], app.Decimal("3000"))
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM invoice_desdobramentos"
+        ).fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM fechamentos_cambio"
+        ).fetchone()[0], 0)
+        conn.close()
+
+    def test_partial_receipt_with_integral_manual_writeoff_can_split_without_reusing_writeoff(self):
+        invoice_id = self._create_invoice("INV-SPLIT-MANUAL-WRITEOFF", "10000,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "7000,00",
+        })
+        self.assertEqual(self.client.post(f"/invoice/{invoice_id}/baixa", data={
+            "justificativa_baixa": "SALDO RESIDUAL INCOBRAVEL",
+            "data_baixa": "11/08/2026",
+        }).status_code, 302)
+
+        conn = app.db()
+        before_split = app.invoice_summary(conn, invoice_id)
+        self.assertEqual(before_split["total_recebido"], app.Decimal("7000"))
+        self.assertEqual(before_split["total_baixado"], app.Decimal("3000"))
+        self.assertEqual(before_split["saldo_recebimento"], app.Decimal("0"))
+        self.assertEqual(before_split["saldo_fechamentos"], app.Decimal("7000"))
+        self.assertEqual(before_split["status"], app.INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO)
+        baixa = conn.execute(
+            "SELECT valor_moeda, justificativa_baixa FROM invoice_baixas WHERE invoice_id=?",
+            (invoice_id,),
+        ).fetchone()
+        self.assertEqual(app.Decimal(str(baixa["valor_moeda"])), app.Decimal("3000"))
+        self.assertEqual(baixa["justificativa_baixa"], "SALDO RESIDUAL INCobravel".upper())
+        conn.close()
+
+        # The manual amount cannot be reused as exchange/closing availability.
+        response = self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "8000,00", "data_fechamento": "12/08/2026",
+        }, follow_redirects=True)
+        self.assertIn("saldo disponível", response.get_data(as_text=True))
+
+        self.assertEqual(self.client.post(f"/invoice/{invoice_id}/fechamentos", data={
+            "valor_moeda": "4000,00", "data_fechamento": "12/08/2026",
+        }).status_code, 302)
+
+        conn = app.db()
+        child_id = conn.execute(
+            "SELECT invoice_id FROM invoice_desdobramentos WHERE invoice_anterior_id=?",
+            (invoice_id,),
+        ).fetchone()[0]
+        source = app.invoice_summary(conn, invoice_id)
+        child = app.invoice_summary(conn, child_id)
+        self.assertEqual(source["valor_moeda"], app.Decimal("7000"))
+        self.assertEqual(source["total_recebido"], app.Decimal("4000"))
+        self.assertEqual(source["total_baixado"], app.Decimal("3000"))
+        self.assertEqual(source["saldo_recebimento"], app.Decimal("0"))
+        self.assertEqual(child["valor_moeda"], app.Decimal("3000"))
+        self.assertEqual(child["total_recebido"], app.Decimal("3000"))
+        self.assertEqual(child["total_baixado"], app.Decimal("0"))
+        self.assertEqual(child["saldo_fechamentos"], app.Decimal("3000"))
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM invoice_baixas WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], 1)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM invoice_baixas WHERE invoice_id=?", (child_id,)
+        ).fetchone()[0], 0)
+        conn.close()
+
+    def test_manual_writeoff_requires_justification_and_excludes_only_receivable_balance(self):
+        invoice_id = self._create_invoice("INV-MANUAL-WRITEOFF", "1000,00")
+        self.assertEqual(self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "700,00",
+        }).status_code, 302)
+
+        conn = app.db()
+        receipt_before = dict(conn.execute(
+            "SELECT id, valor_moeda, data_credito FROM recebimentos_invoice WHERE invoice_id=?",
+            (invoice_id,),
+        ).fetchone())
+        conn.close()
+
+        detail_before = self.client.get(f"/invoice/{invoice_id}").get_data(as_text=True)
+        self.assertIn('name="justificativa_baixa" data-uppercase required', detail_before)
+
+        response = self.client.post(
+            f"/invoice/{invoice_id}/baixa",
+            data={"justificativa_baixa": "   "},
+            follow_redirects=True,
+        )
+        self.assertIn("justificativa", response.get_data(as_text=True).lower())
+
+        conn = app.db()
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM invoice_baixas WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0], 0)
+        conn.close()
+
+        response = self.client.post(
+            f"/invoice/{invoice_id}/baixa",
+            data={
+                "justificativa_baixa": "saldo residual incobravel",
+                "data_baixa": "11/08/2026",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+
+        conn = app.db()
+        baixa = conn.execute(
+            "SELECT id, moeda, valor_moeda, justificativa_baixa, data_baixa, created_at "
+            "FROM invoice_baixas WHERE invoice_id=?",
+            (invoice_id,),
+        ).fetchone()
+        receipt_after = dict(conn.execute(
+            "SELECT id, valor_moeda, data_credito FROM recebimentos_invoice WHERE invoice_id=?",
+            (invoice_id,),
+        ).fetchone())
+        summary = app.invoice_summary(conn, invoice_id)
+        self.assertEqual(baixa["moeda"], "USD")
+        self.assertEqual(app.Decimal(str(baixa["valor_moeda"])), app.Decimal("300"))
+        self.assertEqual(baixa["justificativa_baixa"], "SALDO RESIDUAL INCOBRAVEL")
+        self.assertEqual(baixa["data_baixa"], "2026-08-11")
+        self.assertTrue(baixa["created_at"])
+        self.assertEqual(receipt_after, receipt_before)
+        self.assertEqual(summary["total_recebido"], app.Decimal("700"))
+        self.assertEqual(summary["total_baixado"], app.Decimal("300"))
+        self.assertEqual(summary["saldo_recebimento"], app.Decimal("0"))
+        conn.close()
+
+        saldo = self.client.get(f"/invoices/{invoice_id}/saldo").get_json()
+        self.assertEqual(saldo["total_baixado"], 300.0)
+        self.assertEqual(saldo["saldo_recebimento"], 0.0)
+        report = app.build_invoice_report_context()
+        awaiting = next(table for table in report["tables"] if table["variant"] == "awaiting")
+        self.assertEqual(awaiting["total"], app.Decimal("0"))
+
+        detail = self.client.get(f"/invoice/{invoice_id}").get_data(as_text=True)
+        self.assertIn("SALDO RESIDUAL INCOBRAVEL", detail)
+        self.assertNotIn("Confirmar baixa", detail)
+
+    def test_manual_writeoff_must_be_removed_before_invoice_deletion(self):
+        invoice_id = self._create_invoice("INV-MANUAL-WRITEOFF-DELETE", "1000,00")
+        self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+            "banco_credito_id": "1", "data_credito": "10/08/2026", "valor_moeda": "700,00",
+        })
+        self.client.post(f"/invoice/{invoice_id}/baixa", data={
+            "justificativa_baixa": "AJUSTE MANUAL", "data_baixa": "11/08/2026",
+        })
+
+        blocked = self.client.post(f"/invoice/{invoice_id}/excluir", follow_redirects=True)
+        self.assertIn("baixa", blocked.get_data(as_text=True).lower())
+        conn = app.db()
+        receipt_id = conn.execute(
+            "SELECT id FROM recebimentos_invoice WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0]
+        baixa_id = conn.execute(
+            "SELECT id FROM invoice_baixas WHERE invoice_id=?", (invoice_id,)
+        ).fetchone()[0]
+        conn.close()
+
+        self.assertEqual(self.client.post(
+            f"/invoice/{invoice_id}/baixas/{baixa_id}/excluir"
+        ).status_code, 302)
+        conn = app.db()
+        self.assertEqual(app.invoice_summary(conn, invoice_id)["saldo_recebimento"], app.Decimal("300"))
+        conn.close()
+
+        blocked_by_receipt = self.client.post(f"/invoice/{invoice_id}/excluir", follow_redirects=True)
+        self.assertIn("recebimento", blocked_by_receipt.get_data(as_text=True).lower())
+        self.assertEqual(self.client.post(
+            f"/invoice/{invoice_id}/recebimentos/{receipt_id}/excluir"
+        ).status_code, 302)
+        self.assertEqual(self.client.post(f"/invoice/{invoice_id}/excluir").status_code, 302)
+        conn = app.db()
+        self.assertIsNone(conn.execute(
+            "SELECT id FROM invoices WHERE id=?", (invoice_id,)
+        ).fetchone())
         conn.close()
 
     def test_central_closing_rejects_different_clients_without_partial_write(self):

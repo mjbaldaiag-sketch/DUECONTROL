@@ -277,6 +277,9 @@
   document.querySelectorAll('form[action$="/cambio"]').forEach((form) => fillToday(form, 'data_fechamento'));
   document.querySelectorAll('form[action$="/contrato/novo"]').forEach((form) => fillToday(form, 'data_contrato'));
   document.querySelectorAll('[data-date-br]').forEach((input) => input.addEventListener('input', () => formatDate(input)));
+  document.querySelectorAll('[data-uppercase]').forEach((input) => input.addEventListener('input', () => {
+    input.value = input.value.toLocaleUpperCase('pt-BR');
+  }));
   document.querySelectorAll('[data-chave-acesso]').forEach((input) => input.addEventListener('input', () => {
     input.value = input.value.replace(/[^a-zA-Z0-9]/g, '').slice(0, 14).toUpperCase();
   }));
@@ -299,13 +302,46 @@
     const dialog = document.querySelector('[data-central-closing-dialog]');
     const dialogForm = dialog ? dialog.querySelector('[data-central-closing-dialog-form]') : null;
     const dialogItems = dialog ? dialog.querySelector('[data-central-closing-items]') : null;
+    const dialogSummary = dialog ? dialog.querySelector('[data-central-closing-summary]') : null;
+    const selectedTotal = dialog ? dialog.querySelector('[data-central-selected-total]') : null;
+    const brlTotal = dialog ? dialog.querySelector('[data-central-brl-total]') : null;
+    const brlTotalValue = dialog ? dialog.querySelector('[data-central-brl-total-value]') : null;
     const dialogContracts = dialog ? dialog.querySelector('[data-central-closing-contracts]') : null;
     const liquidationBank = dialogForm ? dialogForm.querySelector('[name="banco_liquidacao_id"]') : null;
     const categorySelect = dialogForm ? dialogForm.querySelector('[data-central-cambio-category]') : null;
+    const rateInput = dialogForm ? dialogForm.querySelector('[name="taxa_cambio"]') : null;
     const previsaoLabel = dialogForm ? dialogForm.querySelector('[data-previsao-embarque-label]') : null;
     const previsaoInput = dialogForm ? dialogForm.querySelector('[data-previsao-embarque]') : null;
     const cancel = dialog ? dialog.querySelector('[data-central-cancel]') : null;
     const selected = () => checkboxes.filter((checkbox) => checkbox.checked);
+    const parseDisplayedNumber = (value) => {
+      const text = String(value || '').trim().replace(/\s/g, '');
+      if (!text) return 0;
+      const normalized = text.includes(',')
+        ? text.replace(/\./g, '').replace(',', '.') : text;
+      const number = Number(normalized);
+      return Number.isFinite(number) ? number : 0;
+    };
+    const formatDisplayedMoney = (value) => new Intl.NumberFormat('pt-BR', {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    }).format(Number(value || 0));
+    const syncDialogTotals = () => {
+      if (!dialogSummary || !selectedTotal || !brlTotal || !brlTotalValue) return;
+      const selectedIds = new Set(selected().map((checkbox) => `valor_fechamento_${checkbox.value}`));
+      const amountInputs = dialogItems
+        ? [...dialogItems.querySelectorAll('input[name^="valor_fechamento_"]')]
+          .filter((input) => selectedIds.has(input.name)) : [];
+      const total = amountInputs.length
+        ? amountInputs.reduce((sum, input) => sum + parseDisplayedNumber(input.value), 0)
+        : selected().reduce(
+          (sum, checkbox) => sum + parseDisplayedNumber(checkbox.dataset.invoiceAvailable), 0
+        );
+      const rate = parseDisplayedNumber(rateInput ? rateInput.value : '');
+      selectedTotal.textContent = `USD ${formatDisplayedMoney(total)}`;
+      brlTotalValue.textContent = `R$ ${formatDisplayedMoney(total * rate)}`;
+      brlTotal.hidden = !rateInput || rate <= 0;
+      dialogSummary.hidden = selected().length === 0;
+    };
     const selectedPrevisaoDefault = () => {
       const defaults = selected().map((checkbox) => checkbox.dataset.invoiceEmbarqueDefault || '');
       return defaults.length > 0
@@ -390,8 +426,15 @@
           input.classList.toggle('input-invalid', invalid);
           input.setAttribute('aria-invalid', String(invalid));
         };
-        input.addEventListener('input', validateClosingInput);
-        input.addEventListener('blur', () => { formatMoney(input); validateClosingInput(); });
+        input.addEventListener('input', () => {
+          validateClosingInput();
+          syncDialogTotals();
+        });
+        input.addEventListener('blur', () => {
+          formatMoney(input);
+          validateClosingInput();
+          syncDialogTotals();
+        });
         validateClosingInput();
         label.append(title, limit, input);
         item.appendChild(label);
@@ -442,6 +485,7 @@
         previsaoInput.value = selectedPrevisaoDefault();
         syncPrevisao();
       }
+      syncDialogTotals();
     };
     const sync = () => {
       const checked = selected();
@@ -451,6 +495,7 @@
         selectAll.checked = checkboxes.length > 0 && checked.length === checkboxes.length;
         selectAll.indeterminate = checked.length > 0 && checked.length < checkboxes.length;
       }
+      syncDialogTotals();
     };
     const sameClient = (items) => new Set(
       items.map((checkbox) => checkbox.dataset.clientId)
@@ -478,6 +523,8 @@
       sync();
     });
     if (categorySelect) categorySelect.addEventListener('change', () => syncPrevisao(true));
+    if (rateInput) rateInput.addEventListener('input', syncDialogTotals);
+    if (previsaoInput) previsaoInput.addEventListener('input', validatePrevisao);
     if (submit && dialog) submit.addEventListener('click', () => {
       if (!selected().length || !sameClient(selected())) {
         window.alert('Selecione uma ou mais Invoices do mesmo Cliente.');

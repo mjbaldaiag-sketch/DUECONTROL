@@ -25,7 +25,7 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 13
+INVOICE_SCHEMA_VERSION = 14
 
 SALDO_TOLERANCE = Decimal("0.005")
 STATUS_PENDENTE = "PENDENTE"
@@ -624,6 +624,17 @@ def init_db():
                 FOREIGN KEY (banco_credito_id) REFERENCES contrapartes(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS invoice_baixas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id INTEGER NOT NULL,
+                moeda TEXT NOT NULL,
+                valor_moeda REAL NOT NULL CHECK(valor_moeda > 0),
+                justificativa_baixa TEXT NOT NULL CHECK(TRIM(justificativa_baixa) <> ''),
+                data_baixa TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE RESTRICT
+            );
+
             CREATE TABLE IF NOT EXISTS invoice_desdobramentos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 invoice_id INTEGER NOT NULL UNIQUE,
@@ -694,6 +705,7 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_invoices_emissao ON invoices(data_emissao);
             CREATE INDEX IF NOT EXISTS idx_recebimentos_invoice ON recebimentos_invoice(invoice_id);
             CREATE INDEX IF NOT EXISTS idx_recebimentos_banco ON recebimentos_invoice(banco_credito_id);
+            CREATE INDEX IF NOT EXISTS idx_invoice_baixas_invoice ON invoice_baixas(invoice_id);
             CREATE INDEX IF NOT EXISTS idx_invoice_desdobramentos_raiz ON invoice_desdobramentos(invoice_raiz_id);
             CREATE INDEX IF NOT EXISTS idx_invoice_desdobramentos_anterior ON invoice_desdobramentos(invoice_anterior_id);
             CREATE INDEX IF NOT EXISTS idx_invoice_recebimento_alocacoes_invoice ON invoice_recebimento_alocacoes(invoice_id);
@@ -2003,6 +2015,14 @@ def decimal_value(value):
 def normalize_balance(balance):
     balance = decimal_value(balance)
     return Decimal("0") if abs(balance) <= SALDO_TOLERANCE else balance
+
+def invoice_receipt_balance(valor_invoice, total_recebido, total_baixado=0):
+    """Retorna o saldo de recebimento, abatendo baixas manuais sem torná-las recebimento."""
+    return normalize_balance(
+        decimal_value(valor_invoice)
+        - decimal_value(total_recebido)
+        - decimal_value(total_baixado)
+    )
 
 def status_from_balance(balance, amortized=0):
     """Calcula o status pelo saldo restante e pelo valor já amortizado/vinculado."""
@@ -6000,7 +6020,12 @@ def invoice_receipt_rows(conn, invoice_id):
                COALESCE(a.valor_moeda, r.valor_moeda) AS valor_moeda,
                r.documento, r.observacao, r.created_at,
                cp.nome AS banco_credito_nome,
-               CASE WHEN a.id IS NULL THEN 0 ELSE 1 END AS recebimento_compartilhado
+               CASE WHEN a.id IS NOT NULL AND EXISTS (
+                   SELECT 1
+                   FROM invoice_recebimento_alocacoes a_shared
+                   WHERE a_shared.recebimento_id=a.recebimento_id
+                     AND a_shared.invoice_id<>a.invoice_id
+               ) THEN 1 ELSE 0 END AS recebimento_compartilhado
         FROM recebimentos_invoice r
         LEFT JOIN invoice_recebimento_alocacoes a
           ON a.recebimento_id=r.id AND a.invoice_id=?
@@ -6023,7 +6048,13 @@ def invoice_receipt_total(conn, invoice_id):
 
 def receipt_is_shared(conn, receipt_id):
     return bool(conn.execute(
-        "SELECT 1 FROM invoice_recebimento_alocacoes WHERE recebimento_id=? LIMIT 1",
+        """
+        SELECT 1
+        FROM invoice_recebimento_alocacoes
+        WHERE recebimento_id=?
+        GROUP BY recebimento_id
+        HAVING COUNT(DISTINCT invoice_id)>1
+        """,
         (receipt_id,),
     ).fetchone())
 
@@ -6065,12 +6096,15 @@ def invoice_lineage(conn, invoice_id):
     }
 
 def invoice_status_from_totals(valor_invoice, total_recebido, total_cambio,
-                               total_fechamentos_pendentes=0):
+                               total_fechamentos_pendentes=0, total_baixado=0):
     valor_invoice = decimal_value(valor_invoice)
     total_recebido = decimal_value(total_recebido)
     total_cambio = decimal_value(total_cambio)
     total_fechamentos_pendentes = decimal_value(total_fechamentos_pendentes)
-    saldo_recebimento = normalize_balance(valor_invoice - total_recebido)
+    total_baixado = decimal_value(total_baixado)
+    saldo_recebimento = invoice_receipt_balance(
+        valor_invoice, total_recebido, total_baixado
+    )
     saldo_cambio = normalize_balance(total_recebido - total_cambio)
     if saldo_recebimento > SALDO_TOLERANCE:
         return INVOICE_STATUS_AGUARDANDO_RECEBIMENTO
@@ -6134,7 +6168,15 @@ def invoice_summary(conn, invoice_id):
         FROM due_invoice di JOIN dues d ON d.id=di.due_id
         WHERE di.invoice_id=? ORDER BY di.id DESC
     """, (invoice_id,)).fetchall()
+    baixas = conn.execute("""
+        SELECT id, invoice_id, moeda, valor_moeda, justificativa_baixa,
+               data_baixa, created_at
+        FROM invoice_baixas
+        WHERE invoice_id=?
+        ORDER BY data_baixa DESC, id DESC
+    """, (invoice_id,)).fetchall()
     total_recebido = sum((decimal_value(row["valor_moeda"]) for row in recebimentos), Decimal("0"))
+    total_baixado = sum((decimal_value(row["valor_moeda"]) for row in baixas), Decimal("0"))
     total_cambio_legado = sum((decimal_value(row["valor_alocado"]) for row in cambios), Decimal("0"))
     total_fechamentos = sum((decimal_value(row["valor_moeda"]) for row in fechamentos), Decimal("0"))
     total_fechamentos_vinculados = sum(
@@ -6143,7 +6185,9 @@ def invoice_summary(conn, invoice_id):
     total_fechamentos_pendentes = total_fechamentos - total_fechamentos_vinculados
     total_cambio = total_cambio_legado + total_fechamentos_vinculados
     valor_invoice = decimal_value(invoice["valor_moeda"])
-    saldo_recebimento = normalize_balance(valor_invoice - total_recebido)
+    saldo_recebimento = invoice_receipt_balance(
+        valor_invoice, total_recebido, total_baixado
+    )
     saldo_cambio = normalize_balance(total_recebido - total_cambio)
     saldo_fechamentos = normalize_balance(
         total_recebido - total_cambio_legado - total_fechamentos
@@ -6164,7 +6208,8 @@ def invoice_summary(conn, invoice_id):
         status = INVOICE_STATUS_AGUARDANDO_RECEBIMENTO
     if not invoice["status_manual"]:
         status = invoice_status_from_totals(
-            valor_invoice, total_recebido, total_cambio, total_fechamentos_pendentes
+            valor_invoice, total_recebido, total_cambio, total_fechamentos_pendentes,
+            total_baixado,
         )
     elif (
         status in INVOICE_STATUS_RECEBIDOS
@@ -6179,6 +6224,7 @@ def invoice_summary(conn, invoice_id):
     data.update({
         "valor_moeda": valor_invoice,
         "total_recebido": total_recebido,
+        "total_baixado": total_baixado,
         "total_cambio_legado": total_cambio_legado,
         "total_cambio": total_cambio,
         "total_fechamentos": total_fechamentos,
@@ -6193,6 +6239,7 @@ def invoice_summary(conn, invoice_id):
         ) else None,
         "status": status,
         "recebimentos": recebimentos,
+        "baixas": baixas,
         "cambios": cambios,
         "fechamentos": fechamentos,
         "due_links": due_links,
@@ -6241,6 +6288,7 @@ def refresh_invoice_status(conn, invoice_id, force=False):
             status = invoice_status_from_totals(
                 summary["valor_moeda"], summary["total_recebido"],
                 summary["total_cambio"], summary["total_fechamentos_pendentes"],
+                summary["total_baixado"],
             )
         data_credito = None
         if status in INVOICE_STATUS_RECEBIDOS | {INVOICE_STATUS_LIQUIDADA}:
@@ -6379,13 +6427,16 @@ def build_invoice_report_context():
         for summary in summaries:
             if summary["status"] != status:
                 continue
+            amount = decimal_value(summary[value_key])
+            if amount <= SALDO_TOLERANCE:
+                continue
             cliente = summary.get("cliente_nome") or "Não informado"
             if include_bank:
                 entry = grouped.setdefault(cliente, {"valor": Decimal("0"), "bancos": set()})
-                entry["valor"] += decimal_value(summary[value_key])
+                entry["valor"] += amount
                 entry["bancos"].update(summary.get("bancos_credito") or [])
             else:
-                grouped[cliente] = grouped.get(cliente, Decimal("0")) + decimal_value(summary[value_key])
+                grouped[cliente] = grouped.get(cliente, Decimal("0")) + amount
         if include_bank:
             rows = [
                 {"cliente": cliente, "banco": ", ".join(sorted(entry["bancos"])) or "-", "valor": entry["valor"]}
@@ -6406,6 +6457,8 @@ def build_invoice_report_context():
             empresa = summary.get("empresa_apelido") or summary.get("empresa_razao_social") or "Não informado"
             cliente = summary.get("cliente_nome") or "Não informado"
             amount = decimal_value(summary[value_key])
+            if amount <= SALDO_TOLERANCE:
+                continue
 
             banco_group = grouped.setdefault(banco, {"banco": banco, "subtotal": Decimal("0"), "empresas": {}})
             empresa_id = summary.get("empresa_id")
@@ -6503,6 +6556,7 @@ def build_invoice_report_context():
 def validate_invoice_balances(summary, extra_recebido=0, extra_cambio=0,
                               replacement_recebido=None, replacement_cambio=None):
     valor = decimal_value(summary["valor_moeda"])
+    baixado = decimal_value(summary.get("total_baixado", 0))
     recebido = decimal_value(summary["total_recebido"]) + decimal_value(extra_recebido)
     cambio = decimal_value(summary["total_cambio"]) + decimal_value(extra_cambio)
     if replacement_recebido is not None:
@@ -6510,7 +6564,7 @@ def validate_invoice_balances(summary, extra_recebido=0, extra_cambio=0,
     if replacement_cambio is not None:
         cambio = decimal_value(replacement_cambio)
     cambio += decimal_value(summary.get("total_fechamentos_pendentes", 0))
-    ensure_non_negative_balance(valor - recebido,
+    ensure_non_negative_balance(invoice_receipt_balance(valor, recebido, baixado),
                                 "O recebimento não pode ultrapassar o valor da Invoice.")
     ensure_non_negative_balance(recebido - cambio,
                                 "O câmbio não pode ultrapassar o total recebido da Invoice.")
@@ -6642,10 +6696,14 @@ def split_invoice_for_closing(conn, summary, closing_amount):
             (current_number, summary["id"]),
         )
 
+    # A baixa manual remains attached to the source parcel. Keep its value in
+    # that parcel so the split preserves the invoice total, while the child
+    # continues to represent only the physically received amount left over.
     remaining = normalize_balance(available - closing_amount)
+    source_value = normalize_balance(decimal_value(summary["valor_moeda"]) - remaining)
     conn.execute(
         "UPDATE invoices SET valor_moeda=? WHERE id=?",
-        (float(closing_amount), summary["id"]),
+        (float(source_value), summary["id"]),
     )
     cursor = conn.execute("""
         INSERT INTO invoices
@@ -7012,7 +7070,245 @@ def invoice_detail_data(conn, invoice_id):
     contratos = invoice_contracts_for_currency(conn, summary)
     return summary, empresas, clientes, contrapartes, dues, contratos
 
-def invoice_deletion_blockers(conn, invoice_id):
+def automatic_invoice_split_plan(conn, invoice_id):
+    """Descreve se uma parcela pode ser recomposta e excluída com segurança.
+
+    As alocações de recebimentos só são consideradas automáticas quando a
+    parcela pertence a uma linhagem válida e cada recebimento alocado foi
+    registrado fisicamente na Invoice raiz. Nenhum recebimento físico é
+    alterado nesta etapa.
+    """
+    split = conn.execute("""
+        SELECT d.*, i.valor_moeda, i.empresa_id, i.tipo_documento
+        FROM invoice_desdobramentos d
+        JOIN invoices i ON i.id=d.invoice_id
+        WHERE d.invoice_id=?
+    """, (invoice_id,)).fetchone()
+    if not split or not split["invoice_anterior_id"]:
+        return None
+
+    parent = conn.execute("""
+        SELECT i.id, i.valor_moeda, i.empresa_id, i.tipo_documento
+        FROM invoices i
+        JOIN invoice_desdobramentos d ON d.invoice_id=i.id
+        WHERE i.id=? AND d.invoice_raiz_id=?
+    """, (split["invoice_anterior_id"], split["invoice_raiz_id"])).fetchone()
+
+    blockers = []
+    if not parent:
+        blockers.append("desdobramento sem parcela anterior identificável")
+
+    descendants = conn.execute(
+        "SELECT 1 FROM invoice_desdobramentos WHERE invoice_anterior_id=? LIMIT 1",
+        (invoice_id,),
+    ).fetchone()
+    if descendants:
+        blockers.append("possui parcela(s) dependente(s); exclua a última parcela primeiro")
+
+    lineage_rows = conn.execute("""
+        SELECT invoice_id
+        FROM invoice_desdobramentos
+        WHERE invoice_raiz_id=?
+        ORDER BY numero_parcela
+    """, (split["invoice_raiz_id"],)).fetchall()
+    lineage_ids = [row["invoice_id"] for row in lineage_rows]
+    if split["invoice_raiz_id"] not in lineage_ids:
+        blockers.append("linhagem de desdobramento incompleta")
+
+    other_lineage_ids = [item for item in lineage_ids if item != invoice_id]
+    if other_lineage_ids:
+        placeholders = ",".join("?" for _ in other_lineage_ids)
+        params = tuple(other_lineage_ids)
+        if conn.execute(
+            f"SELECT 1 FROM fechamentos_cambio WHERE invoice_id IN ({placeholders}) LIMIT 1",
+            params,
+        ).fetchone():
+            blockers.append("a cadeia do desdobramento possui fechamento(s) vinculado(s)")
+        if conn.execute(
+            f"SELECT 1 FROM invoice_contrato_cambio WHERE invoice_id IN ({placeholders}) LIMIT 1",
+            params,
+        ).fetchone():
+            blockers.append("a cadeia do desdobramento possui contrato(s) de câmbio vinculado(s)")
+        if conn.execute(
+            f"SELECT 1 FROM due_invoice WHERE invoice_id IN ({placeholders}) LIMIT 1",
+            params,
+        ).fetchone():
+            blockers.append("a cadeia do desdobramento possui DU-E(s) vinculada(s)")
+
+        non_root_ids = [
+            item for item in other_lineage_ids if item != split["invoice_raiz_id"]
+        ]
+        if non_root_ids:
+            child_placeholders = ",".join("?" for _ in non_root_ids)
+            if conn.execute(
+                f"SELECT 1 FROM recebimentos_invoice WHERE invoice_id IN ({child_placeholders}) LIMIT 1",
+                tuple(non_root_ids),
+            ).fetchone():
+                blockers.append("a cadeia do desdobramento possui recebimento físico em outra parcela")
+
+    allocations = conn.execute("""
+        SELECT a.id, a.recebimento_id, a.valor_moeda,
+               r.invoice_id AS recebimento_invoice_id,
+               r.valor_moeda AS valor_recebimento
+        FROM invoice_recebimento_alocacoes a
+        LEFT JOIN recebimentos_invoice r ON r.id=a.recebimento_id
+        WHERE a.invoice_id=?
+        ORDER BY a.id
+    """, (invoice_id,)).fetchall()
+    invalid_allocation = any(
+        row["recebimento_invoice_id"] != split["invoice_raiz_id"]
+        for row in allocations
+    )
+    if invalid_allocation:
+        blockers.append("possui vínculo de recebimento que não pode ser identificado como automático")
+
+    root_receipt_totals = conn.execute("""
+        SELECT r.id, r.valor_moeda AS valor_recebimento,
+               COALESCE(SUM(a.valor_moeda), 0) AS valor_alocado
+        FROM recebimentos_invoice r
+        LEFT JOIN invoice_recebimento_alocacoes a ON a.recebimento_id=r.id
+        WHERE r.invoice_id=?
+        GROUP BY r.id, r.valor_moeda
+    """, (split["invoice_raiz_id"],)).fetchall()
+    if any(
+        abs(decimal_value(row["valor_alocado"]) - decimal_value(row["valor_recebimento"]))
+        > SALDO_TOLERANCE
+        for row in root_receipt_totals
+    ):
+        blockers.append("os recebimentos da raiz não estão integralmente alocados na cadeia")
+    if conn.execute("""
+        SELECT 1
+        FROM invoice_recebimento_alocacoes a
+        JOIN recebimentos_invoice r ON r.id=a.recebimento_id
+        WHERE r.invoice_id=?
+          AND NOT EXISTS (
+              SELECT 1
+              FROM invoice_desdobramentos d
+              WHERE d.invoice_raiz_id=? AND d.invoice_id=a.invoice_id
+          )
+        LIMIT 1
+    """, (split["invoice_raiz_id"], split["invoice_raiz_id"])).fetchone():
+        blockers.append("há alocação da raiz vinculada a uma Invoice fora da cadeia")
+
+    if allocations:
+        allocation_receipt_ids = [row["recebimento_id"] for row in allocations]
+        placeholders = ",".join("?" for _ in allocation_receipt_ids)
+        totals = conn.execute(
+            f"""
+            SELECT r.id, r.valor_moeda AS valor_recebimento,
+                   COALESCE(SUM(a.valor_moeda), 0) AS valor_alocado
+            FROM recebimentos_invoice r
+            LEFT JOIN invoice_recebimento_alocacoes a ON a.recebimento_id=r.id
+            WHERE r.id IN ({placeholders})
+            GROUP BY r.id, r.valor_moeda
+            """,
+            tuple(allocation_receipt_ids),
+        ).fetchall()
+        if any(
+            decimal_value(row["valor_alocado"])
+            > decimal_value(row["valor_recebimento"]) + SALDO_TOLERANCE
+            for row in totals
+        ):
+            blockers.append("possui alocação de recebimento acima do valor físico registrado")
+
+    return {
+        "eligible": not blockers,
+        "blockers": blockers,
+        "split": split,
+        "parent": parent,
+        "root_id": split["invoice_raiz_id"],
+        "lineage_ids": lineage_ids,
+        "allocations": allocations,
+    }
+
+
+def recombine_invoice_split(conn, plan):
+    """Recompõe uma parcela-folha na parcela anterior e exclui a parcela."""
+    if not plan or not plan["eligible"]:
+        raise ValueError("A parcela não pode ter seu desdobramento recomposto.")
+
+    split = plan["split"]
+    parent = plan["parent"]
+    child_id = split["invoice_id"]
+    parent_id = parent["id"]
+
+    for allocation in plan["allocations"]:
+        existing = conn.execute("""
+            SELECT id, valor_moeda
+            FROM invoice_recebimento_alocacoes
+            WHERE invoice_id=? AND recebimento_id=?
+        """, (parent_id, allocation["recebimento_id"])).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE invoice_recebimento_alocacoes SET valor_moeda=? WHERE id=?",
+                (
+                    float(decimal_value(existing["valor_moeda"]) + decimal_value(allocation["valor_moeda"])),
+                    existing["id"],
+                ),
+            )
+        else:
+            conn.execute("""
+                INSERT INTO invoice_recebimento_alocacoes
+                    (invoice_id,recebimento_id,valor_moeda)
+                VALUES (?,?,?)
+            """, (parent_id, allocation["recebimento_id"], allocation["valor_moeda"]))
+
+    parent_value = decimal_value(parent["valor_moeda"]) + decimal_value(split["valor_moeda"])
+    conn.execute(
+        "UPDATE invoices SET valor_moeda=? WHERE id=?",
+        (float(parent_value), parent_id),
+    )
+    cursor = conn.execute("DELETE FROM invoices WHERE id=?", (child_id,))
+    if cursor.rowcount != 1:
+        raise sqlite3.DatabaseError("A parcela não foi excluída.")
+
+    remaining_children = conn.execute("""
+        SELECT 1
+        FROM invoice_desdobramentos
+        WHERE invoice_raiz_id=? AND invoice_id<>?
+        LIMIT 1
+    """, (plan["root_id"], plan["root_id"])).fetchone()
+    if not remaining_children:
+        root = conn.execute("""
+            SELECT d.numero_base, i.empresa_id, i.tipo_documento, i.numero_invoice
+            FROM invoice_desdobramentos d
+            JOIN invoices i ON i.id=d.invoice_id
+            WHERE d.invoice_id=? AND d.invoice_raiz_id=?
+        """, (plan["root_id"], plan["root_id"])).fetchone()
+        if root:
+            duplicate = conn.execute("""
+                SELECT 1 FROM invoices
+                WHERE empresa_id=? AND numero_invoice=? AND tipo_documento=? AND id<>?
+                LIMIT 1
+            """, (
+                root["empresa_id"], root["numero_base"], root["tipo_documento"],
+                plan["root_id"],
+            )).fetchone()
+            if duplicate:
+                raise ValueError(
+                    f"Já existe a Invoice {root['numero_base']}; não foi possível restaurar o número original."
+                )
+            # A cadeia voltou a ser uma única Invoice. O recebimento físico
+            # passa a ser lido pela FK original, sem manter uma alocação
+            # artificial na raiz.
+            conn.execute(
+                "DELETE FROM invoice_recebimento_alocacoes WHERE invoice_id=?",
+                (plan["root_id"],),
+            )
+            conn.execute(
+                "DELETE FROM invoice_desdobramentos WHERE invoice_id=?",
+                (plan["root_id"],),
+            )
+            conn.execute(
+                "UPDATE invoices SET numero_invoice=? WHERE id=?",
+                (root["numero_base"], plan["root_id"]),
+            )
+
+    refresh_invoice_status(conn, parent_id)
+    return parent_id
+
+
+def invoice_deletion_blockers(conn, invoice_id, ignore_reversible_allocations=False):
     """Retorna os vínculos que impedem a exclusão segura de uma Invoice."""
     blockers = []
 
@@ -7023,13 +7319,55 @@ def invoice_deletion_blockers(conn, invoice_id):
     if receipt_count:
         blockers.append(f"{receipt_count} recebimento(s) registrado(s)")
 
-    shared_receipt_count = conn.execute(
-        "SELECT COUNT(*) FROM invoice_recebimento_alocacoes WHERE invoice_id=?",
+    writeoff_count = conn.execute(
+        "SELECT COUNT(*) FROM invoice_baixas WHERE invoice_id=?",
         (invoice_id,),
     ).fetchone()[0]
-    if shared_receipt_count:
+    if writeoff_count:
+        blockers.append(f"{writeoff_count} baixa(s) manual(is) de saldo residual registrada(s)")
+
+    if not ignore_reversible_allocations:
+        receipt_allocation_count = conn.execute(
+            "SELECT COUNT(*) FROM invoice_recebimento_alocacoes WHERE invoice_id=?",
+            (invoice_id,),
+        ).fetchone()[0]
+        shared_receipt_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM invoice_recebimento_alocacoes a
+            WHERE a.invoice_id=?
+              AND EXISTS (
+                  SELECT 1
+                  FROM invoice_recebimento_alocacoes ax
+                  WHERE ax.recebimento_id=a.recebimento_id
+                    AND ax.invoice_id<>a.invoice_id
+              )
+            """,
+            (invoice_id,),
+        ).fetchone()[0]
+        if shared_receipt_count:
+            blockers.append(
+                f"{shared_receipt_count} recebimento(s) compartilhado(s) entre parcelas"
+            )
+        elif receipt_allocation_count and not conn.execute(
+            "SELECT 1 FROM invoice_desdobramentos WHERE invoice_id=? LIMIT 1",
+            (invoice_id,),
+        ).fetchone():
+            blockers.append(
+                f"{receipt_allocation_count} alocação(ões) de recebimento não reconhecida(s)"
+            )
+
+    split_children = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM invoice_desdobramentos
+        WHERE invoice_anterior_id=?
+        """,
+        (invoice_id,),
+    ).fetchone()[0]
+    if split_children:
         blockers.append(
-            f"{shared_receipt_count} recebimento(s) compartilhado(s) entre parcelas"
+            f"{split_children} parcela(s) automática(s) ainda vinculada(s)"
         )
 
     allocation = conn.execute(
@@ -7106,20 +7444,62 @@ def delete_invoice_if_unlinked(conn, invoice_id):
         raise ValueError("Invoice não encontrada.")
 
     invoice = dict(invoice)
-    blockers = invoice_deletion_blockers(conn, invoice_id)
+    split_plan = automatic_invoice_split_plan(conn, invoice_id)
+    if split_plan and split_plan["eligible"]:
+        blockers = invoice_deletion_blockers(
+            conn, invoice_id, ignore_reversible_allocations=True
+        )
+    else:
+        blockers = invoice_deletion_blockers(conn, invoice_id)
+        if split_plan:
+            for blocker in split_plan["blockers"]:
+                if blocker not in blockers:
+                    blockers.append(blocker)
     if blockers:
         return {"deleted": False, "invoice": invoice, "blockers": blockers}
+
+    if split_plan:
+        recomposed_parent_id = recombine_invoice_split(conn, split_plan)
+        return {
+            "deleted": True,
+            "invoice": invoice,
+            "blockers": [],
+            "recomposed_parent_id": recomposed_parent_id,
+        }
 
     cursor = conn.execute("DELETE FROM invoices WHERE id=?", (invoice_id,))
     if cursor.rowcount != 1:
         raise sqlite3.DatabaseError("A Invoice não foi excluída.")
-    return {"deleted": True, "invoice": invoice, "blockers": []}
+    return {
+        "deleted": True,
+        "invoice": invoice,
+        "blockers": [],
+        "recomposed_parent_id": None,
+    }
 
 def invoice_deletion_blocked_message(result):
     return (
         f"{invoice_deletion_label(result['invoice'])}: "
         f"{'; '.join(result['blockers'])}. Remova os vínculos antes de tentar excluir."
     )
+
+def invoice_deletion_order(conn, invoice_ids):
+    """Processa parcelas automáticas da última para a primeira."""
+    positions = {invoice_id: index for index, invoice_id in enumerate(invoice_ids)}
+    ordered = []
+    for invoice_id in invoice_ids:
+        row = conn.execute(
+            "SELECT numero_parcela FROM invoice_desdobramentos WHERE invoice_id=?",
+            (invoice_id,),
+        ).fetchone()
+        ordered.append((
+            0 if row else 1,
+            -int(row["numero_parcela"]) if row else 0,
+            positions[invoice_id],
+            invoice_id,
+        ))
+    return [item[3] for item in sorted(ordered)]
+
 
 def contract_has_exchange_links(conn, contrato_id):
     return bool(conn.execute("""
@@ -8091,8 +8471,10 @@ def invoice_identity_rows(conn, rows):
                            SELECT 1 FROM invoice_recebimento_alocacoes ar
                            WHERE ar.recebimento_id=r.id AND ar.invoice_id=i.id
                        )
-                   ),0) AS total_recebido,
-                   COALESCE((SELECT SUM(valor_alocado) FROM invoice_contrato_cambio WHERE invoice_id=i.id),0)
+                    ),0) AS total_recebido,
+                    COALESCE((SELECT SUM(valor_moeda) FROM invoice_baixas WHERE invoice_id=i.id),0)
+                    AS total_baixado,
+                    COALESCE((SELECT SUM(valor_alocado) FROM invoice_contrato_cambio WHERE invoice_id=i.id),0)
                    + COALESCE((SELECT SUM(valor_moeda) FROM fechamentos_cambio
                                WHERE invoice_id=i.id AND contrato_id IS NOT NULL AND fechamento_id IS NULL),0)
                    + COALESCE((SELECT SUM(f.valor_moeda) FROM fechamentos_cambio f
@@ -8109,7 +8491,7 @@ def invoice_import_snapshot(row):
     return {key: data.get(key) for key in (
         "id", "empresa_id", "numero_invoice", "tipo_documento", "competencia_id", "cliente_id", "data_emissao",
         "data_credito", "moeda", "valor_moeda", "contrato_comercial", "status", "status_manual",
-        "total_recebido", "total_cambio", "banco_referenciado_id"
+        "total_recebido", "total_baixado", "total_cambio", "banco_referenciado_id"
     )}
 
 def invoice_import_counterparty(conn, name, field_label):
@@ -8183,6 +8565,12 @@ def apply_invoice_import_receipt(conn, invoice_id, row, status=None):
     bank = invoice_import_counterparty(conn, banco_nome, "Banco de Crédito")
     amount = decimal_value(row["valor_invoice"])
     total_received = invoice_receipt_total(conn, invoice_id)
+    total_written_off = decimal_value(conn.execute(
+        "SELECT COALESCE(SUM(valor_moeda),0) FROM invoice_baixas WHERE invoice_id=?",
+        (invoice_id,),
+    ).fetchone()[0])
+    if total_written_off > SALDO_TOLERANCE:
+        return
     if total_received >= amount - SALDO_TOLERANCE:
         return
     remaining = amount - total_received
@@ -8257,12 +8645,17 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
                 raise ValueError(
                     f"Invoice {first['numero_invoice']} pertence a um Fechamento centralizado e não pode mudar de Cliente ou moeda."
                 )
-            if decimal_value(first["valor_invoice"]) < summary["total_recebido"]:
-                raise ValueError(f"Invoice {first['numero_invoice']} não pode ficar abaixo do total recebido.")
+            if decimal_value(first["valor_invoice"]) < (
+                summary["total_recebido"] + summary["total_baixado"]
+            ):
+                raise ValueError(
+                    f"Invoice {first['numero_invoice']} não pode ficar abaixo do total recebido e do saldo baixado."
+                )
             if decimal_value(first["valor_invoice"]) < summary["total_fechamentos"]:
                 raise ValueError(f"Invoice {first['numero_invoice']} não pode ficar abaixo do total de fechamentos.")
             if first["moeda"] != current["moeda"] and (
                 summary["total_recebido"] > SALDO_TOLERANCE or
+                summary["total_baixado"] > SALDO_TOLERANCE or
                 summary["total_cambio_legado"] + summary["total_fechamentos"] > SALDO_TOLERANCE
             ):
                 raise ValueError(f"Invoice {first['numero_invoice']} não pode mudar de moeda com recebimento ou câmbio vinculado.")
@@ -8881,7 +9274,7 @@ def excluir_invoices_lote():
 
         deleted = []
         blocked = []
-        for invoice_id in invoice_ids:
+        for invoice_id in invoice_deletion_order(conn, invoice_ids):
             result = delete_invoice_if_unlinked(conn, invoice_id)
             if result["deleted"]:
                 deleted.append(result["invoice"])
@@ -8975,7 +9368,12 @@ def exportar_invoices():
                    r.banco_credito_id, r.data_credito, r.moeda,
                    COALESCE(a.valor_moeda, r.valor_moeda) AS valor_moeda,
                    r.valor_moeda AS valor_recebimento, a.id AS recebimento_alocacao_id,
-                   CASE WHEN a.id IS NULL THEN 0 ELSE 1 END AS recebimento_compartilhado,
+                   CASE WHEN a.id IS NOT NULL AND EXISTS (
+                       SELECT 1
+                       FROM invoice_recebimento_alocacoes a_shared
+                       WHERE a_shared.recebimento_id=a.recebimento_id
+                         AND a_shared.invoice_id<>a.invoice_id
+                   ) THEN 1 ELSE 0 END AS recebimento_compartilhado,
                    r.documento,
                    r.observacao, r.created_at AS recebimento_criado_em,
                    i.numero_invoice, i.tipo_documento, i.data_emissao,
@@ -9140,6 +9538,7 @@ def exportar_invoices():
         ("banco_referenciado_nome", "Banco referenciado"),
         ("data_emissao", "Data de emissao"), ("data_credito", "Data de credito"),
         ("moeda", "Moeda"), ("valor_moeda", "Valor da Invoice"), ("total_recebido", "Total recebido"),
+        ("total_baixado", "Total baixado manualmente"),
         ("saldo_recebimento", "Saldo de recebimento"), ("total_cambio_legado", "Total de cambio legado"),
         ("total_cambio", "Total de cambio efetivo"), ("total_fechamentos", "Total de fechamentos"),
         ("total_fechamentos_vinculados", "Fechamentos vinculados"),
@@ -9366,14 +9765,19 @@ def editar_invoice(invoice_id):
                 raise ValueError(
                     "Empresa, número, tipo, moeda e valor de uma Invoice desdobrada não podem ser alterados."
                 )
-            if decimal_value(data["valor_moeda"]) < summary["total_recebido"]:
-                raise ValueError("O valor da Invoice não pode ficar abaixo do total recebido.")
+            if decimal_value(data["valor_moeda"]) < (
+                summary["total_recebido"] + summary["total_baixado"]
+            ):
+                raise ValueError(
+                    "O valor da Invoice não pode ficar abaixo do total recebido e do saldo baixado."
+                )
             if decimal_value(data["valor_moeda"]) < (
                 summary["total_cambio_legado"] + summary["total_fechamentos"]
             ):
                 raise ValueError("O valor da Invoice não pode ficar abaixo do total de câmbio.")
             if data["moeda"] != current["moeda"] and (
                 summary["total_recebido"] > SALDO_TOLERANCE or
+                summary["total_baixado"] > SALDO_TOLERANCE or
                 summary["total_cambio"] > SALDO_TOLERANCE or
                 summary["total_fechamentos"] > SALDO_TOLERANCE
             ):
@@ -9592,6 +9996,67 @@ def excluir_recebimento_invoice(invoice_id, receipt_id):
     finally:
         conn.close()
     return redirect(url_for("detalhe_invoice", invoice_id=invoice_id))
+
+
+@app.route("/invoice/<int:invoice_id>/baixa", methods=["POST"])
+def baixar_saldo_invoice(invoice_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        summary = invoice_summary(conn, invoice_id)
+        if not summary:
+            raise ValueError("Invoice não encontrada.")
+
+        justificativa = (request.form.get("justificativa_baixa") or "").strip().upper()
+        if not justificativa:
+            raise ValueError("A justificativa de baixa é obrigatória.")
+
+        valor_baixa = decimal_value(summary["saldo_recebimento"])
+        if valor_baixa <= SALDO_TOLERANCE:
+            raise ValueError("Esta Invoice não possui saldo de recebimento para baixar.")
+
+        data_baixa = parse_date(request.form.get("data_baixa")) or date.today().isoformat()
+        conn.execute("""
+            INSERT INTO invoice_baixas
+                (invoice_id,moeda,valor_moeda,justificativa_baixa,data_baixa)
+            VALUES (?,?,?,?,?)
+        """, (invoice_id, summary["moeda"], float(valor_baixa), justificativa, data_baixa))
+        refresh_invoice_status(conn, invoice_id)
+        conn.commit()
+        flash("Saldo residual baixado com sucesso.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível baixar o saldo residual.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_invoice", invoice_id=invoice_id))
+
+
+@app.route("/invoice/<int:invoice_id>/baixas/<int:baixa_id>/excluir", methods=["POST"])
+def excluir_baixa_invoice(invoice_id, baixa_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        baixa = conn.execute(
+            "SELECT id FROM invoice_baixas WHERE id=? AND invoice_id=?",
+            (baixa_id, invoice_id),
+        ).fetchone()
+        if not baixa:
+            raise ValueError("Baixa manual não encontrada.")
+        conn.execute(
+            "DELETE FROM invoice_baixas WHERE id=? AND invoice_id=?",
+            (baixa_id, invoice_id),
+        )
+        refresh_invoice_status(conn, invoice_id)
+        conn.commit()
+        flash("Baixa manual excluída; o saldo residual voltou a ser considerado.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível excluir a baixa manual.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_invoice", invoice_id=invoice_id))
+
 
 @app.route("/invoice/<int:invoice_id>/cambio", methods=["POST"])
 def adicionar_cambio_invoice(invoice_id):
@@ -9903,6 +10368,7 @@ def saldo_invoice(invoice_id):
     return jsonify({
         "id": summary["id"], "numero_invoice": summary["numero_invoice"], "moeda": summary["moeda"],
         "valor_invoice": float(summary["valor_moeda"]), "total_recebido": float(summary["total_recebido"]),
+        "total_baixado": float(summary["total_baixado"]),
         "saldo_recebimento": float(summary["saldo_recebimento"]),
         "total_cambio_legado": float(summary["total_cambio_legado"]),
         "total_cambio": float(summary["total_cambio"]),
@@ -9912,6 +10378,14 @@ def saldo_invoice(invoice_id):
         "saldo_fechamentos": float(summary["saldo_fechamentos"]),
         "saldo_cambio": float(summary["saldo_cambio"]), "status": summary["status"],
         "status_label": INVOICE_STATUS_LABELS[summary["status"]],
+        "baixas": [
+            {
+                "id": row["id"], "valor_moeda": float(row["valor_moeda"]),
+                "moeda": row["moeda"], "justificativa_baixa": row["justificativa_baixa"],
+                "data_baixa": row["data_baixa"], "created_at": row["created_at"],
+            }
+            for row in summary["baixas"]
+        ],
     })
 
 def invoice_import_preview_context(payload):

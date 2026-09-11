@@ -49,6 +49,10 @@
     <h2 id="central-closing-dialog-title">Registrar fechamento de câmbio</h2>
     <p class="muted">Confira o valor de cada Invoice. O limite é o saldo disponível exibido.</p>
     <div data-central-closing-items class="central-closing-dialog-items"></div>
+    <div data-central-closing-summary class="central-closing-dialog-summary" aria-live="polite" hidden>
+      <span>Total selecionado: <strong data-central-selected-total>USD 0,00</strong></span>
+      <span data-central-brl-total hidden>Total em BRL: <strong data-central-brl-total-value>R$ 0,00</strong></span>
+    </div>
     <div data-central-closing-contracts class="central-closing-dialog-contracts"></div>
     <div class="central-closing-dialog-fields">
       <label>Categoria Câmbio<select name="categoria_cambio" data-central-cambio-category required><option value="">Selecione</option><option value="Câmbio Exportação">Câmbio Exportação</option><option value="Câmbio Financeiro">Câmbio Financeiro</option></select></label>
