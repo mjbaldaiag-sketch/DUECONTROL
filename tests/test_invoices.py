@@ -2040,6 +2040,8 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         detail_html = detail.get_data(as_text=True)
         self.assertIn(f'action="/invoice/{invoice_id}/excluir"', detail_html)
         self.assertIn("Excluir Invoice", detail_html)
+        self.assertIn('href="/invoice/nova"', detail_html)
+        self.assertIn("+ Nova invoice", detail_html)
 
     def test_invoice_list_renders_batch_receipt_controls_and_banks(self):
         invoice_id = self._create_invoice("INV-BATCH-CONTROLS", "100,00")

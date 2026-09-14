@@ -276,6 +276,9 @@
   document.querySelectorAll('form[action*="/recebimentos"]').forEach((form) => fillToday(form, 'data_credito'));
   document.querySelectorAll('form[action$="/cambio"]').forEach((form) => fillToday(form, 'data_fechamento'));
   document.querySelectorAll('form[action$="/contrato/novo"]').forEach((form) => fillToday(form, 'data_contrato'));
+  document.querySelectorAll('[data-fill-today="true"]').forEach((input) => {
+    if (!input.value) input.value = todayBr;
+  });
   document.querySelectorAll('[data-date-br]').forEach((input) => input.addEventListener('input', () => formatDate(input)));
   document.querySelectorAll('[data-uppercase]').forEach((input) => input.addEventListener('input', () => {
     input.value = input.value.toLocaleUpperCase('pt-BR');
@@ -611,6 +614,29 @@
     const form = select.closest('form');
     const empresa = form ? form.querySelector('select[name="empresa_id"]') : null;
     if (!empresa) return;
+    const referenceDate = form.querySelector('[data-competencia-reference]');
+    let automaticSelection = !select.value;
+    const normalizeDate = (value) => {
+      const raw = (value || '').trim();
+      const brMatch = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+      if (brMatch) return `${brMatch[3]}-${brMatch[2]}-${brMatch[1]}`;
+      return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : '';
+    };
+    const today = select.dataset.competenciaToday || new Date().toISOString().slice(0, 10);
+    const competenciaDate = () => normalizeDate(referenceDate && referenceDate.value) || today;
+    const selectCurrentCompetencia = () => {
+      const empresaId = empresa.value;
+      if (!empresaId || !automaticSelection) return;
+      const reference = competenciaDate();
+      const match = [...select.options].find((option) => (
+        option.value
+        && option.dataset.competenciaEmpresa === empresaId
+        && option.dataset.competenciaStatus === 'ABERTA'
+        && option.dataset.competenciaInicial <= reference
+        && option.dataset.competenciaFinal >= reference
+      ));
+      if (match) select.value = match.value;
+    };
     const updateCompetencias = () => {
       const empresaId = empresa.value;
       [...select.options].forEach((option) => {
@@ -619,8 +645,14 @@
       });
       const selected = select.selectedOptions[0];
       if (selected && selected.hidden) select.value = '';
+      selectCurrentCompetencia();
     };
-    empresa.addEventListener('change', updateCompetencias);
+    empresa.addEventListener('change', () => {
+      automaticSelection = true;
+      updateCompetencias();
+    });
+    select.addEventListener('change', () => { automaticSelection = false; });
+    if (referenceDate) referenceDate.addEventListener('change', selectCurrentCompetencia);
     updateCompetencias();
   });
   document.querySelectorAll('[data-client-resolution]').forEach((resolution) => {
@@ -735,6 +767,7 @@
     contractDueOpen.addEventListener('click', () => {
       if (typeof contractDueDialog.showModal === 'function') contractDueDialog.showModal();
       else contractDueDialog.setAttribute('open', '');
+      contractDueValue.value = display(contractDueDialog.dataset.contractTotal);
       updateBalance();
       contractDueSelect.focus();
     });

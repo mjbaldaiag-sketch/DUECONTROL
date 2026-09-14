@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, send_file, jsonify, session
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file, jsonify, session, g
 import json
 import sqlite3
 import re
@@ -426,6 +426,7 @@ def init_db():
         data_due TEXT,
         cnpj TEXT,
         cliente TEXT,
+        cliente_id INTEGER,
         moeda TEXT NOT NULL DEFAULT 'USD',
         valor_original REAL NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'PENDENTE',
@@ -968,6 +969,21 @@ def init_db():
         due_columns = {row[1] for row in conn.execute("PRAGMA table_info(dues)")}
         if "competencia_id" not in due_columns:
             conn.execute("ALTER TABLE dues ADD COLUMN competencia_id INTEGER")
+        if "cliente_id" not in due_columns:
+            conn.execute("ALTER TABLE dues ADD COLUMN cliente_id INTEGER")
+        conn.execute("""
+            UPDATE dues
+            SET cliente_id=(
+                SELECT MIN(c.id)
+                FROM clientes c
+                WHERE c.nome=dues.cliente
+            )
+            WHERE cliente_id IS NULL
+              AND cliente IS NOT NULL
+              AND (
+                  SELECT COUNT(*) FROM clientes c2 WHERE c2.nome=dues.cliente
+              )=1
+        """)
         ndf_columns = {row[1] for row in conn.execute("PRAGMA table_info(ndfs)")}
         if "cliente_id" not in ndf_columns:
             conn.execute("ALTER TABLE ndfs ADD COLUMN cliente_id INTEGER")
@@ -981,6 +997,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_cliente ON invoices(cliente_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contratos_cliente ON contratos(cliente_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ndfs_cliente ON ndfs(cliente_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_cliente ON dues(cliente_id)")
         movimentacao_columns = {row[1] for row in conn.execute("PRAGMA table_info(due_movimentacoes)")}
         if "contrato_id" not in movimentacao_columns:
             conn.execute("ALTER TABLE due_movimentacoes ADD COLUMN contrato_id INTEGER")
@@ -1780,6 +1797,20 @@ def clientes_for_form(conn):
         ORDER BY nome, pais, id
     """).fetchall()
 
+def cliente_id_for_due_form(conn, due=None, selected_id=None):
+    """Seleciona o cliente centralizado usado pelo formulário de DU-E."""
+    if selected_id not in (None, ""):
+        return form_record_id(selected_id)
+    if due and "cliente_id" in due.keys() and due["cliente_id"]:
+        return due["cliente_id"]
+    if due and due["cliente"]:
+        cliente = conn.execute(
+            "SELECT id FROM clientes WHERE nome=? ORDER BY id LIMIT 1",
+            (due["cliente"],),
+        ).fetchone()
+        return cliente["id"] if cliente else None
+    return None
+
 def cliente_form_data(form, conn, current_id=None):
     nome = normalize_client_name_display(form.get("nome"))
     if not nome:
@@ -1823,7 +1854,13 @@ def cliente_vinculos(conn, cliente_id):
         WHERE cliente_id=?
         ORDER BY numero_operacao, id
     """, (cliente_id,)).fetchall()
-    return {"invoices": invoices, "contratos": contratos, "ndfs": ndfs}
+    dues = conn.execute("""
+        SELECT id, numero_due
+        FROM dues
+        WHERE cliente_id=?
+        ORDER BY numero_due, id
+    """, (cliente_id,)).fetchall()
+    return {"invoices": invoices, "contratos": contratos, "ndfs": ndfs, "dues": dues}
 
 def clientes_com_vinculos(conn, pagination=None):
     query = """
@@ -2449,6 +2486,321 @@ def contract_summary(conn, contrato_id):
 init_db()
 
 
+GLOBAL_CONTEXT_ENDPOINTS = frozenset({
+    "index",
+    "lista_invoices",
+    "gestao_fechamentos_invoices",
+    "lista_contratos",
+    "consulta_dues",
+})
+GLOBAL_CONTEXT_EMPRESA_KEY = "global_context_empresa_id"
+GLOBAL_CONTEXT_COMPETENCIA_KEY = "global_context_competencia"
+
+
+def _global_normalized_cnpj_sql(expression):
+    return (
+        "REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(" + expression
+        + ",'') ,'.',''),'/',''),'-',''),' ','')"
+    )
+
+
+def global_context_period_key(data_inicial, data_final):
+    return f"{data_inicial}|{data_final}"
+
+
+def global_context_options(conn):
+    empresas = conn.execute(
+        "SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY "
+        + empresa_order_sql()
+    ).fetchall()
+    periodos = {}
+    for row in conn.execute("""
+        SELECT data_inicial, data_final, descricao
+        FROM competencias
+        ORDER BY data_inicial DESC, data_final DESC, descricao, id
+    """).fetchall():
+        key = global_context_period_key(row["data_inicial"], row["data_final"])
+        item = periodos.setdefault(key, {
+            "key": key,
+            "data_inicial": row["data_inicial"],
+            "data_final": row["data_final"],
+            "descricoes": [],
+        })
+        descricao = (row["descricao"] or "").strip()
+        if descricao and descricao not in item["descricoes"]:
+            item["descricoes"].append(descricao)
+
+    competencia_options = []
+    for item in periodos.values():
+        descricao = " / ".join(item["descricoes"]) or "Período sem descrição"
+        item["descricao"] = descricao
+        item["label"] = (
+            f"{descricao} ({date_br(item['data_inicial'])} a "
+            f"{date_br(item['data_final'])})"
+        )
+        competencia_options.append(item)
+
+    return empresas, competencia_options
+
+
+def _global_context_from_session(conn=None):
+    owns_connection = conn is None
+    conn = conn or db()
+    try:
+        empresas, competencias = global_context_options(conn)
+        empresa_ids = {int(row["id"]) for row in empresas}
+        empresa_id = session.get(GLOBAL_CONTEXT_EMPRESA_KEY)
+        try:
+            empresa_id = int(empresa_id) if empresa_id not in (None, "") else None
+        except (TypeError, ValueError):
+            empresa_id = None
+        if empresa_id not in empresa_ids:
+            empresa_id = None
+            session.pop(GLOBAL_CONTEXT_EMPRESA_KEY, None)
+
+        competencia_key = session.get(GLOBAL_CONTEXT_COMPETENCIA_KEY)
+        competencia = next(
+            (item for item in competencias if item["key"] == competencia_key),
+            None,
+        )
+        if competencia is None:
+            competencia_key = None
+            session.pop(GLOBAL_CONTEXT_COMPETENCIA_KEY, None)
+
+        return {
+            "empresa_id": empresa_id,
+            "competencia_key": competencia_key,
+            "competencia": competencia,
+            "competencia_data_inicial": competencia["data_inicial"] if competencia else None,
+            "competencia_data_final": competencia["data_final"] if competencia else None,
+            "empresas": empresas,
+            "competencias": competencias,
+        }
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+@app.before_request
+def carregar_contexto_global():
+    g.global_context = _global_context_from_session()
+    g.global_context_enabled = request.endpoint in GLOBAL_CONTEXT_ENDPOINTS
+
+
+@app.context_processor
+def injetar_contexto_global():
+    contexto = getattr(g, "global_context", None) or {
+        "empresa_id": None, "competencia_key": None,
+        "competencia": None, "empresas": [], "competencias": [],
+    }
+    return {
+        "global_context": contexto,
+        "global_context_enabled": getattr(g, "global_context_enabled", False),
+        "global_context_empresas": contexto.get("empresas", []),
+        "global_context_competencias": contexto.get("competencias", []),
+    }
+
+
+def _global_context_contract_link_invoice_sql(contract_alias, invoice_alias):
+    return f"""
+        (
+            EXISTS (
+                SELECT 1 FROM invoice_contrato_cambio gl_ic
+                WHERE gl_ic.contrato_id={contract_alias}.id
+                  AND gl_ic.invoice_id={invoice_alias}.id
+            )
+            OR EXISTS (
+                SELECT 1 FROM fechamentos_cambio gl_fc
+                WHERE gl_fc.contrato_id={contract_alias}.id
+                  AND gl_fc.invoice_id={invoice_alias}.id
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM fechamentos_cambio gl_fh_fc
+                JOIN fechamentos gl_fh ON gl_fh.id=gl_fh_fc.fechamento_id
+                WHERE gl_fh.contrato_id={contract_alias}.id
+                  AND gl_fh_fc.invoice_id={invoice_alias}.id
+            )
+        )
+    """
+
+
+def _global_context_contract_link_due_sql(contract_alias, due_alias):
+    return f"""
+        (
+            EXISTS (
+                SELECT 1 FROM due_contratos gl_dc
+                WHERE gl_dc.contrato_id={contract_alias}.id
+                  AND gl_dc.due_id={due_alias}.id
+            )
+            OR EXISTS (
+                SELECT 1 FROM due_movimentacoes gl_dm
+                WHERE gl_dm.contrato_id={contract_alias}.id
+                  AND gl_dm.due_id={due_alias}.id
+            )
+        )
+    """
+
+
+def _global_context_contract_company_sql(context, alias="c"):
+    empresa_id = context.get("empresa_id") if context else None
+    if not empresa_id:
+        return None, []
+    direct = (
+        "EXISTS (SELECT 1 FROM empresas gl_e "
+        f"WHERE gl_e.id=? AND {_global_normalized_cnpj_sql(alias + '.cnpj')}="
+        f"{_global_normalized_cnpj_sql('gl_e.cnpj')})"
+    )
+    linked_invoice = (
+        "EXISTS (SELECT 1 FROM invoices gl_i "
+        f"WHERE gl_i.empresa_id=? AND {_global_context_contract_link_invoice_sql(alias, 'gl_i')})"
+    )
+    linked_due = (
+        "EXISTS (SELECT 1 FROM dues gl_d "
+        f"WHERE {_global_context_contract_link_due_sql(alias, 'gl_d')} "
+        "AND EXISTS (SELECT 1 FROM empresas gl_de WHERE gl_de.id=? "
+        f"AND {_global_normalized_cnpj_sql('gl_d.cnpj')}="
+        f"{_global_normalized_cnpj_sql('gl_de.cnpj')}))"
+    )
+    return f"({direct} OR {linked_invoice} OR {linked_due})", [empresa_id, empresa_id, empresa_id]
+
+
+def _global_context_contract_period_sql(context, alias="c"):
+    inicio = context.get("competencia_data_inicial") if context else None
+    fim = context.get("competencia_data_final") if context else None
+    if not inicio or not fim:
+        return None, []
+    direct = (
+        "EXISTS (SELECT 1 FROM competencias gl_c "
+        f"WHERE gl_c.id={alias}.competencia_id AND gl_c.data_inicial=? "
+        "AND gl_c.data_final=?)"
+    )
+    linked_invoice = (
+        "EXISTS (SELECT 1 FROM invoices gl_i "
+        "JOIN competencias gl_ic ON gl_ic.id=gl_i.competencia_id "
+        f"WHERE gl_ic.data_inicial=? AND gl_ic.data_final=? AND "
+        f"{_global_context_contract_link_invoice_sql(alias, 'gl_i')})"
+    )
+    linked_due = (
+        "EXISTS (SELECT 1 FROM dues gl_d "
+        "JOIN competencias gl_dc ON gl_dc.id=gl_d.competencia_id "
+        f"WHERE gl_dc.data_inicial=? AND gl_dc.data_final=? AND "
+        f"{_global_context_contract_link_due_sql(alias, 'gl_d')})"
+    )
+    return f"({direct} OR {linked_invoice} OR {linked_due})", [inicio, fim, inicio, fim, inicio, fim]
+
+
+def global_context_sql(scope, context=None, alias=None):
+    """Retorna predicados globais e parâmetros sem alterar filtros locais."""
+    context = context or {}
+    empresa_id = context.get("empresa_id")
+    inicio = context.get("competencia_data_inicial")
+    fim = context.get("competencia_data_final")
+    clauses, params = [], []
+
+    if scope == "invoice":
+        alias = alias or "i"
+        if empresa_id:
+            clauses.append(f"{alias}.empresa_id=?")
+            params.append(empresa_id)
+        if inicio and fim:
+            clauses.append(
+                f"EXISTS (SELECT 1 FROM competencias gl_c WHERE gl_c.id={alias}.competencia_id "
+                "AND gl_c.data_inicial=? AND gl_c.data_final=?)"
+            )
+            params.extend([inicio, fim])
+    elif scope == "due":
+        alias = alias or "d"
+        if empresa_id:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM empresas gl_e WHERE gl_e.id=? AND "
+                f"{_global_normalized_cnpj_sql(alias + '.cnpj')}="
+                f"{_global_normalized_cnpj_sql('gl_e.cnpj')})"
+            )
+            params.append(empresa_id)
+        if inicio and fim:
+            clauses.append(
+                f"EXISTS (SELECT 1 FROM competencias gl_c WHERE gl_c.id={alias}.competencia_id "
+                "AND gl_c.data_inicial=? AND gl_c.data_final=?)"
+            )
+            params.extend([inicio, fim])
+    elif scope == "contract":
+        alias = alias or "c"
+        company_sql, company_params = _global_context_contract_company_sql(context, alias)
+        period_sql, period_params = _global_context_contract_period_sql(context, alias)
+        if company_sql:
+            clauses.append(company_sql)
+            params.extend(company_params)
+        if period_sql:
+            clauses.append(period_sql)
+            params.extend(period_params)
+    elif scope == "closing":
+        alias = alias or "h"
+        if empresa_id:
+            invoice_company = (
+                f"EXISTS (SELECT 1 FROM fechamentos_cambio gl_f "
+                f"JOIN invoices gl_i ON gl_i.id=gl_f.invoice_id "
+                f"WHERE gl_f.fechamento_id={alias}.id AND gl_i.empresa_id=?)"
+            )
+            contract_company, contract_params = _global_context_contract_company_sql(context, "gl_contract")
+            contract_company = (
+                f"EXISTS (SELECT 1 FROM contratos gl_contract WHERE gl_contract.id={alias}.contrato_id "
+                f"AND {contract_company})"
+            )
+            clauses.append(f"({invoice_company} OR {contract_company})")
+            params.extend([empresa_id, *contract_params])
+        if inicio and fim:
+            invoice_period = (
+                f"EXISTS (SELECT 1 FROM fechamentos_cambio gl_f "
+                f"JOIN invoices gl_i ON gl_i.id=gl_f.invoice_id "
+                f"JOIN competencias gl_c ON gl_c.id=gl_i.competencia_id "
+                f"WHERE gl_f.fechamento_id={alias}.id AND gl_c.data_inicial=? "
+                "AND gl_c.data_final=?)"
+            )
+            contract_period, contract_params = _global_context_contract_period_sql(context, "gl_contract")
+            contract_period = (
+                f"EXISTS (SELECT 1 FROM contratos gl_contract WHERE gl_contract.id={alias}.contrato_id "
+                f"AND {contract_period})"
+            )
+            clauses.append(f"({invoice_period} OR {contract_period})")
+            params.extend([inicio, fim, *contract_params])
+    else:
+        raise ValueError(f"Escopo de contexto global desconhecido: {scope}")
+
+    return (" AND ".join(clauses) if clauses else ""), params
+
+
+@app.route("/contexto-global", methods=["POST"])
+def atualizar_contexto_global():
+    conn = db()
+    try:
+        empresas, competencias = global_context_options(conn)
+        empresa_raw = (request.form.get("global_empresa_id") or "").strip()
+        periodo_raw = (request.form.get("global_competencia") or "").strip()
+        if empresa_raw:
+            empresa_id = form_record_id(empresa_raw)
+            if not empresa_id or empresa_id not in {row["id"] for row in empresas}:
+                raise ValueError("A empresa selecionada para o contexto não é válida.")
+            session[GLOBAL_CONTEXT_EMPRESA_KEY] = empresa_id
+        else:
+            session.pop(GLOBAL_CONTEXT_EMPRESA_KEY, None)
+        if periodo_raw:
+            if not any(item["key"] == periodo_raw for item in competencias):
+                raise ValueError("A competência selecionada para o contexto não é válida.")
+            session[GLOBAL_CONTEXT_COMPETENCIA_KEY] = periodo_raw
+        else:
+            session.pop(GLOBAL_CONTEXT_COMPETENCIA_KEY, None)
+        session.modified = True
+    except ValueError as exc:
+        flash(str(exc), "danger")
+    finally:
+        conn.close()
+    target = (request.form.get("next") or "").strip()
+    if not target.startswith("/") or target.startswith("//"):
+        target = url_for("index")
+    return redirect(target)
+
+
 def dashboard_due_sorting(args):
     fields = {
         "numero_due": ("d.numero_due", "text"),
@@ -2506,8 +2858,19 @@ def dashboard_contract_sorting(args):
 @app.route("/")
 def index():
     conn = db()
-    dues_total = conn.execute("SELECT COUNT(*) FROM dues").fetchone()[0]
-    contratos_total = conn.execute("SELECT COUNT(*) FROM contratos").fetchone()[0]
+    due_global, due_global_params = global_context_sql("due", g.global_context)
+    contract_global, contract_global_params = global_context_sql("contract", g.global_context)
+    invoice_global, invoice_global_params = global_context_sql("invoice", g.global_context)
+    due_scope_where = f"WHERE {due_global}" if due_global else ""
+    contract_scope_where = f"WHERE {contract_global}" if contract_global else ""
+    dues_total = conn.execute(
+        "SELECT COUNT(*) FROM dues d " + due_scope_where,
+        due_global_params,
+    ).fetchone()[0]
+    contratos_total = conn.execute(
+        "SELECT COUNT(*) FROM contratos c " + contract_scope_where,
+        contract_global_params,
+    ).fetchone()[0]
     dues_sort_fields, dues_sort, dues_direction, dues_sort_links = dashboard_due_sorting(request.args)
     contratos_sort_fields, contratos_sort, contratos_direction, contratos_sort_links = dashboard_contract_sorting(request.args)
     dues_pagination = build_pagination(request.args, dues_total, page_param="dues_page", endpoint="index")
@@ -2517,13 +2880,14 @@ def index():
         f"{empresa_order_sql('e')}, d.id {dues_direction}"
         if dues_sort else f"{empresa_order_sql('e')}, d.id DESC"
     )
-    dues_params = []
+    dues_params = list(due_global_params)
     dues = [decorate_due(row) for row in conn.execute(f"""
         SELECT d.*, e.apelido AS empresa_apelido,
                COALESCE(SUM(CASE WHEN m.tipo IN ('UTILIZACAO','VINCULACAO') THEN m.valor ELSE -m.valor END),0) AS utilizado
         FROM dues d
         LEFT JOIN due_movimentacoes m ON m.due_id=d.id
         LEFT JOIN empresas e ON e.cnpj=d.cnpj
+        {due_scope_where}
         GROUP BY d.id ORDER BY {dues_order}
         LIMIT ? OFFSET ?
     """, dues_params + [dues_pagination["per_page"], dues_pagination["offset"]]).fetchall()]
@@ -2532,7 +2896,7 @@ def index():
         f"{empresa_order_sql('e')}, c.id {contratos_direction}"
         if contratos_sort else f"{empresa_order_sql('e')}, c.id DESC"
     )
-    contratos_params = []
+    contratos_params = list(contract_global_params)
     contratos = [decorate_contract(row) for row in conn.execute(f"""
         SELECT c.*, e.apelido AS empresa_apelido,
                {contract_total_sql("c")} AS valor_moeda_consolidado,
@@ -2540,22 +2904,33 @@ def index():
         FROM contratos c
         LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
         LEFT JOIN empresas e ON e.cnpj=c.cnpj
+        {contract_scope_where}
         GROUP BY c.id ORDER BY {contratos_order}
         LIMIT ? OFFSET ?
     """, contratos_params + [contratos_pagination["per_page"], contratos_pagination["offset"]]).fetchall()]
+    due_unlinked_where = (
+        f"WHERE {due_global} AND " if due_global else "WHERE "
+    ) + "NOT EXISTS (SELECT 1 FROM due_contratos v WHERE v.due_id=d.id)"
+    contract_unlinked_where = (
+        f"{contract_global} AND " if contract_global else ""
+    ) + "NOT EXISTS (SELECT 1 FROM due_contratos v WHERE v.contrato_id=c.id)"
     resumo = {
-        "invoices": conn.execute("SELECT COUNT(*) FROM invoices").fetchone()[0],
+        "invoices": conn.execute(
+            "SELECT COUNT(*) FROM invoices i "
+            + (f"WHERE {invoice_global}" if invoice_global else ""),
+            invoice_global_params,
+        ).fetchone()[0],
         "dues": dues_total,
         "contratos": contratos_total,
-        "dues_sem_vinculo": conn.execute("""
-            SELECT COUNT(*) FROM dues d
-            WHERE NOT EXISTS (SELECT 1 FROM due_contratos v WHERE v.due_id=d.id)
-        """).fetchone()[0],
-        "contratos_sem_vinculo": conn.execute("""
+        "dues_sem_vinculo": conn.execute(
+            "SELECT COUNT(*) FROM dues d " + due_unlinked_where,
+            due_global_params,
+        ).fetchone()[0],
+        "contratos_sem_vinculo": conn.execute(f"""
             SELECT COUNT(*) FROM contratos c
-            WHERE NOT EXISTS (SELECT 1 FROM due_contratos v WHERE v.contrato_id=c.id)
+            WHERE {contract_unlinked_where}
               AND COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), 'Câmbio Exportação')<>?
-        """, (CATEGORIA_CAMBIO_FINANCEIRO,)).fetchone()[0],
+        """, contract_global_params + [CATEGORIA_CAMBIO_FINANCEIRO]).fetchone()[0],
     }
     conn.close()
     return render_template("index.html", dues=dues, contratos=contratos, resumo=resumo,
@@ -2683,6 +3058,10 @@ def contratos_order_sql(sort_fields, sort, direction):
 
 def consulta_contratos(conn, args, paginate=False):
     filtros, clause, params = contratos_filtros(args)
+    global_clause, global_params = global_context_sql("contract", g.global_context)
+    if global_clause:
+        clause = f"{clause} AND {global_clause}" if clause else f" WHERE {global_clause}"
+        params = list(params) + global_params
     sort_fields, sort, direction, _ = contratos_sorting(args)
     pagination = None
     query_params = list(params)
@@ -4474,6 +4853,10 @@ def editar_cliente(cliente_id):
                 "UPDATE contratos SET cliente=? WHERE cliente_id=?",
                 (data["nome"], cliente_id),
             )
+            conn.execute(
+                "UPDATE dues SET cliente=? WHERE cliente_id=?",
+                (data["nome"], cliente_id),
+            )
             conn.commit()
             conn.close()
             flash("Cliente atualizado com sucesso.", "success")
@@ -5135,6 +5518,10 @@ def consulta_dues():
     filters = {key: value for key, value in request.args.items()
                if key not in {"sort", "direction", "page"} and value}
     where, params = [], []
+    global_clause, global_params = global_context_sql("due", g.global_context)
+    if global_clause:
+        where.append(global_clause)
+        params.extend(global_params)
     if request.args.get("numero_due"):
         where.append("d.numero_due LIKE ?"); params.append(f"%{request.args['numero_due'].strip()}%")
     if request.args.get("chave_acesso"):
@@ -5385,6 +5772,7 @@ def nova_due():
             valor_original = parse_number(f.get("valor_original"))
             ensure_non_negative_balance(valor_original, "O valor original da DU-E não pode ser negativo.")
             conn = db()
+            cliente = cliente_da_selecao(conn, f.get("cliente_id"), required=True)
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"))
             empresa_id = form_record_id(f.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
             data_due = parse_date(f.get("data_due")) or date.today().isoformat()
@@ -5392,9 +5780,9 @@ def nova_due():
             if conn.execute("SELECT 1 FROM dues WHERE chave_acesso=?", (chave,)).fetchone():
                 raise ValueError("A Chave de Acesso já está cadastrada.")
             conn.execute("""INSERT INTO dues
-                (chave_acesso,numero_due,cnpj,cliente,moeda,valor_original,status,created_at,observacao,data_due,competencia_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (chave,f["numero_due"].strip(),cnpj,f.get("cliente"),
+                (chave_acesso,numero_due,cnpj,cliente,cliente_id,moeda,valor_original,status,created_at,observacao,data_due,competencia_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (chave,f["numero_due"].strip(),cnpj,cliente["nome"],cliente["id"],
                  f.get("moeda") or "USD",valor_original, status_from_balance(valor_original),
                  launch_timestamp(),
                  f.get("observacao"), data_due, competencia_id))
@@ -5410,13 +5798,19 @@ def nova_due():
                 conn.close()
     conn = db()
     empresas, empresa_id = empresas_for_form(conn, selected_id=request.form.get("empresa_id"))
+    clientes = clientes_for_form(conn)
+    cliente_id = cliente_id_for_due_form(
+        conn, selected_id=request.form.get("cliente_id") if request.method == "POST" else None
+    )
     competencias = competencias_for_empresa(conn, empresa_id)
     competencia_id = form_record_id(request.form.get("competencia_id"))
     if not competencia_id and empresa_id:
         sugerida = sugerir_competencia(conn, empresa_id, request.form.get("data_due") or date.today().isoformat())
         competencia_id = sugerida["id"] if sugerida else None
     conn.close()
-    return render_template("due_form.html", due=None, empresas=empresas, empresa_id=empresa_id, competencias=competencias, competencia_id=competencia_id)
+    return render_template("due_form.html", due=None, empresas=empresas, empresa_id=empresa_id,
+                           clientes=clientes, cliente_id=cliente_id,
+                           competencias=competencias, competencia_id=competencia_id)
 
 @app.route("/due/<int:due_id>/editar", methods=["GET", "POST"])
 def editar_due(due_id):
@@ -5435,16 +5829,22 @@ def editar_due(due_id):
                 decimal_value(valor_original) - decimal_value(utilizado_atual),
                 "O valor original da DU-E não pode ficar abaixo do total utilizado."
             )
+            cliente_id_atual = cliente_id_for_due_form(conn, due=due)
+            cliente_registro = cliente_da_selecao(
+                conn, f.get("cliente_id"), current_id=cliente_id_atual
+            )
+            cliente = cliente_registro["nome"] if cliente_registro else due["cliente"]
+            cliente_id = cliente_registro["id"] if cliente_registro else due["cliente_id"]
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"), due["cnpj"])
             empresa_id = form_record_id(f.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
             data_due = parse_date(f.get("data_due")) or due["data_due"] or date.today().isoformat()
             competencia_id = competencia_da_operacao(conn, f.get("competencia_id"), empresa_id, data_due, due["competencia_id"] if "competencia_id" in due.keys() else None)
             if conn.execute("SELECT 1 FROM dues WHERE chave_acesso=? AND id<>?", (chave, due_id)).fetchone():
                 raise ValueError("A Chave de Acesso já está cadastrada.")
-            conn.execute("""UPDATE dues SET chave_acesso=?,numero_due=?,cnpj=?,cliente=?,moeda=?,valor_original=?,observacao=?,data_due=?,competencia_id=?
+            conn.execute("""UPDATE dues SET chave_acesso=?,numero_due=?,cnpj=?,cliente=?,cliente_id=?,moeda=?,valor_original=?,observacao=?,data_due=?,competencia_id=?
                             WHERE id=?""",
                          (chave, f["numero_due"].strip(), cnpj,
-                          f.get("cliente"), f.get("moeda") or "USD", valor_original,
+                          cliente, cliente_id, f.get("moeda") or "USD", valor_original,
                           f.get("observacao"), data_due, competencia_id, due_id))
             update_due_status(conn, due_id)
             conn.commit(); conn.close()
@@ -5458,9 +5858,17 @@ def editar_due(due_id):
         conn, due["cnpj"], request.form.get("empresa_id") if request.method == "POST" else None
     )
     competencias = competencias_for_empresa(conn, empresa_id)
+    clientes = clientes_for_form(conn)
+    cliente_id = cliente_id_for_due_form(
+        conn,
+        due=due,
+        selected_id=request.form.get("cliente_id") if request.method == "POST" else None,
+    )
     competencia_id = form_record_id(request.form.get("competencia_id"), due["competencia_id"] if "competencia_id" in due.keys() else None)
     conn.close()
-    return render_template("due_form.html", due=due, empresas=empresas, empresa_id=empresa_id, competencias=competencias, competencia_id=competencia_id)
+    return render_template("due_form.html", due=due, empresas=empresas, empresa_id=empresa_id,
+                           clientes=clientes, cliente_id=cliente_id,
+                           competencias=competencias, competencia_id=competencia_id)
 
 def carregar_detalhe_due(conn, due_id):
     due_row=conn.execute("SELECT * FROM dues WHERE id=?", (due_id,)).fetchone()
@@ -7927,7 +8335,7 @@ def central_closing_context_args(args):
     }
 
 
-def central_closing_filter_sql(filters=None, alias="h"):
+def central_closing_filter_sql(filters=None, alias="h", global_context=None):
     filters = filters or {}
     if filters.get("_no_results"):
         return "WHERE 1=0", []
@@ -7954,6 +8362,11 @@ def central_closing_filter_sql(filters=None, alias="h"):
     if filters.get("banco_liquidacao_id"):
         clauses.append(f"{alias}.banco_liquidacao_id=?")
         params.append(filters["banco_liquidacao_id"])
+    if global_context is not None:
+        global_clause, global_params = global_context_sql("closing", global_context, alias)
+        if global_clause:
+            clauses.append(global_clause)
+            params.extend(global_params)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     return where, params
 
@@ -8002,8 +8415,9 @@ def central_closing_order_sql(sort=None, direction="DESC"):
     """
 
 
-def central_closing_headers(conn, filters=None, pagination=None, sort=None, direction="DESC"):
-    where, params = central_closing_filter_sql(filters)
+def central_closing_headers(conn, filters=None, pagination=None, sort=None, direction="DESC",
+                            global_context=None):
+    where, params = central_closing_filter_sql(filters, global_context=global_context)
     limit_clause = ""
     query_params = list(params)
     if pagination:
@@ -8033,9 +8447,10 @@ def central_closing_headers(conn, filters=None, pagination=None, sort=None, dire
     """, query_params).fetchall()
 
 
-def central_closing_navigation(conn, fechamento_id, filters=None, sort=None, direction="DESC"):
+def central_closing_navigation(conn, fechamento_id, filters=None, sort=None, direction="DESC",
+                               global_context=None):
     """Retorna somente os fechamentos vizinhos na ordem oficial da listagem."""
-    where, params = central_closing_filter_sql(filters)
+    where, params = central_closing_filter_sql(filters, global_context=global_context)
     row = conn.execute(f"""
         WITH ranked AS (
             SELECT h.id,
@@ -8064,8 +8479,8 @@ def central_closing_navigation(conn, fechamento_id, filters=None, sort=None, dir
     }
 
 
-def central_closing_headers_count(conn, filters=None):
-    where, params = central_closing_filter_sql(filters)
+def central_closing_headers_count(conn, filters=None, global_context=None):
+    where, params = central_closing_filter_sql(filters, global_context=global_context)
     return conn.execute(f"""
         SELECT COUNT(DISTINCT h.id)
         FROM fechamentos h
@@ -8900,6 +9315,10 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
 
 def invoice_filter_query(args):
     where, params = [], []
+    global_clause, global_params = global_context_sql("invoice", g.global_context)
+    if global_clause:
+        where.append(global_clause)
+        params.extend(global_params)
     if args.get("numero_invoice"):
         where.append("i.numero_invoice LIKE ?"); params.append(f"%{args['numero_invoice'].strip()}%")
     if args.get("contrato_comercial"):
@@ -9032,9 +9451,15 @@ def sort_eligible_invoices(invoices, sort, direction):
 
 
 def central_closing_page_data(conn, closing_filters=None, closing_pagination=None,
-                              closing_sort=None, closing_direction="DESC"):
+                              closing_sort=None, closing_direction="DESC",
+                              global_context=None):
     eligible = []
-    for row in conn.execute("SELECT id FROM invoices ORDER BY numero_invoice, id").fetchall():
+    invoice_global, invoice_params = global_context_sql("invoice", global_context or {})
+    invoice_where = f" WHERE {invoice_global}" if invoice_global else ""
+    for row in conn.execute(
+        "SELECT i.id FROM invoices i" + invoice_where + " ORDER BY i.numero_invoice, i.id",
+        invoice_params,
+    ).fetchall():
         try:
             eligible.append(central_closing_invoice(conn, row["id"]))
         except ValueError:
@@ -9045,7 +9470,7 @@ def central_closing_page_data(conn, closing_filters=None, closing_pagination=Non
         "contrapartes": contrapartes_for_form(conn),
         "fechamentos": central_closing_headers(
             conn, closing_filters, closing_pagination,
-            closing_sort, closing_direction,
+            closing_sort, closing_direction, global_context,
         ),
         "moedas": [row[0] for row in conn.execute(
             "SELECT DISTINCT moeda FROM invoices ORDER BY moeda"
@@ -9078,7 +9503,9 @@ def gestao_fechamentos_invoices():
     _, closing_sort, closing_direction, closing_sort_links = central_closing_sorting(request.args)
     _, eligible_sort, eligible_direction, eligible_sort_links = eligible_invoice_sorting(request.args)
     try:
-        closing_total = central_closing_headers_count(conn, closing_query)
+        closing_total = central_closing_headers_count(
+            conn, closing_query, global_context=g.global_context
+        )
         closing_pagination = build_pagination(
             request.args, closing_total, page_param="fechamentos_page",
             endpoint="gestao_fechamentos_invoices",
@@ -9086,6 +9513,7 @@ def gestao_fechamentos_invoices():
         data = central_closing_page_data(
             conn, closing_query, closing_pagination,
             closing_sort, closing_direction,
+            g.global_context,
         )
     finally:
         conn.close()
@@ -9270,6 +9698,7 @@ def detalhe_fechamento_invoice(fechamento_id):
             closing_navigation = central_closing_navigation(
                 conn, fechamento_id, closing_query,
                 closing_sort, closing_direction,
+                g.global_context,
             )
     finally:
         conn.close()
@@ -9872,13 +10301,21 @@ def nova_invoice():
     competencias = competencias_for_empresa(conn, None)
     contrapartes = contrapartes_for_form(conn)
     padroes_por_empresa = configuracoes_padrao_por_empresa(conn)
+    empresa_id = form_record_id(request.form.get("empresa_id")) if request.method == "POST" else None
+    competencia_id = form_record_id(request.form.get("competencia_id")) if request.method == "POST" else None
+    if not competencia_id and empresa_id:
+        sugerida = sugerir_competencia(
+            conn, empresa_id, request.form.get("data_emissao") or date.today().isoformat()
+        )
+        competencia_id = sugerida["id"] if sugerida else None
     banco_referenciado_id = (
         form_record_id(request.form.get("banco_referenciado_id"))
         if request.method == "POST" and "banco_referenciado_id" in request.form
         else None
     )
     conn.close()
-    return render_template("invoice_form.html", invoice=None, empresas=empresas, clientes=clientes,
+    return render_template("invoice_form.html", invoice=None, empresas=empresas, empresa_id=empresa_id,
+                           competencia_id=competencia_id, clientes=clientes,
                            competencias=competencias,
                            contrapartes=contrapartes,
                            padroes_por_empresa=padroes_por_empresa,
@@ -9966,6 +10403,8 @@ def editar_invoice(invoice_id):
     competencias = competencias_for_empresa(conn, None)
     contrapartes = contrapartes_for_form(conn)
     padroes_por_empresa = configuracoes_padrao_por_empresa(conn)
+    empresa_id = current["empresa_id"]
+    competencia_id = current["competencia_id"]
     banco_referenciado_id = (
         form_record_id(request.form.get("banco_referenciado_id"))
         if request.method == "POST" and "banco_referenciado_id" in request.form
@@ -9973,7 +10412,8 @@ def editar_invoice(invoice_id):
     )
     editing_lineage = invoice_lineage(conn, invoice_id)
     conn.close()
-    return render_template("invoice_form.html", invoice=current, empresas=empresas, clientes=clientes,
+    return render_template("invoice_form.html", invoice=current, empresas=empresas, empresa_id=empresa_id,
+                           competencia_id=competencia_id, clientes=clientes,
                            competencias=competencias,
                            contrapartes=contrapartes,
                            padroes_por_empresa=padroes_por_empresa,
