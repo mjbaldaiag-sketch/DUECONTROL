@@ -6707,6 +6707,36 @@ def invoice_summary(conn, invoice_id):
         LEFT JOIN contratos c ON c.id=COALESCE(h.contrato_id, f.contrato_id)
         WHERE f.invoice_id=? ORDER BY f.data_fechamento DESC, f.id DESC
     """, (invoice_id,)).fetchall()
+    contratos_cambio = []
+    for row in cambios:
+        item = dict(row)
+        item["tipo_vinculo"] = "contrato"
+        item["fechamento_id"] = None
+        contratos_cambio.append(item)
+    for row in fechamentos:
+        if not row["contrato_id_efetivo"]:
+            continue
+        item = dict(row)
+        item.update({
+            "tipo_vinculo": "fechamento",
+            "contrato_id": row["contrato_id_efetivo"],
+            "banco_liquidacao": (
+                row["fechamento_banco_liquidacao_nome"] or row["banco_liquidacao"]
+            ),
+            "data_fechamento": (
+                row["fechamento_data_fechamento"] or row["data_fechamento"]
+            ),
+            "data_liquidacao": (
+                row["fechamento_data_liquidacao"] or row["data_liquidacao"]
+            ),
+            "taxa_cambio": (
+                row["fechamento_taxa_cambio"]
+                if row["fechamento_taxa_cambio"] is not None
+                else row["taxa_cambio"]
+            ),
+            "valor_alocado": row["valor_moeda"],
+        })
+        contratos_cambio.append(item)
     due_links = conn.execute("""
         SELECT di.*, d.numero_due, d.chave_acesso, d.moeda AS due_moeda
         FROM due_invoice di JOIN dues d ON d.id=di.due_id
@@ -6785,6 +6815,7 @@ def invoice_summary(conn, invoice_id):
         "recebimentos": recebimentos,
         "baixas": baixas,
         "cambios": cambios,
+        "contratos_cambio": contratos_cambio,
         "fechamentos": fechamentos,
         "due_links": due_links,
         "bancos_credito": sorted({row["banco_credito_nome"] for row in recebimentos if row["banco_credito_nome"]}),

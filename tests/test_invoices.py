@@ -2043,6 +2043,34 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         self.assertIn('href="/invoice/nova"', detail_html)
         self.assertIn("+ Nova invoice", detail_html)
 
+    def test_invoice_detail_shows_central_closing_in_contract_table(self):
+        invoice_id = self._create_invoice("INV-CONTRACT-CLOSING-DETAIL", "100,00")
+        closing = self._register_central_closing(
+            invoice_id,
+            "100,00",
+            "20/08/2026",
+            "25/08/2026",
+            taxa_cambio="5,1000",
+            numero_contrato="CONTRACT-DETAIL-001",
+        )
+
+        response = self.client.get(f"/invoice/{invoice_id}")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        start = html.index("<th>Contrato Câmbio</th>")
+        end = html.index("<h2>DU-Es vinculadas", start)
+        table = html[start:end]
+        contract_id = closing["contrato_id"]
+
+        self.assertIn(f'href="/contrato/{contract_id}"', table)
+        self.assertIn("CONTRACT-DETAIL-001", table)
+        self.assertIn("Banco Teste", table)
+        self.assertIn("20/08/2026", table)
+        self.assertIn("25/08/2026", table)
+        self.assertIn("5,1000", table)
+        self.assertIn("100,00", table)
+        self.assertIn(f'href="/invoices/fechamentos/{closing["id"]}"', table)
+
     def test_invoice_list_renders_batch_receipt_controls_and_banks(self):
         invoice_id = self._create_invoice("INV-BATCH-CONTROLS", "100,00")
 
