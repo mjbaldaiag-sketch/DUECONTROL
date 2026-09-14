@@ -2673,9 +2673,17 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         self.assertEqual(export.status_code, 200)
         contract_detail = self.client.get(f"/contrato/{header['contrato_id']}")
         self.assertEqual(contract_detail.status_code, 200)
-        self.assertIn(f"href=\"/invoices/fechamentos/{header['id']}\"", contract_detail.get_data(as_text=True))
+        contract_html = contract_detail.get_data(as_text=True)
+        self.assertIn(f"href=\"/invoices/fechamentos/{header['id']}\"", contract_html)
         self.assertIn("PREVISÃO EMBARQUE", contract_detail.get_data(as_text=True))
-        self.assertIn("120 dias", contract_detail.get_data(as_text=True))
+        self.assertIn(f"href=\"/invoice/{invoice_a}\">INV-CENTRAL-A</a>", contract_html)
+        self.assertIn(f"href=\"/invoice/{invoice_b}\">INV-CENTRAL-B</a>", contract_html)
+        self.assertIn("Teste", contract_html)
+        self.assertIn("Cliente Teste", contract_html)
+        self.assertIn("01/08/2026", contract_html)
+        self.assertIn("100,00", contract_html)
+        self.assertIn("50,00", contract_html)
+        self.assertIn("120 dias", contract_html)
 
         response = self.client.post(f"/invoices/fechamentos/{header['id']}/editar", data={
             "data_fechamento": "2026-08-22", "data_liquidacao": "2026-08-26", "taxa_cambio": "5,2000",

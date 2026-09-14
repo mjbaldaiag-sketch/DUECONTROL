@@ -5270,6 +5270,11 @@ def carregar_detalhe_contrato(conn, contrato_id):
            OR h.contrato_id=?
         ORDER BY f.data_fechamento DESC, f.id DESC
     """, (contrato_id, contrato_id)).fetchall()
+    invoice_links = [dict(row) for row in invoice_links]
+    for row in fechamentos:
+        item = dict(row)
+        item["valor_alocado"] = row["valor_moeda"]
+        invoice_links.append(item)
     pending_params = [contrato["moeda"]]
     pending_client_clause = ""
     if contrato["cliente_id"]:
