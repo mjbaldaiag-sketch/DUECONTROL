@@ -706,6 +706,46 @@
     input.addEventListener('change', () => formatRate(input));
   });
 
+  const contractDueDialog = document.querySelector('[data-contract-due-dialog]');
+  const contractDueOpen = document.querySelector('[data-contract-due-open]');
+  if (contractDueDialog && contractDueOpen) {
+    const contractDueSelect = contractDueDialog.querySelector('[data-contract-due-select]');
+    const contractDueBalance = contractDueDialog.querySelector('[data-contract-due-balance]');
+    const contractDueValue = contractDueDialog.querySelector('[name="valor_vinculado"]');
+    const contractDueCancel = contractDueDialog.querySelector('[data-contract-due-cancel]');
+    const display = (value) => new Intl.NumberFormat('pt-BR', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(Number(value || 0));
+    const close = () => {
+      if (typeof contractDueDialog.close === 'function') contractDueDialog.close();
+      else contractDueDialog.removeAttribute('open');
+    };
+    const updateBalance = () => {
+      const option = contractDueSelect.selectedOptions[0];
+      if (!option || !option.value) {
+        contractDueBalance.textContent = 'Selecione uma DU-E para consultar o saldo disponível.';
+        contractDueValue.removeAttribute('max');
+        return;
+      }
+      const saldo = Number(option.dataset.saldo || 0);
+      contractDueBalance.textContent = `Saldo disponível: ${display(saldo)} ${option.dataset.moeda || ''}`;
+      contractDueValue.max = option.dataset.saldo;
+    };
+    contractDueOpen.addEventListener('click', () => {
+      if (typeof contractDueDialog.showModal === 'function') contractDueDialog.showModal();
+      else contractDueDialog.setAttribute('open', '');
+      updateBalance();
+      contractDueSelect.focus();
+    });
+    contractDueSelect.addEventListener('change', updateBalance);
+    if (contractDueCancel) contractDueCancel.addEventListener('click', close);
+    contractDueDialog.addEventListener('cancel', (event) => {
+      event.preventDefault();
+      close();
+    });
+  }
+
   const bancoCredito = document.querySelector('[data-banco-credito]');
   const bancoLiquidacao = document.querySelector('[data-banco-liquidacao]');
   if (bancoCredito && bancoLiquidacao) {

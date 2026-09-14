@@ -4563,7 +4563,97 @@ def cadastro_contrapartes():
     """, (pagination["per_page"], pagination["offset"])).fetchall()
     conn.close()
     return render_template("contrapartes.html", contrapartes=contrapartes, nome=nome,
-                           pagination=pagination)
+                           contraparte_em_edicao=None, pagination=pagination)
+
+
+@app.route("/configuracoes/contrapartes/<int:contraparte_id>/editar", methods=["GET", "POST"])
+def editar_contraparte(contraparte_id):
+    conn = db()
+    contraparte = conn.execute(
+        "SELECT id, nome FROM contrapartes WHERE id=?", (contraparte_id,)
+    ).fetchone()
+    if not contraparte:
+        conn.close()
+        return "Banco / Contraparte não encontrado", 404
+
+    nome = (request.form.get("nome") or "").strip() if request.method == "POST" else contraparte["nome"]
+    if request.method == "POST":
+        try:
+            if not nome:
+                raise ValueError("O nome do Banco / Contraparte é obrigatório.")
+            conn.execute("BEGIN IMMEDIATE")
+            duplicate = conn.execute(
+                "SELECT 1 FROM contrapartes WHERE nome=? COLLATE NOCASE AND id<>?",
+                (nome, contraparte_id),
+            ).fetchone()
+            if duplicate:
+                raise ValueError("Já existe um Banco / Contraparte cadastrado com este nome.")
+
+            old_name = contraparte["nome"]
+            conn.execute("UPDATE contrapartes SET nome=? WHERE id=?", (nome, contraparte_id))
+
+            # Contratos legados mantêm os nomes bancários como texto além dos IDs.
+            # Atualize apenas os tokens que representam esta contraparte para não
+            # deixar a tela de Contratos divergente da configuração central.
+            contrato_rows = conn.execute(
+                "SELECT id, banco, banco_credito, banco_liquidacao FROM contratos"
+            ).fetchall()
+            for contrato in contrato_rows:
+                updates = {}
+                for field in ("banco", "banco_credito", "banco_liquidacao"):
+                    value = contrato[field]
+                    if not value:
+                        continue
+                    parts = str(value).split(",")
+                    changed = False
+                    normalized_parts = []
+                    for part in parts:
+                        stripped = part.strip()
+                        if stripped.casefold() == old_name.casefold():
+                            normalized_parts.append(nome)
+                            changed = True
+                        else:
+                            normalized_parts.append(stripped)
+                    if changed:
+                        updates[field] = ", ".join(normalized_parts)
+                if updates:
+                    assignments = ", ".join(f"{field}=?" for field in updates)
+                    conn.execute(
+                        f"UPDATE contratos SET {assignments} WHERE id=?",
+                        (*updates.values(), contrato["id"]),
+                    )
+
+            conn.execute(
+                "UPDATE ndfs SET contraparte=? WHERE contraparte=? COLLATE NOCASE",
+                (nome, old_name),
+            )
+            conn.commit()
+            conn.close()
+            flash("Banco / Contraparte atualizado com sucesso.", "success")
+            return redirect(url_for("cadastro_contrapartes"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe um Banco / Contraparte cadastrado com este nome.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+        except sqlite3.Error:
+            conn.rollback()
+            flash("Não foi possível atualizar o Banco / Contraparte.", "danger")
+
+    contrapartes_total = conn.execute("SELECT COUNT(*) FROM contrapartes").fetchone()[0]
+    pagination = build_pagination(request.args, contrapartes_total, endpoint="cadastro_contrapartes")
+    contrapartes = conn.execute("""
+        SELECT id, nome
+        FROM contrapartes
+        ORDER BY nome, id
+        LIMIT ? OFFSET ?
+    """, (pagination["per_page"], pagination["offset"])).fetchall()
+    conn.close()
+    return render_template(
+        "contrapartes.html", contrapartes=contrapartes, nome=nome,
+        contraparte_em_edicao=contraparte, pagination=pagination,
+    )
 
 def competencias_sorting(args):
     fields = {
@@ -4731,6 +4821,18 @@ def novo_contrato():
                            clientes=clientes, cliente_id=cliente_id,
                            competencias=competencias, competencia_id=competencia_id)
 
+def dues_disponiveis_para_vinculo(conn):
+    rows = conn.execute(f"""
+        SELECT d.*, COALESCE(SUM({movement_effect_sql()}), 0) AS utilizado
+        FROM dues d
+        LEFT JOIN due_movimentacoes m ON m.due_id=d.id
+        GROUP BY d.id
+        HAVING d.valor_original-COALESCE(SUM({movement_effect_sql()}), 0)>?
+        ORDER BY d.numero_due
+    """, (float(SALDO_TOLERANCE),)).fetchall()
+    return [decorate_due(row) for row in rows]
+
+
 def carregar_detalhe_contrato(conn, contrato_id):
     contrato = conn.execute("""
         SELECT c.*, cl.pais AS cliente_pais,
@@ -4814,13 +4916,15 @@ def carregar_detalhe_contrato(conn, contrato_id):
 def detalhe_contrato(contrato_id):
     conn = db()
     dados = carregar_detalhe_contrato(conn, contrato_id)
+    dues_disponiveis = dues_disponiveis_para_vinculo(conn) if dados else []
     conn.close()
     if not dados:
         return "Contrato Câmbio não encontrado", 404
     contrato, vinculos, summary, fechamentos_pendentes = dados
     return render_template("contrato_detalhe.html", contrato=contrato, vinculos=vinculos,
                            vinculado=summary["vinculado"], saldo=summary["saldo"],
-                           fechamentos_pendentes=fechamentos_pendentes)
+                           fechamentos_pendentes=fechamentos_pendentes,
+                           dues_disponiveis=dues_disponiveis)
 
 @app.route("/contrato/<int:contrato_id>/relatorio")
 def relatorio_contrato(contrato_id):
@@ -5461,55 +5565,63 @@ def movimentacao(due_id):
         flash(str(exc), "danger")
     return redirect(url_for("due_detalhe", due_id=due_id))
 
+def registrar_vinculo_due(conn, due_id, contrato_id, form):
+    due=conn.execute("SELECT valor_original FROM dues WHERE id=?",(due_id,)).fetchone()
+    if not due:
+        raise ValueError("DU-E não encontrada.")
+    contrato=contract_summary(conn, contrato_id)
+    if not contrato:
+        raise ValueError("Contrato Câmbio não encontrado.")
+    if contrato["categoria_cambio"] == CATEGORIA_CAMBIO_FINANCEIRO:
+        raise ValueError("Contratos de Câmbio Financeiro não podem receber vínculos DU-E.")
+    if contrato["saldo_zerado_manual"]:
+        raise ValueError("O Contrato Câmbio foi zerado manualmente e não pode receber vínculos.")
+    if contrato["status"] not in {STATUS_PENDENTE, STATUS_PARCIAL}:
+        raise ValueError("O Contrato Câmbio selecionado não possui saldo disponível.")
+    valor=Decimal(str(parse_number(form.get("valor_vinculado"))))
+    if valor<=0:
+        raise ValueError("O valor do vínculo deve ser maior que zero.")
+    saldo_due=due_balance(due["valor_original"], due_effect(conn, due_id))
+    saldo_contrato=contract_balance(contrato["valor_moeda"], contrato["vinculado"])
+    if saldo_due <= 0:
+        raise ValueError("A DU-E não possui saldo disponível.")
+    if saldo_contrato <= 0:
+        raise ValueError("O Contrato Câmbio não possui saldo disponível.")
+    if valor>saldo_due:
+        raise ValueError(f"Valor maior que o saldo disponível da DU-E ({money(saldo_due)}).")
+    if valor>saldo_contrato:
+        raise ValueError(f"Valor maior que o saldo disponível do Contrato Câmbio ({money(saldo_contrato)}).")
+    link=conn.execute("SELECT id,valor_vinculado FROM due_contratos WHERE due_id=? AND contrato_id=?",
+                      (due_id,contrato_id)).fetchone()
+    if link:
+        due_contrato_id=link["id"]
+        conn.execute("UPDATE due_contratos SET valor_vinculado=valor_vinculado+?,observacao=? WHERE id=?",
+                     (float(valor),form.get("observacao"),due_contrato_id))
+    else:
+        conn.execute("""INSERT INTO due_contratos(due_id,contrato_id,valor_vinculado,observacao)
+                        VALUES (?,?,?,?)""",(due_id,contrato_id,float(valor),form.get("observacao")))
+        due_contrato_id=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("""INSERT INTO due_movimentacoes
+        (due_id,contrato_id,due_contrato_id,data_movimentacao,tipo,documento,valor,observacao)
+        VALUES (?,?,?,?,?,?,?,?)""",(due_id,contrato_id,due_contrato_id,date.today().isoformat(),
+                                      "VINCULACAO",f"CONTRATO:{contrato['numero_contrato']}",float(valor),form.get("observacao")))
+    recalculate_statuses(conn, due_ids=[due_id], contrato_ids=[contrato_id])
+
+
+def processar_vinculo_due(conn, due_id, contrato_id, form):
+    conn.execute("BEGIN IMMEDIATE")
+    registrar_vinculo_due(conn, due_id, contrato_id, form)
+    conn.commit()
+
+
 @app.route("/due/<int:due_id>/vincular", methods=["POST"])
 def vincular(due_id):
     f=request.form
     conn=None
-    conn=db()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        due=conn.execute("SELECT valor_original FROM dues WHERE id=?",(due_id,)).fetchone()
-        if not due:
-            raise ValueError("DU-E não encontrada.")
-        contrato_id=int(f["contrato_id"])
-        contrato=contract_summary(conn, contrato_id)
-        if not contrato:
-            raise ValueError("Contrato Câmbio não encontrado.")
-        if contrato["categoria_cambio"] == CATEGORIA_CAMBIO_FINANCEIRO:
-            raise ValueError("Contratos de Câmbio Financeiro não podem receber vínculos DU-E.")
-        if contrato["saldo_zerado_manual"]:
-            raise ValueError("O Contrato Câmbio foi zerado manualmente e não pode receber vínculos.")
-        if contrato["status"] not in {STATUS_PENDENTE, STATUS_PARCIAL}:
-            raise ValueError("O Contrato Câmbio selecionado não possui saldo disponível.")
-        valor=Decimal(str(parse_number(f.get("valor_vinculado"))))
-        if valor<=0:
-            raise ValueError("O valor do vínculo deve ser maior que zero.")
-        saldo_due=due_balance(due["valor_original"], due_effect(conn, due_id))
-        saldo_contrato=contract_balance(contrato["valor_moeda"], contrato["vinculado"])
-        if saldo_due <= 0:
-            raise ValueError("A DU-E não possui saldo disponível.")
-        if saldo_contrato <= 0:
-            raise ValueError("O Contrato Câmbio não possui saldo disponível.")
-        if valor>saldo_due:
-            raise ValueError(f"Valor maior que o saldo disponível da DU-E ({money(saldo_due)}).")
-        if valor>saldo_contrato:
-            raise ValueError(f"Valor maior que o saldo disponível do Contrato Câmbio ({money(saldo_contrato)}).")
-        link=conn.execute("SELECT id,valor_vinculado FROM due_contratos WHERE due_id=? AND contrato_id=?",
-                          (due_id,contrato_id)).fetchone()
-        if link:
-            due_contrato_id=link["id"]
-            conn.execute("UPDATE due_contratos SET valor_vinculado=valor_vinculado+?,observacao=? WHERE id=?",
-                         (float(valor),f.get("observacao"),due_contrato_id))
-        else:
-            conn.execute("""INSERT INTO due_contratos(due_id,contrato_id,valor_vinculado,observacao)
-                            VALUES (?,?,?,?)""",(due_id,contrato_id,float(valor),f.get("observacao")))
-            due_contrato_id=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute("""INSERT INTO due_movimentacoes
-            (due_id,contrato_id,due_contrato_id,data_movimentacao,tipo,documento,valor,observacao)
-            VALUES (?,?,?,?,?,?,?,?)""",(due_id,contrato_id,due_contrato_id,date.today().isoformat(),
-                                          "VINCULACAO",f"CONTRATO:{contrato['numero_contrato']}",float(valor),f.get("observacao")))
-        recalculate_statuses(conn, due_ids=[due_id], contrato_ids=[contrato_id])
-        conn.commit(); flash("Contrato Câmbio vinculado e movimentação registrada com sucesso.", "success")
+        conn=db()
+        processar_vinculo_due(conn, due_id, int(f["contrato_id"]), f)
+        flash("Contrato Câmbio vinculado e movimentação registrada com sucesso.", "success")
     except sqlite3.IntegrityError:
         if conn: conn.rollback()
         flash("Esse Contrato Câmbio já está vinculado a esta DU-E.", "danger")
@@ -5519,6 +5631,30 @@ def vincular(due_id):
     finally:
         if conn: conn.close()
     return redirect(url_for("due_detalhe", due_id=due_id))
+
+
+@app.route("/contrato/<int:contrato_id>/due", methods=["POST"])
+def vincular_due_contrato(contrato_id):
+    f=request.form
+    conn=None
+    try:
+        due_id=int(f["due_id"])
+    except (KeyError, TypeError, ValueError):
+        flash("Selecione uma DU-E e informe um valor válido para o vínculo.", "danger")
+        return redirect(url_for("detalhe_contrato", contrato_id=contrato_id))
+    try:
+        conn=db()
+        processar_vinculo_due(conn, due_id, contrato_id, f)
+        flash("Contrato Câmbio vinculado e movimentação registrada com sucesso.", "success")
+    except sqlite3.IntegrityError:
+        if conn: conn.rollback()
+        flash("Esse Contrato Câmbio já está vinculado a esta DU-E.", "danger")
+    except ValueError as exc:
+        if conn: conn.rollback()
+        flash(str(exc), "danger")
+    finally:
+        if conn: conn.close()
+    return redirect(url_for("detalhe_contrato", contrato_id=contrato_id))
 
 @app.route("/due/<int:due_id>/movimentacao/<int:mov_id>/excluir", methods=["POST"])
 def excluir_movimentacao(due_id, mov_id):
@@ -6966,10 +7102,12 @@ def sync_contract_cache(conn, contrato_id):
             LEFT JOIN clientes cl ON cl.id=i.cliente_id
             WHERE f.contrato_id=? AND f.fechamento_id IS NULL
             UNION ALL
-            SELECT f.invoice_id, f.valor_moeda AS valor, h.moeda, NULL AS empresa_id,
-                   h.cliente_id, NULL AS cnpj, cl.nome AS cliente, NULL AS data_emissao
+            SELECT f.invoice_id, f.valor_moeda AS valor, h.moeda, i.empresa_id,
+                   h.cliente_id, e.cnpj, cl.nome AS cliente, i.data_emissao
             FROM fechamentos_cambio f
             JOIN fechamentos h ON h.id=f.fechamento_id AND h.contrato_id=?
+            JOIN invoices i ON i.id=f.invoice_id
+            LEFT JOIN empresas e ON e.id=i.empresa_id
             LEFT JOIN clientes cl ON cl.id=h.cliente_id
         ) x
     """, (contrato_id, contrato_id, contrato_id)).fetchone()
@@ -7886,7 +8024,9 @@ def central_closing_headers(conn, filters=None, pagination=None, sort=None, dire
         LEFT JOIN contratos c ON c.id=h.contrato_id
         LEFT JOIN fechamentos_cambio f ON f.fechamento_id=h.id
         LEFT JOIN invoices i ON i.id=f.invoice_id
-        LEFT JOIN empresas e ON e.id=i.empresa_id
+        LEFT JOIN empresas ec
+               ON REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(c.cnpj,''),'.',''),'/',''),'-',''),' ','')=ec.cnpj
+        LEFT JOIN empresas e ON e.id=COALESCE(ec.id, i.empresa_id)
         {where}
         GROUP BY h.id
         ORDER BY {central_closing_order_sql(sort, direction)}{limit_clause}
@@ -7908,7 +8048,9 @@ def central_closing_navigation(conn, fechamento_id, filters=None, sort=None, dir
             LEFT JOIN contratos c ON c.id=h.contrato_id
             LEFT JOIN fechamentos_cambio f ON f.fechamento_id=h.id
             LEFT JOIN invoices i ON i.id=f.invoice_id
-            LEFT JOIN empresas e ON e.id=i.empresa_id
+            LEFT JOIN empresas ec
+                   ON REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(c.cnpj,''),'.',''),'/',''),'-',''),' ','')=ec.cnpj
+            LEFT JOIN empresas e ON e.id=COALESCE(ec.id, i.empresa_id)
             {where}
             GROUP BY h.id
         )
@@ -7933,7 +8075,9 @@ def central_closing_headers_count(conn, filters=None):
         LEFT JOIN contratos c ON c.id=h.contrato_id
         LEFT JOIN fechamentos_cambio f ON f.fechamento_id=h.id
         LEFT JOIN invoices i ON i.id=f.invoice_id
-        LEFT JOIN empresas e ON e.id=i.empresa_id
+        LEFT JOIN empresas ec
+               ON REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(c.cnpj,''),'.',''),'/',''),'-',''),' ','')=ec.cnpj
+        LEFT JOIN empresas e ON e.id=COALESCE(ec.id, i.empresa_id)
         {where}
     """, params).fetchone()[0]
 
@@ -7945,15 +8089,18 @@ def central_closing_report_items(conn, filters=None):
                COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social) AS empresa_nome,
                cl.nome AS cliente_nome, bc.nome AS banco_credito_nome,
                e.id AS empresa_id, e.prioridade AS empresa_prioridade,
-               c.numero_contrato, f.moeda, f.valor_moeda, h.taxa_cambio,
+               c.numero_contrato, COALESCE(f.moeda, h.moeda) AS moeda,
+               COALESCE(f.valor_moeda, 0) AS valor_moeda, h.taxa_cambio,
                h.valor_brl AS fechamento_valor_brl
         FROM fechamentos h
         JOIN clientes cl ON cl.id=h.cliente_id
         JOIN contrapartes bc ON bc.id=h.banco_credito_id
-        JOIN fechamentos_cambio f ON f.fechamento_id=h.id
-        JOIN invoices i ON i.id=f.invoice_id
-        JOIN empresas e ON e.id=i.empresa_id
         LEFT JOIN contratos c ON c.id=h.contrato_id
+        LEFT JOIN fechamentos_cambio f ON f.fechamento_id=h.id
+        LEFT JOIN invoices i ON i.id=f.invoice_id
+        LEFT JOIN empresas ec
+               ON REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(c.cnpj,''),'.',''),'/',''),'-',''),' ','')=ec.cnpj
+        LEFT JOIN empresas e ON e.id=COALESCE(ec.id, i.empresa_id)
         {where}
         ORDER BY CASE WHEN e.prioridade IS NULL THEN 1 ELSE 0 END,
                  e.prioridade, h.valor_brl DESC, e.id,
@@ -8141,12 +8288,19 @@ def central_closing_detail(conn, fechamento_id):
     header = conn.execute("""
         SELECT h.*, cl.nome AS cliente_nome,
                bc.nome AS banco_credito_nome, bl.nome AS banco_liquidacao_nome,
-               c.numero_contrato, c.status AS contrato_status
+               c.numero_contrato, c.status AS contrato_status,
+               e.id AS empresa_id, e.apelido AS empresa_apelido,
+               e.razao_social AS empresa_razao_social
         FROM fechamentos h
         JOIN clientes cl ON cl.id=h.cliente_id
         JOIN contrapartes bc ON bc.id=h.banco_credito_id
         JOIN contrapartes bl ON bl.id=h.banco_liquidacao_id
         LEFT JOIN contratos c ON c.id=h.contrato_id
+        LEFT JOIN empresas ec
+               ON REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(c.cnpj,''),'.',''),'/',''),'-',''),' ','')=ec.cnpj
+        LEFT JOIN fechamentos_cambio f ON f.fechamento_id=h.id
+        LEFT JOIN invoices i ON i.id=f.invoice_id
+        LEFT JOIN empresas e ON e.id=COALESCE(ec.id, i.empresa_id)
         WHERE h.id=?
     """, (fechamento_id,)).fetchone()
     if not header:
