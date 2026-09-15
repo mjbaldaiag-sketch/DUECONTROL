@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Relatório de Fechamentos</title>
+  <title></title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
@@ -14,7 +14,7 @@
   </div>
 
   <div class="report-title">
-    <h1>Relatório de Fechamentos</h1>
+    <h1>Relatório de fechamentos</h1>
     <p class="muted">{{ total_registros }} fechamento(s) filtrados.</p>
   </div>
 
@@ -25,13 +25,14 @@
           <th>Empresa / apelido</th>
           <th>Contrato</th>
           <th class="closing-report-invoices">Invoices</th>
-          <th>Categoria Câmbio</th>
+          <th>Categoria câmbio</th>
           <th>Cliente</th>
           <th>Banco de crédito</th>
           <th>Banco de liquidação</th>
           <th>Data de fechamento</th>
           <th>Data de liquidação</th>
-          <th>Valor original</th>
+          <th class="closing-report-currency">Moeda</th>
+          <th>Valor moeda</th>
           <th>Taxa</th>
           <th>Valor em BRL</th>
         </tr>
@@ -49,17 +50,18 @@
           <td>{{ fechamento.banco_liquidacao_nome or '-' }}</td>
           <td>{{ fechamento.data_fechamento|date_br or '-' }}</td>
           <td>{{ fechamento.data_liquidacao|date_br or '-' }}</td>
+          <td class="closing-report-currency">{{ fechamento.moeda|upper if fechamento.moeda else '-' }}</td>
           <td class="report-number">{{ fechamento.valor_moeda|money }}</td>
           <td>{{ fechamento.taxa_cambio|rate if fechamento.taxa_cambio is not none else '-' }}</td>
           <td class="report-number">{{ fechamento.valor_brl|money if fechamento.valor_brl is not none else '-' }}</td>
         </tr>
       {% else %}
-        <tr><td class="empty" colspan="12">Nenhum Fechamento encontrado para os filtros informados.</td></tr>
+        <tr><td class="empty" colspan="13">Nenhum Fechamento encontrado para os filtros informados.</td></tr>
       {% endfor %}
       </tbody>
       <tfoot>
         <tr class="closing-report-total-row">
-          <td colspan="9"></td>
+          <td colspan="10"></td>
           <td class="report-number">{% for total in totais_moeda %}{{ total.valor|money }}{% if not loop.last %} / {% endif %}{% else %}0,00{% endfor %}</td>
           <td></td>
           <th class="report-number">{{ total_brl|money }}</th>
@@ -144,41 +146,75 @@
 <script>
 (() => {
   const MEASURE_CLASS = 'closing-report-print-measure';
+  const FALLBACK_CLASS = 'closing-report-fallback-counters';
   const COUNTERS_CLASS = 'closing-report-page-counters';
-  const PAGE_HEIGHT_PX = (210 / 25.4 * 96) - (16 / 25.4 * 96);
+  const PAGE_HEIGHT_MM = 210;
+  const PAGE_MARGIN_MM = 12;
+  const PAGE_CONTENT_HEIGHT_MM = PAGE_HEIGHT_MM - (PAGE_MARGIN_MM * 2);
 
   const clearPageCounters = () => {
     document.querySelectorAll(`.${COUNTERS_CLASS}`).forEach((element) => element.remove());
-    document.body.classList.remove(MEASURE_CLASS);
+    document.body.classList.remove(MEASURE_CLASS, FALLBACK_CLASS);
+  };
+
+  const millimetersToPixels = (millimeters) => {
+    const probe = document.createElement('div');
+    probe.style.cssText = `position:absolute;visibility:hidden;width:${millimeters}mm;height:0`;
+    document.body.appendChild(probe);
+    const pixels = probe.getBoundingClientRect().width;
+    probe.remove();
+    return pixels;
+  };
+
+  const supportsNativePageCounters = () => {
+    if (typeof CSSRule === 'undefined' || typeof CSSRule.PAGE_RULE !== 'number') return false;
+    for (const sheet of Array.from(document.styleSheets)) {
+      let rules;
+      try {
+        rules = Array.from(sheet.cssRules || []);
+      } catch (error) {
+        continue;
+      }
+      const pageRule = rules.find((rule) =>
+        rule.type === CSSRule.PAGE_RULE && rule.selectorText === 'closing-report'
+      );
+      if (!pageRule) continue;
+      return Array.from(pageRule.cssRules || []).some((rule) =>
+        rule.name === '@bottom-right' || rule.cssText.startsWith('@bottom-right')
+      );
+    }
+    return false;
   };
 
   const preparePageCounters = () => {
-    const report = document.querySelector('.closing-report');
     const mainSection = document.querySelector('.closing-report-main-section');
     const summaryPage = document.querySelector('.closing-report-summary-page');
-    if (!report || !mainSection || !summaryPage || document.body.classList.contains(MEASURE_CLASS)) return;
+    if (!mainSection || !summaryPage || supportsNativePageCounters()) return;
+    if (document.body.classList.contains(FALLBACK_CLASS)) return;
 
-    document.body.classList.add(MEASURE_CLASS);
+    document.body.classList.add(MEASURE_CLASS, FALLBACK_CLASS);
+    const pageHeightPx = millimetersToPixels(PAGE_CONTENT_HEIGHT_MM);
     const mainPages = Math.max(
       1,
-      Math.ceil(mainSection.getBoundingClientRect().bottom / PAGE_HEIGHT_PX),
+      Math.ceil(mainSection.getBoundingClientRect().bottom / pageHeightPx),
     );
     const summaryPages = Math.max(
       1,
-      Math.ceil(summaryPage.getBoundingClientRect().height / PAGE_HEIGHT_PX),
+      Math.ceil(summaryPage.getBoundingClientRect().height / pageHeightPx),
     );
     const totalPages = mainPages + summaryPages;
     const layer = document.createElement('div');
     layer.className = COUNTERS_CLASS;
     layer.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(layer);
+    const footerGapPx = millimetersToPixels(3);
     for (let page = 1; page <= totalPages; page += 1) {
       const counter = document.createElement('span');
       counter.className = 'closing-report-page-counter';
       counter.textContent = `${page}/${totalPages}`;
-      counter.style.top = `${(page - 1) * PAGE_HEIGHT_PX + 4}px`;
       layer.appendChild(counter);
+      counter.style.top = `${(page - 1) * pageHeightPx + pageHeightPx - counter.offsetHeight - footerGapPx}px`;
     }
-    document.body.appendChild(layer);
   };
 
   window.printClosingReport = () => {
