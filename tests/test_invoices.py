@@ -2807,6 +2807,101 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         self.assertIn("445.179,31", report_html)
         self.assertNotIn("445.179,32", report_html)
 
+    def test_closing_report_lists_all_contract_invoices_linearly_and_deduplicated(self):
+        central_ids = [
+            self._create_invoice("001", "100,00"),
+            self._create_invoice("003", "100,00"),
+            self._create_invoice("002", "100,00"),
+        ]
+        for invoice_id in central_ids:
+            response = self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+                "banco_credito_id": "1", "data_credito": "01/08/2026",
+                "valor_moeda": "100,00",
+            })
+            self.assertEqual(response.status_code, 302)
+
+        response = self.client.post("/invoices/fechamentos", data={
+            "selected_ids": [str(invoice_id) for invoice_id in central_ids],
+            "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
+            "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120", "numero_contrato_0": "CONTRACT-001",
+        })
+        self.assertEqual(response.status_code, 302)
+
+        direct_invoice_id = self._create_invoice("004", "100,00")
+        legacy_invoice_id = self._create_invoice("005", "100,00")
+        conn = app.db()
+        header = conn.execute(
+            "SELECT id, contrato_id FROM fechamentos ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO invoice_contrato_cambio(invoice_id,contrato_id,valor_alocado) "
+            "VALUES (?,?,?)", (central_ids[0], header["contrato_id"], 100)
+        )
+        conn.execute(
+            "INSERT INTO invoice_contrato_cambio(invoice_id,contrato_id,valor_alocado) "
+            "VALUES (?,?,?)", (direct_invoice_id, header["contrato_id"], 100)
+        )
+        conn.execute(
+            "INSERT INTO fechamentos_cambio "
+            "(invoice_id,contrato_id,moeda,valor_moeda,data_fechamento,observacao) "
+            "VALUES (?,?,?,?,?,?)",
+            (legacy_invoice_id, header["contrato_id"], "USD", 100, "2026-08-21", "Legado"),
+        )
+        conn.commit()
+        conn.close()
+
+        report = self.client.get("/invoices/fechamentos/relatorio")
+        self.assertEqual(report.status_code, 200)
+        html = report.get_data(as_text=True)
+        main_section = html.split(
+            '<section class="report-section closing-report-main-section">', 1
+        )[1].split("</section>", 1)[0]
+        self.assertIn('<th class="closing-report-invoices">Invoices</th>', main_section)
+        self.assertIn(
+            '<td class="closing-report-invoices"><strong>001</strong> ; '
+            '<strong>002</strong> ; <strong>003</strong> ; '
+            '<strong>004</strong><br><strong>005</strong></td>',
+            main_section,
+        )
+        self.assertLess(main_section.index("Contrato"), main_section.index("Invoices"))
+        self.assertLess(main_section.index("Invoices"), main_section.index("Categoria Câmbio"))
+        self.assertIn("<br>", main_section)
+        self.assertIn('<td colspan="9"></td>', html)
+        self.assertNotIn("CÃ¢mbio", html)
+        self.assertNotIn("�", html)
+
+    def test_closing_report_lists_invoices_for_pending_group(self):
+        invoice_ids = [
+            self._create_invoice("PENDING-002", "100,00"),
+            self._create_invoice("PENDING-001", "100,00"),
+        ]
+        for invoice_id in invoice_ids:
+            response = self.client.post(f"/invoice/{invoice_id}/recebimentos", data={
+                "banco_credito_id": "1", "data_credito": "01/08/2026",
+                "valor_moeda": "100,00",
+            })
+            self.assertEqual(response.status_code, 302)
+
+        response = self.client.post("/invoices/fechamentos", data={
+            "selected_ids": [str(invoice_id) for invoice_id in invoice_ids],
+            "data_fechamento": "2026-08-21", "data_liquidacao": "2026-08-25",
+            "taxa_cambio": "5,0000", "banco_liquidacao_id": "1",
+            "categoria_cambio": app.CATEGORIA_CAMBIO_EXPORTACAO,
+            "previsao_embarque_dias": "120",
+        })
+        self.assertEqual(response.status_code, 302)
+
+        report = self.client.get("/invoices/fechamentos/relatorio")
+        self.assertEqual(report.status_code, 200)
+        html = report.get_data(as_text=True)
+        self.assertIn(
+            '<td class="closing-report-invoices"><strong>PENDING-001</strong> ; '
+            '<strong>PENDING-002</strong></td>',
+            html,
+        )
+
     def test_export_prediction_uses_unanimous_company_default_and_rejects_conflict(self):
         conn = app.db()
         conn.execute(

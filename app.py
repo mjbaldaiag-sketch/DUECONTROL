@@ -5518,40 +5518,49 @@ def saldo_contrato(contrato_id):
                     "status": contrato["status"],
                     "categoria_cambio": contrato["categoria_cambio"]})
 
-@app.route("/dues")
-def consulta_dues():
-    filters = {key: value for key, value in request.args.items()
-               if key not in {"sort", "direction", "page"} and value}
+def dues_filter_parts(args):
+    """Monta os predicados compartilhados pela listagem e pela exportação de DU-Es."""
     where, params = [], []
     global_clause, global_params = global_context_sql("due", g.global_context)
     if global_clause:
         where.append(global_clause)
         params.extend(global_params)
-    if request.args.get("numero_due"):
-        where.append("d.numero_due LIKE ?"); params.append(f"%{request.args['numero_due'].strip()}%")
-    if request.args.get("chave_acesso"):
-        where.append("d.chave_acesso LIKE ?"); params.append(f"%{request.args['chave_acesso'].strip().upper()}%")
-    if request.args.get("cliente"):
-        where.append("d.cliente LIKE ?"); params.append(f"%{request.args['cliente'].strip()}%")
-    if request.args.get("cnpj"):
-        where.append("d.cnpj LIKE ?"); params.append(f"%{request.args['cnpj'].strip()}%")
-    if request.args.get("moeda"):
-        where.append("d.moeda = ?"); params.append(request.args["moeda"].strip().upper())
-    if request.args.get("status"):
-        where.append("d.status = ?"); params.append(request.args["status"].strip().upper())
+    if args.get("numero_due"):
+        where.append("d.numero_due LIKE ?")
+        params.append(f"%{args['numero_due'].strip()}%")
+    if args.get("chave_acesso"):
+        where.append("d.chave_acesso LIKE ?")
+        params.append(f"%{args['chave_acesso'].strip().upper()}%")
+    if args.get("cliente"):
+        where.append("d.cliente LIKE ?")
+        params.append(f"%{args['cliente'].strip()}%")
+    if args.get("cnpj"):
+        where.append("d.cnpj LIKE ?")
+        params.append(f"%{args['cnpj'].strip()}%")
+    if args.get("moeda"):
+        where.append("d.moeda = ?")
+        params.append(args["moeda"].strip().upper())
+    if args.get("status"):
+        where.append("d.status = ?")
+        params.append(args["status"].strip().upper())
     for key, operator in (("data_de", ">="), ("data_ate", "<=")):
-        if request.args.get(key):
+        if args.get(key):
             try:
-                where.append(f"date(d.created_at) {operator} ?"); params.append(parse_date(request.args[key]))
+                where.append(f"date(d.created_at) {operator} ?")
+                params.append(parse_date(args[key]))
             except ValueError as exc:
                 flash(str(exc), "danger")
     for key, operator in (("valor_min", ">="), ("valor_max", "<=")):
-        if request.args.get(key):
+        if args.get(key):
             try:
-                where.append(f"d.valor_original {operator} ?"); params.append(parse_number(request.args[key]))
+                where.append(f"d.valor_original {operator} ?")
+                params.append(parse_number(args[key]))
             except ValueError as exc:
                 flash(str(exc), "danger")
+    return where, params
 
+
+def dues_sorting(args):
     sort_fields = {
         "chave_acesso": ("d.chave_acesso", "text"),
         "numero_due": ("d.numero_due", "text"),
@@ -5562,8 +5571,17 @@ def consulta_dues():
         "status": ("d.status", "text"),
     }
     sort, direction, sort_links = build_sorting(
-        request.args, sort_fields, default_sort="data_due", default_direction="DESC"
+        args, sort_fields, default_sort="data_due", default_direction="DESC"
     )
+    return sort_fields, sort, direction, sort_links
+
+
+@app.route("/dues")
+def consulta_dues():
+    filters = {key: value for key, value in request.args.items()
+               if key not in {"sort", "direction", "page"} and value}
+    where, params = dues_filter_parts(request.args)
+    sort_fields, sort, direction, sort_links = dues_sorting(request.args)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     conn = db()
     total = conn.execute(f"SELECT COUNT(*) FROM dues d{clause}", params).fetchone()[0]
@@ -5581,6 +5599,187 @@ def consulta_dues():
                            filters=filters, moedas=moedas, sort=sort, direction=direction,
                            sort_links=sort_links, pagination=pagination,
                            status_concluido=STATUS_CONCLUIDO, status_parcial=STATUS_PARCIAL)
+
+
+@app.route("/dues/exportar")
+def exportar_dues():
+    import pandas as pd
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    where, params = dues_filter_parts(request.args)
+    sort_fields, sort, direction, _ = dues_sorting(request.args)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    order = f"{sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, d.id {direction}"
+
+    conn = db()
+    try:
+        due_rows = conn.execute(f"""
+            SELECT d.*, COALESCE(SUM(
+                       CASE WHEN m.tipo IN ('UTILIZACAO','VINCULACAO')
+                            THEN m.valor ELSE -m.valor END
+                   ), 0) AS utilizado
+            FROM dues d
+            LEFT JOIN due_movimentacoes m ON m.due_id=d.id
+            {clause}
+            GROUP BY d.id
+            ORDER BY {order}
+        """, params).fetchall()
+        dues = [decorate_due(row) for row in due_rows]
+        due_ids = [due["id"] for due in dues]
+
+        movements = []
+        links = []
+        invoice_links = []
+        if due_ids:
+            placeholders = ",".join("?" for _ in due_ids)
+            movements = conn.execute(f"""
+                SELECT m.id AS movimentacao_id, m.due_id, d.numero_due, d.chave_acesso,
+                       m.contrato_id, c.numero_contrato, m.due_contrato_id,
+                       m.data_movimentacao, m.tipo, m.documento, m.valor,
+                       m.observacao, m.created_at AS movimentacao_criada_em
+                FROM due_movimentacoes m
+                JOIN dues d ON d.id=m.due_id
+                LEFT JOIN contratos c ON c.id=m.contrato_id
+                WHERE m.due_id IN ({placeholders})
+                ORDER BY d.numero_due, m.data_movimentacao, m.id
+            """, due_ids).fetchall()
+            links = conn.execute(f"""
+                SELECT v.id AS vinculo_id, v.due_id, d.numero_due, d.chave_acesso,
+                       v.contrato_id, c.numero_contrato, c.moeda AS contrato_moeda,
+                       v.valor_vinculado,
+                       COALESCE(SUM(m.valor), v.valor_vinculado) AS valor_calculado,
+                       v.observacao, v.created_at AS vinculo_criado_em
+                FROM due_contratos v
+                JOIN dues d ON d.id=v.due_id
+                JOIN contratos c ON c.id=v.contrato_id
+                LEFT JOIN due_movimentacoes m
+                       ON m.due_contrato_id=v.id AND m.tipo='VINCULACAO'
+                WHERE v.due_id IN ({placeholders})
+                GROUP BY v.id
+                ORDER BY d.numero_due, c.numero_contrato, v.id
+            """, due_ids).fetchall()
+            invoice_links = conn.execute(f"""
+                SELECT di.id AS vinculo_id, di.due_id, d.numero_due, d.chave_acesso,
+                       di.invoice_id, i.numero_invoice, i.tipo_documento,
+                       i.data_emissao, i.moeda AS invoice_moeda,
+                       i.valor_moeda AS invoice_valor_moeda,
+                       di.valor_vinculado, di.observacao,
+                       di.created_at AS vinculo_criado_em
+                FROM due_invoice di
+                JOIN dues d ON d.id=di.due_id
+                JOIN invoices i ON i.id=di.invoice_id
+                WHERE di.due_id IN ({placeholders})
+                ORDER BY d.numero_due, i.numero_invoice, di.id
+            """, due_ids).fetchall()
+    finally:
+        conn.close()
+
+    date_fields = {
+        "data_due", "created_at", "data_movimentacao", "movimentacao_criada_em",
+        "vinculo_criado_em", "data_emissao",
+    }
+
+    def excel_value(value, field=None):
+        if value is None:
+            return None
+        if field in date_fields:
+            return date_br(value)
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, bool):
+            return "Sim" if value else "Não"
+        return value
+
+    def mapped_row(item, fields):
+        data = dict(item)
+        return {label: excel_value(data.get(key), key) for key, label in fields}
+
+    due_fields = [
+        ("id", "ID"), ("numero_due", "Número da DU-E"),
+        ("chave_acesso", "Chave de acesso"), ("data_due", "Data da DU-E"),
+        ("created_at", "Data de lançamento"), ("cnpj", "CNPJ"),
+        ("cliente", "Cliente"), ("moeda", "Moeda"),
+        ("valor_original", "Valor original"), ("utilizado", "Total utilizado"),
+        ("saldo", "Saldo disponível"), ("status", "Status"),
+        ("observacao", "Observação"),
+    ]
+    due_data = []
+    for due in dues:
+        item = dict(due)
+        item["cnpj"] = format_cnpj(item.get("cnpj")) or None
+        due_data.append(mapped_row(item, due_fields))
+
+    movement_fields = [
+        ("movimentacao_id", "Movimentação ID"), ("due_id", "DU-E ID"),
+        ("numero_due", "Número da DU-E"), ("chave_acesso", "Chave de acesso"),
+        ("contrato_id", "Contrato ID"), ("numero_contrato", "Contrato Câmbio"),
+        ("due_contrato_id", "Vínculo com contrato ID"),
+        ("data_movimentacao", "Data da movimentação"), ("tipo", "Tipo"),
+        ("documento", "Documento"), ("valor", "Valor"),
+        ("observacao", "Observação"),
+        ("movimentacao_criada_em", "Movimentação criada em"),
+    ]
+    movement_data = [mapped_row(row, movement_fields) for row in movements]
+
+    link_fields = [
+        ("vinculo_id", "Vínculo ID"), ("due_id", "DU-E ID"),
+        ("numero_due", "Número da DU-E"), ("chave_acesso", "Chave de acesso"),
+        ("contrato_id", "Contrato ID"), ("numero_contrato", "Contrato Câmbio"),
+        ("contrato_moeda", "Moeda do contrato"),
+        ("valor_vinculado", "Valor vinculado registrado"),
+        ("valor_calculado", "Valor vinculado calculado"),
+        ("observacao", "Observação"), ("vinculo_criado_em", "Vínculo criado em"),
+    ]
+    link_data = [mapped_row(row, link_fields) for row in links]
+
+    invoice_link_fields = [
+        ("vinculo_id", "Vínculo ID"), ("due_id", "DU-E ID"),
+        ("numero_due", "Número da DU-E"), ("chave_acesso", "Chave de acesso"),
+        ("invoice_id", "Invoice ID"), ("numero_invoice", "Número da Invoice"),
+        ("tipo_documento", "Tipo"), ("data_emissao", "Data de emissão"),
+        ("invoice_moeda", "Moeda da Invoice"),
+        ("invoice_valor_moeda", "Valor da Invoice"),
+        ("valor_vinculado", "Valor vinculado"), ("observacao", "Observação"),
+        ("vinculo_criado_em", "Vínculo criado em"),
+    ]
+    invoice_link_data = []
+    for row in invoice_links:
+        item = dict(row)
+        item["tipo_documento"] = invoice_type_label(item["tipo_documento"])
+        invoice_link_data.append(mapped_row(item, invoice_link_fields))
+
+    sheets = [
+        ("DU-Es", due_data, [label for _, label in due_fields]),
+        ("Movimentações", movement_data, [label for _, label in movement_fields]),
+        ("Vínculos", link_data, [label for _, label in link_fields]),
+        ("Invoices", invoice_link_data, [label for _, label in invoice_link_fields]),
+    ]
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, data, columns in sheets:
+            pd.DataFrame(data, columns=columns).to_excel(
+                writer, index=False, sheet_name=sheet_name
+            )
+        for worksheet in writer.book.worksheets:
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1769AA")
+                cell.alignment = Alignment(horizontal="center")
+            for column in worksheet.columns:
+                letter = get_column_letter(column[0].column)
+                width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 12), 45)
+                worksheet.column_dimensions[letter].width = width
+    output.seek(0)
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name="dues_exportacao.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
 
 @app.route("/dues/excluir-lote", methods=["POST"])
 def excluir_dues_lote():
@@ -8683,11 +8882,57 @@ def closing_report_hierarchy(items):
     return bancos
 
 
+def central_closing_report_invoice_display(conn, fechamentos):
+    """Retorna as invoices consolidadas por linha da Parte 1 do relatório."""
+    closing_ids = [fechamento["id"] for fechamento in fechamentos]
+    if not closing_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in closing_ids)
+    links = conn.execute(f"""
+        SELECT h.id AS fechamento_id, i.id AS invoice_id, i.numero_invoice
+        FROM fechamentos h
+        JOIN fechamentos_cambio f ON f.fechamento_id=h.id
+        JOIN invoices i ON i.id=f.invoice_id
+        WHERE h.id IN ({placeholders})
+        UNION ALL
+        SELECT h.id AS fechamento_id, i.id AS invoice_id, i.numero_invoice
+        FROM fechamentos h
+        JOIN invoice_contrato_cambio v ON v.contrato_id=h.contrato_id
+        JOIN invoices i ON i.id=v.invoice_id
+        WHERE h.id IN ({placeholders}) AND h.contrato_id IS NOT NULL
+        UNION ALL
+        SELECT h.id AS fechamento_id, i.id AS invoice_id, i.numero_invoice
+        FROM fechamentos h
+        JOIN fechamentos_cambio f
+          ON f.contrato_id=h.contrato_id AND f.fechamento_id IS NULL
+        JOIN invoices i ON i.id=f.invoice_id
+        WHERE h.id IN ({placeholders}) AND h.contrato_id IS NOT NULL
+    """, [*closing_ids, *closing_ids, *closing_ids]).fetchall()
+
+    invoice_numbers = {}
+    for link in links:
+        by_invoice = invoice_numbers.setdefault(link["fechamento_id"], {})
+        by_invoice[link["invoice_id"]] = link["numero_invoice"]
+
+    return {
+        fechamento_id: [
+            str(numero)
+            for _, numero in sorted(
+                by_invoice.items(),
+                key=lambda item: (str(item[1]).casefold(), item[0]),
+            )
+        ]
+        for fechamento_id, by_invoice in invoice_numbers.items()
+    }
+
+
 def central_closing_report_context(args):
     filters = central_closing_filter_context(args)
     conn = db()
     try:
         fechamentos = central_closing_headers(conn, filters["query"])
+        invoice_display = central_closing_report_invoice_display(conn, fechamentos)
         report_items = central_closing_report_items(conn, filters["query"])
     finally:
         conn.close()
@@ -8708,6 +8953,7 @@ def central_closing_report_context(args):
     fechamentos_por_contrato = [
         {
             "nome": fechamento["numero_contrato"] or "Pendente",
+            "invoices": invoice_display.get(fechamento["id"], []),
             "fechamento": fechamento,
         }
         for fechamento in fechamentos
