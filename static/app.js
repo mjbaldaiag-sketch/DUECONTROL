@@ -652,7 +652,10 @@
       updateCompetencias();
     });
     select.addEventListener('change', () => { automaticSelection = false; });
-    if (referenceDate) referenceDate.addEventListener('change', selectCurrentCompetencia);
+    if (referenceDate) referenceDate.addEventListener('change', () => {
+      automaticSelection = true;
+      selectCurrentCompetencia();
+    });
     updateCompetencias();
   });
   document.querySelectorAll('[data-client-resolution]').forEach((resolution) => {

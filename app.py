@@ -25,7 +25,7 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 14
+INVOICE_SCHEMA_VERSION = 15
 
 SALDO_TOLERANCE = Decimal("0.005")
 STATUS_PENDENTE = "PENDENTE"
@@ -1020,6 +1020,8 @@ def init_db():
                 (link["due_id"], link["contrato_id"], link["id"], date.today().isoformat(),
                  "VINCULACAO", f"VINCULO:{link['id']}", link["valor_vinculado"],
                  "Movimentação criada na migração do vínculo existente."))
+        if schema_version < INVOICE_SCHEMA_VERSION:
+            migrar_vinculos_due_contrato_empresas(conn)
         recalculate_statuses(conn)
         conn.commit()
     finally:
@@ -1410,6 +1412,36 @@ def empresa_id_por_cnpj(conn, cnpj):
         return None
     row = conn.execute("SELECT id FROM empresas WHERE cnpj=?", (re.sub(r"\D", "", str(cnpj)),)).fetchone()
     return row["id"] if row else None
+
+
+def migrar_vinculos_due_contrato_empresas(conn):
+    """Remove vínculos legados que conectam DUEs e contratos de empresas distintas."""
+    invalid_links = []
+    for link in conn.execute("""
+        SELECT v.id, v.due_id, v.contrato_id, d.cnpj AS due_cnpj,
+               c.cnpj AS contrato_cnpj
+        FROM due_contratos v
+        JOIN dues d ON d.id=v.due_id
+        JOIN contratos c ON c.id=v.contrato_id
+    """).fetchall():
+        due_empresa_id = empresa_id_por_cnpj(conn, link["due_cnpj"])
+        contrato_empresa_id = empresa_id_por_cnpj(conn, link["contrato_cnpj"])
+        if due_empresa_id and contrato_empresa_id and due_empresa_id != contrato_empresa_id:
+            invalid_links.append(link)
+
+    affected_due_ids = {link["due_id"] for link in invalid_links}
+    affected_contrato_ids = {link["contrato_id"] for link in invalid_links}
+    for link in invalid_links:
+        conn.execute("""
+            DELETE FROM due_movimentacoes
+            WHERE tipo='VINCULACAO'
+              AND (
+                  due_contrato_id=?
+                  OR (due_id=? AND contrato_id=?)
+              )
+        """, (link["id"], link["due_id"], link["contrato_id"]))
+        conn.execute("DELETE FROM due_contratos WHERE id=?", (link["id"],))
+    return affected_due_ids, affected_contrato_ids
 
 def competencia_da_operacao(conn, raw_id, empresa_id, data_referencia, current_id=None):
     """Valida a competência da operação e sugere uma aberta pela data."""
@@ -2465,7 +2497,7 @@ def render_ptax_page(previsao=None, consulta=None):
 
 def contract_summary(conn, contrato_id):
     row = conn.execute(f"""
-        SELECT c.id, c.numero_contrato, c.moeda, c.valor_moeda, c.status,
+        SELECT c.id, c.numero_contrato, c.cnpj, c.moeda, c.valor_moeda, c.status,
                COALESCE(NULLIF(TRIM(c.categoria_cambio), ''),
                         (SELECT h.categoria_cambio FROM fechamentos h
                          WHERE h.contrato_id=c.id ORDER BY h.id DESC LIMIT 1),
@@ -5204,15 +5236,21 @@ def novo_contrato():
                            clientes=clientes, cliente_id=cliente_id,
                            competencias=competencias, competencia_id=competencia_id)
 
-def dues_disponiveis_para_vinculo(conn):
+def dues_disponiveis_para_vinculo(conn, contrato):
+    empresa_id = empresa_id_por_cnpj(conn, contrato["cnpj"])
+    if not empresa_id:
+        return []
+    due_cnpj_sql = _global_normalized_cnpj_sql("d.cnpj")
+    empresa_cnpj_sql = _global_normalized_cnpj_sql("e.cnpj")
     rows = conn.execute(f"""
         SELECT d.*, COALESCE(SUM({movement_effect_sql()}), 0) AS utilizado
         FROM dues d
         LEFT JOIN due_movimentacoes m ON m.due_id=d.id
+        JOIN empresas e ON e.id=? AND {due_cnpj_sql}={empresa_cnpj_sql}
         GROUP BY d.id
         HAVING d.valor_original-COALESCE(SUM({movement_effect_sql()}), 0)>?
         ORDER BY d.numero_due
-    """, (float(SALDO_TOLERANCE),)).fetchall()
+    """, (empresa_id, float(SALDO_TOLERANCE))).fetchall()
     return [decorate_due(row) for row in rows]
 
 
@@ -5304,7 +5342,7 @@ def carregar_detalhe_contrato(conn, contrato_id):
 def detalhe_contrato(contrato_id):
     conn = db()
     dados = carregar_detalhe_contrato(conn, contrato_id)
-    dues_disponiveis = dues_disponiveis_para_vinculo(conn) if dados else []
+    dues_disponiveis = dues_disponiveis_para_vinculo(conn, dados[0]) if dados else []
     conn.close()
     if not dados:
         return "Contrato Câmbio não encontrado", 404
@@ -6061,7 +6099,7 @@ def editar_due(due_id):
     empresas, empresa_id = empresas_for_form(
         conn, due["cnpj"], request.form.get("empresa_id") if request.method == "POST" else None
     )
-    competencias = competencias_for_empresa(conn, empresa_id)
+    competencias = competencias_for_empresa(conn, None)
     clientes = clientes_for_form(conn)
     cliente_id = cliente_id_for_due_form(
         conn,
@@ -6087,16 +6125,21 @@ def carregar_detalhe_due(conn, due_id):
                          FROM due_contratos v JOIN contratos c ON c.id=v.contrato_id
                          LEFT JOIN due_movimentacoes m ON m.due_contrato_id=v.id AND m.tipo='VINCULACAO'
                          WHERE v.due_id=? ORDER BY v.id DESC""",(due_id,)).fetchall()
+    due_empresa_id = empresa_id_por_cnpj(conn, due_row["cnpj"]) or 0
+    contrato_cnpj_sql = _global_normalized_cnpj_sql("c.cnpj")
+    empresa_cnpj_sql = _global_normalized_cnpj_sql("e.cnpj")
     contratos=[decorate_contract(row) for row in conn.execute(f"""SELECT c.*,
                                {contract_total_sql("c")} AS valor_moeda_consolidado,
                                COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0) AS vinculado
-                               FROM contratos c LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
+                               FROM contratos c
+                               JOIN empresas e ON e.id=? AND {contrato_cnpj_sql}={empresa_cnpj_sql}
+                               LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
                                GROUP BY c.id
                                HAVING c.saldo_zerado_manual=0
                                   AND valor_moeda_consolidado-COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END),0)>?
                                   AND COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), 'Câmbio Exportação')<>?
                                ORDER BY c.numero_contrato""",
-                               (float(SALDO_TOLERANCE), CATEGORIA_CAMBIO_FINANCEIRO)).fetchall()]
+                               (due_empresa_id, float(SALDO_TOLERANCE), CATEGORIA_CAMBIO_FINANCEIRO)).fetchall()]
     utilizado=due_effect(conn, due_id)
     due = decorate_due({**dict(due_row), "utilizado": utilizado})
     due["invoice_links"] = conn.execute("""
@@ -6178,7 +6221,7 @@ def movimentacao(due_id):
     return redirect(url_for("due_detalhe", due_id=due_id))
 
 def registrar_vinculo_due(conn, due_id, contrato_id, form):
-    due=conn.execute("SELECT valor_original FROM dues WHERE id=?",(due_id,)).fetchone()
+    due=conn.execute("SELECT valor_original, cnpj FROM dues WHERE id=?",(due_id,)).fetchone()
     if not due:
         raise ValueError("DU-E não encontrada.")
     contrato=contract_summary(conn, contrato_id)
@@ -6190,6 +6233,10 @@ def registrar_vinculo_due(conn, due_id, contrato_id, form):
         raise ValueError("O Contrato Câmbio foi zerado manualmente e não pode receber vínculos.")
     if contrato["status"] not in {STATUS_PENDENTE, STATUS_PARCIAL}:
         raise ValueError("O Contrato Câmbio selecionado não possui saldo disponível.")
+    due_empresa_id = empresa_id_por_cnpj(conn, due["cnpj"])
+    contrato_empresa_id = empresa_id_por_cnpj(conn, contrato["cnpj"])
+    if not due_empresa_id or not contrato_empresa_id or due_empresa_id != contrato_empresa_id:
+        raise ValueError("A DU-E e o Contrato Câmbio devem pertencer à mesma empresa.")
     valor=Decimal(str(parse_number(form.get("valor_vinculado"))))
     if valor<=0:
         raise ValueError("O valor do vínculo deve ser maior que zero.")

@@ -4010,6 +4010,86 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         self.assertEqual(report.status_code, 200)
         self.assertIn("Nenhum Fechamento encontrado para os filtros informados", report.get_data(as_text=True))
 
+    def test_due_contract_link_requires_same_company_in_options_and_posts(self):
+        conn = app.db()
+        conn.execute(
+            "INSERT INTO empresas (razao_social, cnpj, apelido) VALUES (?,?,?)",
+            ("Coplaser Teste", "05928246000141", "COPLASA"),
+        )
+        conn.execute(
+            "INSERT INTO dues (numero_due, chave_acesso, cnpj, moeda, valor_original, status) "
+            "VALUES (?,?,?,?,?,?)",
+            ("DUE-COMPANY-CEM", "22345678901234", "45765914000181", "USD", 100, app.STATUS_PENDENTE),
+        )
+        due_cem_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO dues (numero_due, chave_acesso, cnpj, moeda, valor_original, status) "
+            "VALUES (?,?,?,?,?,?)",
+            ("DUE-COMPANY-COPLASA", "32345678901234", "05928246000141", "USD", 100, app.STATUS_PENDENTE),
+        )
+        due_coplasa_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO contratos (numero_contrato, cnpj, moeda, valor_moeda, status) "
+            "VALUES (?,?,?,?,?)",
+            ("CONTRACT-COMPANY-CEM", "45765914000181", "USD", 100, app.STATUS_PENDENTE),
+        )
+        contract_cem_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO contratos (numero_contrato, cnpj, moeda, valor_moeda, status) "
+            "VALUES (?,?,?,?,?)",
+            ("CONTRACT-COMPANY-COPLASA", "05928246000141", "USD", 100, app.STATUS_PENDENTE),
+        )
+        contract_coplasa_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        contract_page = self.client.get(f"/contrato/{contract_cem_id}")
+        contract_html = contract_page.get_data(as_text=True)
+        self.assertIn("DUE-COMPANY-CEM", contract_html)
+        self.assertNotIn("DUE-COMPANY-COPLASA", contract_html)
+
+        due_page = self.client.get(f"/due/{due_cem_id}")
+        due_html = due_page.get_data(as_text=True)
+        self.assertIn("CONTRACT-COMPANY-CEM", due_html)
+        self.assertNotIn("CONTRACT-COMPANY-COPLASA", due_html)
+
+        allowed = self.client.post(
+            f"/contrato/{contract_cem_id}/due",
+            data={"due_id": str(due_cem_id), "valor_vinculado": "10,00"},
+        )
+        self.assertEqual(allowed.status_code, 302)
+
+        rejected_from_contract = self.client.post(
+            f"/contrato/{contract_cem_id}/due",
+            data={"due_id": str(due_coplasa_id), "valor_vinculado": "10,00"},
+            follow_redirects=True,
+        )
+        self.assertIn("mesma empresa", rejected_from_contract.get_data(as_text=True))
+
+        rejected_from_due = self.client.post(
+            f"/due/{due_cem_id}/vincular",
+            data={"contrato_id": str(contract_coplasa_id), "valor_vinculado": "10,00"},
+            follow_redirects=True,
+        )
+        self.assertIn("mesma empresa", rejected_from_due.get_data(as_text=True))
+
+        conn = app.db()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM due_contratos WHERE due_id=? AND contrato_id=?",
+                (due_cem_id, contract_coplasa_id),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM due_movimentacoes WHERE due_id=? AND contrato_id=? AND tipo='VINCULACAO'",
+                (due_cem_id, contract_coplasa_id),
+            ).fetchone()[0],
+            0,
+        )
+        conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
