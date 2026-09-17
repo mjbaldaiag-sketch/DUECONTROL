@@ -787,6 +787,10 @@
       minimumFractionDigits: 2,
       maximumFractionDigits: 2,
     }).format(Number(value || 0));
+    const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+    const contractAvailable = () => roundMoney(
+      contractDueDialog.dataset.contractAvailable || contractDueDialog.dataset.contractTotal
+    );
     const close = () => {
       if (typeof contractDueDialog.close === 'function') contractDueDialog.close();
       else contractDueDialog.removeAttribute('open');
@@ -798,9 +802,12 @@
         contractDueValue.removeAttribute('max');
         return;
       }
-      const saldo = Number(option.dataset.saldo || 0);
-      contractDueBalance.textContent = `Saldo disponível: ${display(saldo)} ${option.dataset.moeda || ''}`;
-      contractDueValue.max = option.dataset.saldo;
+      const saldo = roundMoney(option.dataset.saldo);
+      const limite = Math.min(saldo, contractAvailable());
+      const limiteTexto = limite < saldo ? ` Limite do contrato: ${display(limite)} ${option.dataset.moeda || ''}.` : '';
+      contractDueBalance.textContent = `Saldo disponível: ${display(saldo)} ${option.dataset.moeda || ''}.${limiteTexto}`;
+      contractDueValue.max = String(limite);
+      contractDueValue.value = display(limite);
     };
     contractDueOpen.addEventListener('click', () => {
       if (typeof contractDueDialog.showModal === 'function') contractDueDialog.showModal();

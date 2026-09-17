@@ -2102,6 +2102,10 @@ def decimal_value(value):
         return Decimal("0")
     return Decimal(str(value))
 
+def monetary_float(value):
+    """Serializa valores monetarios com duas casas, sem expor ruido de float."""
+    return float(decimal_value(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
 def normalize_balance(balance):
     balance = decimal_value(balance)
     return Decimal("0") if abs(balance) <= SALDO_TOLERANCE else balance
@@ -5569,11 +5573,11 @@ def saldo_contrato(contrato_id):
     conn.close()
     if not contrato:
         return jsonify({"error": "Contrato Câmbio não encontrado."}), 404
-    total = float(contrato["valor_moeda"] or 0)
-    vinculado = float(contrato["vinculado"] or 0)
+    total = monetary_float(contrato["valor_moeda"])
+    vinculado = monetary_float(contrato["vinculado"])
     return jsonify({"id": contrato["id"], "numero_contrato": contrato["numero_contrato"],
                     "moeda": contrato["moeda"], "valor_total": total,
-                    "total_vinculado": vinculado, "saldo_disponivel": float(contrato["saldo"]),
+                    "total_vinculado": vinculado, "saldo_disponivel": monetary_float(contrato["saldo"]),
                     "status": contrato["status"],
                     "categoria_cambio": contrato["categoria_cambio"]})
 
@@ -6285,9 +6289,9 @@ def registrar_vinculo_due(conn, due_id, contrato_id, form):
         raise ValueError("A DU-E não possui saldo disponível.")
     if saldo_contrato <= 0:
         raise ValueError("O Contrato Câmbio não possui saldo disponível.")
-    if valor>saldo_due:
+    if valor-saldo_due > SALDO_TOLERANCE:
         raise ValueError(f"Valor maior que o saldo disponível da DU-E ({money(saldo_due)}).")
-    if valor>saldo_contrato:
+    if valor-saldo_contrato > SALDO_TOLERANCE:
         raise ValueError(f"Valor maior que o saldo disponível do Contrato Câmbio ({money(saldo_contrato)}).")
     link=conn.execute("SELECT id,valor_vinculado FROM due_contratos WHERE due_id=? AND contrato_id=?",
                       (due_id,contrato_id)).fetchone()
