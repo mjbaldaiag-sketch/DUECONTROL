@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
+{% block content %}
+<div class="print-report saldo-analysis-report">
+  <div class="report-actions">
+    <button class="btn" type="button" onclick="window.print()">Imprimir relatório</button>
+    <a class="btn secondary" href="{{ url_for('lista_contratos') }}">Voltar aos Contratos</a>
+  </div>
+
+  <div class="report-title">
+    <h1>Análise de saldos</h1>
+    <p class="muted">Visão consolidada dos saldos abertos de DUEs e Contratos de câmbio por empresa, cliente e moeda.</p>
+  </div>
+
+  <div class="report-context">
+    <span>{{ total_sugestoes }} grupo(s) compatível(is) encontrado(s)</span>
+    <span>Critérios: mesma empresa, cliente e moeda; somente saldos abertos com possibilidade ainda não vinculada.</span>
+  </div>
+
+  <div class="saldo-analysis-summary" aria-label="Totalizadores da análise">
+    <div>
+      <span>Saldo DUEs em aberto</span>
+      <strong>{{ resumo.saldo_due_aberto|money }}</strong>
+    </div>
+    <div>
+      <span>Saldo contratos em aberto</span>
+      <strong>{{ resumo.saldo_contratos_aberto|money }}</strong>
+    </div>
+    <div>
+      <span>Saldo contratos em grupos compatíveis</span>
+      <strong>{{ resumo.saldo_contratos_compativel|money }}</strong>
+    </div>
+    <div>
+      <span>Saldo contratos fora da tabela</span>
+      <strong>{{ resumo.saldo_contratos_fora_tabela|money }}</strong>
+    </div>
+    <div>
+      <span>Saldo a vincular</span>
+      <strong>{{ resumo.saldo_a_vincular|money }}</strong>
+    </div>
+  </div>
+  <p class="muted saldo-analysis-note">
+    O saldo fora da tabela corresponde a contratos em aberto sem DUE compatível em aberto no mesmo grupo de empresa, cliente e moeda.
+  </p>
+
+  <section class="report-section">
+    <div class="table-wrap">
+      <table class="compact-table saldo-analysis-table">
+        <thead>
+          <tr>
+            <th>Empresa</th>
+            <th>Cliente</th>
+            <th>Moeda</th>
+            <th>Saldo DUE</th>
+            <th>Saldo contratos</th>
+            <th>Saldo a vincular</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for sugestao in sugestoes %}
+          <tr>
+            <td>{{ sugestao.empresa or '-' }}</td>
+            <td>{{ sugestao.cliente or '-' }}</td>
+            <td>{{ sugestao.moeda or '-' }}</td>
+            <td>{{ sugestao.saldo_due|money }}</td>
+            <td>{{ sugestao.saldo_contrato|money }}</td>
+            <td>{{ sugestao.saldo_compativel|money }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6" class="empty">Nenhum grupo compatível encontrado para os saldos atualmente abertos.</td></tr>
+        {% endfor %}
+        </tbody>
+        <tfoot>
+          <tr class="saldo-analysis-total-row">
+            <th colspan="3">Total geral dos grupos compatíveis</th>
+            <th>{{ resumo.saldo_due_compativel|money }}</th>
+            <th>{{ resumo.saldo_contratos_compativel|money }}</th>
+            <th>{{ resumo.saldo_a_vincular|money }}</th>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </section>
+
+  {{ render_pagination(pagination, 'Paginação da análise de saldos') }}
+</div>
+{% endblock %}

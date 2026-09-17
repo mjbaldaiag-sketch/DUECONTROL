@@ -2548,6 +2548,7 @@ GLOBAL_CONTEXT_ENDPOINTS = frozenset({
     "lista_invoices",
     "gestao_fechamentos_invoices",
     "lista_contratos",
+    "analise_saldos_contratos",
     "consulta_dues",
 })
 GLOBAL_CONTEXT_EMPRESA_KEY = "global_context_empresa_id"
@@ -3182,6 +3183,211 @@ def lista_contratos():
         direction=direction,
         sort_links=sort_links,
         **filtros,
+    )
+
+
+def consulta_analise_saldos(conn, incluir_resumo=False):
+    """Monta saldos abertos consolidados sem persistir ou alterar vínculos."""
+    due_global, due_global_params = global_context_sql("due", g.global_context)
+    contract_global, contract_global_params = global_context_sql("contract", g.global_context)
+    due_clause = f" WHERE {due_global}" if due_global else ""
+    contract_clause = f" WHERE {contract_global}" if contract_global else ""
+    normalized_due_cnpj = _global_normalized_cnpj_sql("d.cnpj")
+    normalized_contract_cnpj = _global_normalized_cnpj_sql("c.cnpj")
+    normalized_company_cnpj = _global_normalized_cnpj_sql("e.cnpj")
+
+    due_rows = conn.execute(f"""
+        SELECT d.*, e.id AS analise_empresa_id,
+               e.razao_social AS analise_empresa_razao_social,
+               e.apelido AS analise_empresa_apelido,
+               cl.nome AS analise_cliente_nome,
+               COALESCE(SUM({movement_effect_sql('m')}), 0) AS utilizado
+        FROM dues d
+        JOIN empresas e ON {normalized_due_cnpj}={normalized_company_cnpj}
+        LEFT JOIN clientes cl ON cl.id=d.cliente_id
+        LEFT JOIN due_movimentacoes m ON m.due_id=d.id
+        {due_clause}
+        GROUP BY d.id
+    """, due_global_params).fetchall()
+    dues = [decorate_due(row) for row in due_rows]
+    dues = [due for due in dues if due["saldo"] > SALDO_TOLERANCE]
+
+    contract_rows = conn.execute(f"""
+        SELECT c.*, e.id AS analise_empresa_id,
+               e.razao_social AS analise_empresa_razao_social,
+               e.apelido AS analise_empresa_apelido,
+               cl.nome AS analise_cliente_nome,
+               comp.descricao AS competencia_descricao,
+               {contract_total_sql("c")} AS valor_moeda_consolidado,
+               COALESCE(SUM(CASE WHEN m.tipo='VINCULACAO' THEN m.valor ELSE 0 END), 0)
+                   AS vinculado
+        FROM contratos c
+        JOIN empresas e ON {normalized_contract_cnpj}={normalized_company_cnpj}
+        LEFT JOIN clientes cl ON cl.id=c.cliente_id
+        LEFT JOIN competencias comp ON comp.id=c.competencia_id
+        LEFT JOIN due_movimentacoes m ON m.contrato_id=c.id
+        {contract_clause}
+        GROUP BY c.id
+    """, contract_global_params).fetchall()
+    contratos = [decorate_contract(row) for row in contract_rows]
+    contratos = [contrato for contrato in contratos if contrato["saldo"] > SALDO_TOLERANCE]
+    saldo_due_aberto = sum((due["saldo"] for due in dues), Decimal("0"))
+    saldo_contratos_aberto = sum(
+        (contrato["saldo"] for contrato in contratos), Decimal("0")
+    )
+
+    existing_links = {
+        (row["due_id"], row["contrato_id"])
+        for row in conn.execute("""
+            SELECT due_id, contrato_id FROM due_contratos
+            UNION
+            SELECT due_id, contrato_id
+            FROM due_movimentacoes
+            WHERE tipo='VINCULACAO' AND contrato_id IS NOT NULL
+        """).fetchall()
+    }
+
+    def compatibility_key(record):
+        company_id = record.get("analise_empresa_id")
+        currency = str(record.get("moeda") or "").strip().upper()
+        client_id = record.get("cliente_id")
+        if client_id is not None:
+            client_key = ("id", client_id)
+        else:
+            client_name = normalize_client_name_key(record.get("cliente"))
+            if not client_name:
+                return None
+            client_key = ("nome", client_name)
+        return (company_id, currency, *client_key)
+
+    groups = {}
+    due_group_by_id = {}
+    contract_group_by_id = {}
+
+    def group_for(key):
+        return groups.setdefault(key, {
+            "empresa": None,
+            "cliente": None,
+            "moeda": key[1],
+            "saldo_due": Decimal("0"),
+            "saldo_contrato": Decimal("0"),
+            "due_ids": set(),
+            "contrato_ids": set(),
+            "_data_contrato": None,
+        })
+
+    for due in dues:
+        key = compatibility_key(due)
+        if key is None:
+            continue
+        group = group_for(key)
+        group["saldo_due"] += due["saldo"]
+        group["due_ids"].add(due["id"])
+        due_group_by_id[due["id"]] = key
+        group["empresa"] = (
+            group["empresa"] or due.get("analise_empresa_apelido") or
+            due.get("analise_empresa_razao_social")
+        )
+        group["cliente"] = (
+            group["cliente"] or due.get("analise_cliente_nome") or due.get("cliente")
+        )
+
+    for contrato in contratos:
+        key = compatibility_key(contrato)
+        if key is None:
+            continue
+        group = group_for(key)
+        group["saldo_contrato"] += contrato["saldo"]
+        group["contrato_ids"].add(contrato["id"])
+        contract_group_by_id[contrato["id"]] = key
+        group["empresa"] = (
+            group["empresa"] or contrato.get("analise_empresa_apelido") or
+            contrato.get("analise_empresa_razao_social")
+        )
+        group["cliente"] = (
+            group["cliente"] or contrato.get("analise_cliente_nome") or contrato.get("cliente")
+        )
+        data_contrato = normalize_date(contrato.get("data_contrato"))
+        if data_contrato is not None and (
+            group["_data_contrato"] is None or data_contrato < group["_data_contrato"]
+        ):
+            group["_data_contrato"] = data_contrato
+
+    linked_counts = {}
+    for due_id, contrato_id in existing_links:
+        due_key = due_group_by_id.get(due_id)
+        if due_key is not None and contract_group_by_id.get(contrato_id) == due_key:
+            linked_counts[due_key] = linked_counts.get(due_key, 0) + 1
+
+    suggestions = []
+    for key, group in groups.items():
+        if (
+            group["saldo_due"] <= SALDO_TOLERANCE or
+            group["saldo_contrato"] <= SALDO_TOLERANCE
+        ):
+            continue
+        possible_pairs = len(group["due_ids"]) * len(group["contrato_ids"])
+        if linked_counts.get(key, 0) >= possible_pairs:
+            continue
+        suggestions.append({
+            "empresa": group["empresa"],
+            "cliente": group["cliente"],
+            "moeda": group["moeda"],
+            "saldo_due": group["saldo_due"],
+            "saldo_contrato": group["saldo_contrato"],
+            "saldo_compativel": min(group["saldo_due"], group["saldo_contrato"]),
+            "_data_contrato": group["_data_contrato"],
+        })
+
+    suggestions.sort(key=lambda item: (
+        -item["saldo_compativel"],
+        item["_data_contrato"] is None,
+        item["_data_contrato"] or "",
+        normalize_client_name_key(item["empresa"]),
+        normalize_client_name_key(item["cliente"]),
+        item["moeda"],
+    ))
+    for item in suggestions:
+        item.pop("_data_contrato", None)
+    resumo = {
+        "saldo_due_aberto": saldo_due_aberto,
+        "saldo_contratos_aberto": saldo_contratos_aberto,
+        "saldo_due_compativel": sum(
+            (item["saldo_due"] for item in suggestions), Decimal("0")
+        ),
+        "saldo_contratos_compativel": sum(
+            (item["saldo_contrato"] for item in suggestions), Decimal("0")
+        ),
+        "saldo_a_vincular": sum(
+            (item["saldo_compativel"] for item in suggestions), Decimal("0")
+        ),
+    }
+    resumo["saldo_contratos_fora_tabela"] = (
+        resumo["saldo_contratos_aberto"] - resumo["saldo_contratos_compativel"]
+    )
+    if incluir_resumo:
+        return suggestions, resumo
+    return suggestions
+
+
+@app.route("/contratos/analise-saldos")
+def analise_saldos_contratos():
+    conn = db()
+    try:
+        suggestions, resumo = consulta_analise_saldos(conn, incluir_resumo=True)
+    finally:
+        conn.close()
+    pagination = build_pagination(
+        request.args, len(suggestions), endpoint="analise_saldos_contratos"
+    )
+    start = pagination["offset"]
+    visible_suggestions = suggestions[start:start + pagination["per_page"]]
+    return render_template(
+        "contratos_analise_saldos.html",
+        sugestoes=visible_suggestions,
+        total_sugestoes=len(suggestions),
+        resumo=resumo,
+        pagination=pagination,
     )
 
 @app.route("/contratos/excluir-lote", methods=["POST"])
