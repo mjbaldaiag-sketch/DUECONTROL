@@ -1218,6 +1218,27 @@ def parse_chave_acesso(value):
         raise ValueError("A Chave de Acesso deve conter exatamente 14 caracteres alfanuméricos.")
     return chave
 
+def normalize_numero_due(value, allow_partial=False):
+    """Normaliza o número da DU-E para 13 caracteres, hífen e dígito verificador."""
+    raw = "" if value is None else str(value).strip().upper()
+    if not raw:
+        if allow_partial:
+            return ""
+        raise ValueError("O número da DU-E é obrigatório.")
+    if not re.fullmatch(r"[A-Z0-9-]+", raw):
+        raise ValueError("O número da DU-E deve conter apenas letras, números e hífen.")
+
+    compact = raw.replace("-", "")
+    if not compact:
+        raise ValueError("O número da DU-E deve conter caracteres alfanuméricos.")
+    if len(compact) > 14:
+        raise ValueError("O número da DU-E deve conter exatamente 14 caracteres alfanuméricos.")
+    if len(compact) < 14:
+        if allow_partial:
+            return compact
+        raise ValueError("O número da DU-E deve conter exatamente 14 caracteres alfanuméricos.")
+    return f"{compact[:13]}-{compact[13]}"
+
 def normalize_cnpj(value):
     """Valida e armazena o CNPJ somente com seus 14 dígitos."""
     digits = re.sub(r"\D", "", str(value or ""))
@@ -5564,8 +5585,14 @@ def dues_filter_parts(args):
         where.append(global_clause)
         params.extend(global_params)
     if args.get("numero_due"):
-        where.append("d.numero_due LIKE ?")
-        params.append(f"%{args['numero_due'].strip()}%")
+        try:
+            numero_due = normalize_numero_due(args["numero_due"], allow_partial=True)
+        except ValueError as exc:
+            flash(str(exc), "danger")
+            where.append("1=0")
+        else:
+            where.append("d.numero_due LIKE ?")
+            params.append(f"%{numero_due}%")
     if args.get("chave_acesso"):
         where.append("d.chave_acesso LIKE ?")
         params.append(f"%{args['chave_acesso'].strip().upper()}%")
@@ -5945,12 +5972,12 @@ def importar_dues():
 
     for indice, row in df.iterrows():
         linha = indice + 2
-        numero = str(valor_linha(row, "numero_due", "") or "").strip()
+        numero_input = str(valor_linha(row, "numero_due", "") or "").strip()
+        numero = numero_input
         chave = str(valor_linha(row, "chave_acesso", "") or "").strip()
         try:
+            numero = normalize_numero_due(numero_input)
             chave = parse_chave_acesso(chave)
-            if not numero:
-                raise ValueError("numero_due é obrigatório")
             if numero in existentes:
                 raise ValueError("a DU-E já está cadastrada no banco")
             if numero in vistos_numeros:
@@ -5967,8 +5994,10 @@ def importar_dues():
             moeda = str(valor_linha(row, "moeda", "USD") or "USD").strip().upper()
             if not moeda:
                 moeda = "USD"
+            created_at = launch_timestamp()
             registros.append((chave, numero, valor_linha(row, "cnpj"), valor_linha(row, "cliente"),
-                              moeda, valor_original, status_from_balance(valor_original), launch_timestamp()))
+                              moeda, valor_original, status_from_balance(valor_original), created_at,
+                              created_at[:10]))
             vistos_numeros.add(numero)
             vistos_chaves.add(chave)
         except (TypeError, ValueError, InvalidOperation) as exc:
@@ -5982,8 +6011,8 @@ def importar_dues():
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     conn.executemany("""INSERT INTO dues
-                        (chave_acesso,numero_due,cnpj,cliente,moeda,valor_original,status,created_at)
-                        VALUES (?,?,?,?,?,?,?,?)""", registros)
+                        (chave_acesso,numero_due,cnpj,cliente,moeda,valor_original,status,created_at,data_due)
+                        VALUES (?,?,?,?,?,?,?,?,?)""", registros)
                     conn.commit()
                     break
                 except sqlite3.OperationalError as exc:
@@ -6010,6 +6039,7 @@ def nova_due():
         f=request.form
         conn = None
         try:
+            numero_due = normalize_numero_due(f.get("numero_due"))
             chave = parse_chave_acesso(f.get("chave_acesso"))
             valor_original = parse_number(f.get("valor_original"))
             ensure_non_negative_balance(valor_original, "O valor original da DU-E não pode ser negativo.")
@@ -6017,16 +6047,17 @@ def nova_due():
             cliente = cliente_da_selecao(conn, f.get("cliente_id"), required=True)
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"))
             empresa_id = form_record_id(f.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
-            data_due = parse_date(f.get("data_due")) or date.today().isoformat()
+            created_at = launch_timestamp()
+            data_due = created_at[:10]
             competencia_id = competencia_da_operacao(conn, f.get("competencia_id"), empresa_id, data_due)
             if conn.execute("SELECT 1 FROM dues WHERE chave_acesso=?", (chave,)).fetchone():
                 raise ValueError("A Chave de Acesso já está cadastrada.")
             conn.execute("""INSERT INTO dues
                 (chave_acesso,numero_due,cnpj,cliente,cliente_id,moeda,valor_original,status,created_at,observacao,data_due,competencia_id)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (chave,f["numero_due"].strip(),cnpj,cliente["nome"],cliente["id"],
+                (chave,numero_due,cnpj,cliente["nome"],cliente["id"],
                  f.get("moeda") or "USD",valor_original, status_from_balance(valor_original),
-                 launch_timestamp(),
+                 created_at,
                  f.get("observacao"), data_due, competencia_id))
             conn.commit()
             flash("DU-E cadastrada com sucesso.", "success")
@@ -6047,7 +6078,7 @@ def nova_due():
     competencias = competencias_for_empresa(conn, empresa_id)
     competencia_id = form_record_id(request.form.get("competencia_id"))
     if not competencia_id and empresa_id:
-        sugerida = sugerir_competencia(conn, empresa_id, request.form.get("data_due") or date.today().isoformat())
+        sugerida = sugerir_competencia(conn, empresa_id, date.today().isoformat())
         competencia_id = sugerida["id"] if sugerida else None
     conn.close()
     return render_template("due_form.html", due=None, empresas=empresas, empresa_id=empresa_id,
@@ -6063,6 +6094,7 @@ def editar_due(due_id):
     if request.method == "POST":
         f = request.form
         try:
+            numero_due = normalize_numero_due(f.get("numero_due"))
             chave = parse_chave_acesso(f.get("chave_acesso"))
             valor_original = parse_number(f.get("valor_original"))
             ensure_non_negative_balance(valor_original, "O valor original da DU-E não pode ser negativo.")
@@ -6079,15 +6111,22 @@ def editar_due(due_id):
             cliente_id = cliente_registro["id"] if cliente_registro else due["cliente_id"]
             cnpj = cnpj_da_empresa(conn, f.get("empresa_id"), due["cnpj"])
             empresa_id = form_record_id(f.get("empresa_id"), empresa_id_por_cnpj(conn, cnpj))
-            data_due = parse_date(f.get("data_due")) or due["data_due"] or date.today().isoformat()
-            competencia_id = competencia_da_operacao(conn, f.get("competencia_id"), empresa_id, data_due, due["competencia_id"] if "competencia_id" in due.keys() else None)
+            data_referencia = (
+                due["data_due"]
+                or (due["created_at"] or "")[:10]
+                or date.today().isoformat()
+            )
+            competencia_id = competencia_da_operacao(
+                conn, f.get("competencia_id"), empresa_id, data_referencia,
+                due["competencia_id"] if "competencia_id" in due.keys() else None,
+            )
             if conn.execute("SELECT 1 FROM dues WHERE chave_acesso=? AND id<>?", (chave, due_id)).fetchone():
                 raise ValueError("A Chave de Acesso já está cadastrada.")
-            conn.execute("""UPDATE dues SET chave_acesso=?,numero_due=?,cnpj=?,cliente=?,cliente_id=?,moeda=?,valor_original=?,observacao=?,data_due=?,competencia_id=?
+            conn.execute("""UPDATE dues SET chave_acesso=?,numero_due=?,cnpj=?,cliente=?,cliente_id=?,moeda=?,valor_original=?,observacao=?,competencia_id=?
                             WHERE id=?""",
-                         (chave, f["numero_due"].strip(), cnpj,
+                         (chave, numero_due, cnpj,
                           cliente, cliente_id, f.get("moeda") or "USD", valor_original,
-                          f.get("observacao"), data_due, competencia_id, due_id))
+                          f.get("observacao"), competencia_id, due_id))
             update_due_status(conn, due_id)
             conn.commit(); conn.close()
             flash("DU-E atualizada com sucesso.", "success")

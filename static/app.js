@@ -4,6 +4,35 @@
     input.value = digits.replace(/(\d{2})(\d)/, '$1/$2').replace(/(\d{2})(\d)/, '$1/$2');
   };
 
+  const normalizeDueNumberValue = (value) => {
+    const compact = String(value || '')
+      .toLocaleUpperCase('pt-BR')
+      .replace(/[^A-Z0-9]/g, '')
+      .slice(0, 14);
+    return compact.length === 14 ? `${compact.slice(0, 13)}-${compact.slice(13)}` : compact;
+  };
+
+  const formatDueNumber = (input) => {
+    const original = String(input.value || '');
+    const start = typeof input.selectionStart === 'number' ? input.selectionStart : null;
+    const prefix = start === null ? '' : original.slice(0, start);
+    const alphanumericBefore = (prefix.toLocaleUpperCase('pt-BR').match(/[A-Z0-9]/g) || []).length;
+    const separatorBefore = prefix.includes('-');
+    const formatted = normalizeDueNumberValue(original);
+    input.value = formatted;
+
+    if (start !== null && document.activeElement === input) {
+      let cursor = 0;
+      let seen = 0;
+      while (cursor < formatted.length && seen < alphanumericBefore) {
+        if (/[A-Z0-9]/.test(formatted[cursor])) seen += 1;
+        cursor += 1;
+      }
+      if (separatorBefore && formatted[cursor] === '-') cursor += 1;
+      input.setSelectionRange(cursor, cursor);
+    }
+  };
+
   const formatCnpj = (input) => {
     const digits = input.value.replace(/\D/g, '').slice(0, 14);
     let formatted = digits;
@@ -280,6 +309,12 @@
     if (!input.value) input.value = todayBr;
   });
   document.querySelectorAll('[data-date-br]').forEach((input) => input.addEventListener('input', () => formatDate(input)));
+  document.querySelectorAll('[data-due-number]').forEach((input) => {
+    const update = () => formatDueNumber(input);
+    input.addEventListener('input', update);
+    input.addEventListener('blur', update);
+    update();
+  });
   document.querySelectorAll('[data-uppercase]').forEach((input) => input.addEventListener('input', () => {
     input.value = input.value.toLocaleUpperCase('pt-BR');
   }));

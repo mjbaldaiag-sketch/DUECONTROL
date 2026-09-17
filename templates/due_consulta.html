@@ -4,7 +4,7 @@
 <div class="page-heading"><div><h1>Gestão de DU-Es</h1><p class="muted">{{ total }} registro(s) encontrado(s)</p></div><div class="actions"><a class="btn" href="{{ url_for('nova_due') }}">+ Nova DU-E</a><a class="btn secondary" href="{{ url_for('modelo_dues') }}">Baixar modelo Excel</a></div></div>
 <div class="import-box"><form class="inline" action="{{ url_for('importar_dues') }}" method="post" enctype="multipart/form-data"><input type="file" name="arquivo" accept=".xlsx,.xls" required><button>Importar Excel</button></form><span class="muted">Use as colunas do modelo para validar os registros corretamente.</span></div>
 <form method="get" class="filters">
-  <label>Número da DU-E<input name="numero_due" value="{{ request.args.get('numero_due','') }}" placeholder="Pesquisar número"></label>
+  <label>Número da DU-E<input name="numero_due" data-due-number inputmode="text" autocomplete="off" spellcheck="false" value="{{ request.args.get('numero_due','') }}" placeholder="Pesquisar número"></label>
   <label>Chave de acesso<input name="chave_acesso" maxlength="14" value="{{ request.args.get('chave_acesso','') }}" placeholder="14 caracteres"></label>
   <label>Cliente<input name="cliente" value="{{ request.args.get('cliente','') }}" placeholder="Nome do cliente"></label>
   <label>CNPJ<input name="cnpj" value="{{ request.args.get('cnpj','') }}"></label>
