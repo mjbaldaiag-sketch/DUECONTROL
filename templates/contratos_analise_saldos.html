@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_pagination.html" import render_pagination %}
+{% from "_sorting.html" import sortable_header %}
 {% block content %}
 <div class="print-report saldo-analysis-report">
   <div class="report-actions">
@@ -13,75 +14,124 @@
   </div>
 
   <div class="report-context">
-    <span>{{ total_sugestoes }} grupo(s) compatível(is) encontrado(s)</span>
-    <span>Critérios: mesma empresa, cliente e moeda; somente saldos abertos com possibilidade ainda não vinculada.</span>
+    <span>{{ total_sugestoes }} total(is) por cliente e moeda encontrado(s)</span>
+    <span>Critérios: mesma empresa, cliente e moeda; saldos ainda abertos.</span>
   </div>
 
   <div class="saldo-analysis-summary" aria-label="Totalizadores da análise">
-    <div>
-      <span>Saldo DUEs em aberto</span>
-      <strong>{{ resumo.saldo_due_aberto|money }}</strong>
-    </div>
-    <div>
-      <span>Saldo contratos em aberto</span>
-      <strong>{{ resumo.saldo_contratos_aberto|money }}</strong>
-    </div>
-    <div>
-      <span>Saldo contratos em grupos compatíveis</span>
-      <strong>{{ resumo.saldo_contratos_compativel|money }}</strong>
-    </div>
-    <div>
-      <span>Saldo contratos fora da tabela</span>
-      <strong>{{ resumo.saldo_contratos_fora_tabela|money }}</strong>
-    </div>
-    <div>
-      <span>Saldo a vincular</span>
-      <strong>{{ resumo.saldo_a_vincular|money }}</strong>
-    </div>
+    <div><span>Saldo DUEs em aberto</span><strong>{{ resumo.saldo_due_aberto|money }}</strong></div>
+    <div><span>Saldo contratos em aberto</span><strong>{{ resumo.saldo_contratos_aberto|money }}</strong></div>
+    <div><span>Saldo contratos em grupos compatíveis</span><strong>{{ resumo.saldo_contratos_compativel|money }}</strong></div>
+    <div><span>Saldo contratos fora da tabela</span><strong>{{ resumo.saldo_contratos_fora_tabela|money }}</strong></div>
+    <div><span>Saldo a vincular</span><strong>{{ resumo.saldo_a_vincular|money }}</strong></div>
   </div>
   <p class="muted saldo-analysis-note">
     O saldo fora da tabela corresponde a contratos em aberto sem DUE compatível em aberto no mesmo grupo de empresa, cliente e moeda.
   </p>
 
-  <section class="report-section">
-    <div class="table-wrap">
-      <table class="compact-table saldo-analysis-table">
-        <thead>
-          <tr>
-            <th>Empresa</th>
-            <th>Cliente</th>
-            <th>Moeda</th>
-            <th>Saldo DUE</th>
-            <th>Saldo contratos</th>
-            <th>Saldo a vincular</th>
-          </tr>
-        </thead>
-        <tbody>
-        {% for sugestao in sugestoes %}
-          <tr>
-            <td>{{ sugestao.empresa or '-' }}</td>
-            <td>{{ sugestao.cliente or '-' }}</td>
-            <td>{{ sugestao.moeda or '-' }}</td>
-            <td>{{ sugestao.saldo_due|money }}</td>
-            <td>{{ sugestao.saldo_contrato|money }}</td>
-            <td>{{ sugestao.saldo_compativel|money }}</td>
-          </tr>
-        {% else %}
-          <tr><td colspan="6" class="empty">Nenhum grupo compatível encontrado para os saldos atualmente abertos.</td></tr>
-        {% endfor %}
-        </tbody>
-        <tfoot>
-          <tr class="saldo-analysis-total-row">
-            <th colspan="3">Total geral dos grupos compatíveis</th>
-            <th>{{ resumo.saldo_due_compativel|money }}</th>
-            <th>{{ resumo.saldo_contratos_compativel|money }}</th>
-            <th>{{ resumo.saldo_a_vincular|money }}</th>
-          </tr>
-        </tfoot>
-      </table>
-    </div>
+  <section class="saldo-analysis-consolidated-grid" aria-label="Totalizadores consolidados">
+    <section class="report-section saldo-analysis-consolidated-section">
+      <div class="section-heading"><h2>Total Geral por Cliente + Moeda</h2></div>
+      <div class="table-wrap">
+        <table class="compact-table saldo-analysis-consolidated-table saldo-analysis-primary-table" data-sortable-server>
+          <thead><tr>
+            {{ sortable_header('Cliente', 'cliente', sort, direction, sort_links) }}
+            {{ sortable_header('Moeda', 'moeda', sort, direction, sort_links) }}
+            {{ sortable_header('Saldo DUE', 'saldo_due', sort, direction, sort_links, 'number') }}
+            {{ sortable_header('Saldo contratos', 'saldo_contrato', sort, direction, sort_links, 'number') }}
+            {{ sortable_header('Saldo a vincular', 'saldo_compativel', sort, direction, sort_links, 'number') }}
+            <th data-sortable="false">Detalhe</th>
+          </tr></thead>
+          <tbody>
+          {% for total in totais_cliente_moeda %}
+            <tr>
+              <td>{{ total.cliente or '-' }}</td><td>{{ total.moeda or '-' }}</td>
+              <td>{{ total.saldo_due|money }}</td><td>{{ total.saldo_contrato|money }}</td><td>{{ total.saldo_compativel|money }}</td>
+              <td class="row-actions"><button type="button" class="saldo-analysis-detail-trigger" data-saldo-detail-target="{{ total._detail_id }}" aria-label="Abrir detalhamento de {{ total.cliente or 'cliente' }}" title="Abrir detalhamento">+</button></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6" class="empty">Nenhum totalizador disponível.</td></tr>
+          {% endfor %}
+          </tbody>
+          <tfoot><tr class="saldo-analysis-total-row"><th colspan="2">Total geral</th><th>{{ resumo.saldo_due_compativel|money }}</th><th>{{ resumo.saldo_contratos_compativel|money }}</th><th>{{ resumo.saldo_a_vincular|money }}</th><th></th></tr></tfoot>
+        </table>
+      </div>
+    </section>
+
+    <section class="report-section saldo-analysis-consolidated-section">
+      <div class="section-heading"><h2>Total Geral por Empresa + Moeda</h2></div>
+      <div class="table-wrap">
+        <table class="compact-table saldo-analysis-consolidated-table">
+          <thead><tr><th>Empresa</th><th>Moeda</th><th>Saldo DUE</th><th>Saldo contratos</th><th>Saldo a vincular</th></tr></thead>
+          <tbody>
+          {% for total in totais_empresa_moeda %}
+            <tr><td>{{ total.empresa or '-' }}</td><td>{{ total.moeda or '-' }}</td><td>{{ total.saldo_due|money }}</td><td>{{ total.saldo_contrato|money }}</td><td>{{ total.saldo_compativel|money }}</td></tr>
+          {% else %}
+            <tr><td colspan="5" class="empty">Nenhum totalizador disponível.</td></tr>
+          {% endfor %}
+          </tbody>
+          <tfoot><tr class="saldo-analysis-total-row"><th colspan="2">Total geral</th><th>{{ resumo.saldo_due_compativel|money }}</th><th>{{ resumo.saldo_contratos_compativel|money }}</th><th>{{ resumo.saldo_a_vincular|money }}</th></tr></tfoot>
+        </table>
+      </div>
+    </section>
   </section>
 
   {{ render_pagination(pagination, 'Paginação da análise de saldos') }}
 </div>
+
+{% for detalhe in detalhes_clientes %}
+<template id="{{ detalhe.id }}">
+  <div class="print-report saldo-client-detail-report">
+    <div class="report-title">
+      <h1>Análise de saldos — {{ detalhe.cliente or '-' }}</h1>
+    </div>
+    <div class="saldo-client-detail-summary" aria-label="Totalizadores do cliente">
+      <div><span>Saldo DUE</span><strong>{{ detalhe.saldo_due|money }}</strong></div>
+      <div><span>Saldo contratos</span><strong>{{ detalhe.saldo_contrato|money }}</strong></div>
+      <div><span>Saldo a vincular</span><strong>{{ detalhe.saldo_compativel|money }}</strong></div>
+    </div>
+
+    {% for grupo in detalhe.grupos %}
+    <section class="report-section saldo-client-detail-group">
+      <div class="section-heading"><h2>{{ grupo.empresa or '-' }} <span class="muted">&gt; {{ grupo.moeda or '-' }}</span></h2></div>
+      <table class="compact-table saldo-client-detail-summary-table">
+        <thead><tr><th>Saldo DUE</th><th>Saldo contratos</th><th>Saldo a vincular</th></tr></thead>
+        <tbody><tr><td>{{ grupo.saldo_due|money }}</td><td>{{ grupo.saldo_contrato|money }}</td><td>{{ grupo.saldo_compativel|money }}</td></tr></tbody>
+      </table>
+
+      <div class="saldo-client-detail-columns">
+        <section><h3>SALDO A VINCULAR — POR CONTRATOS</h3>
+          <table class="compact-table saldo-client-detail-table">
+            <thead><tr><th>Contrato</th><th>Data</th><th>Saldo aberto</th></tr></thead>
+            <tbody>
+            {% for contrato in grupo.contratos %}<tr><td>{{ contrato.numero or '-' }}</td><td>{{ contrato.data|date_br or '-' }}</td><td>{{ contrato.saldo|money }}</td></tr>
+            {% else %}<tr><td colspan="3" class="empty">Nenhum Contrato em aberto.</td></tr>{% endfor %}
+            </tbody>
+            <tfoot><tr><th colspan="2">Total Contratos</th><th>{{ grupo.saldo_contrato|money }}</th></tr></tfoot>
+          </table>
+        </section>
+        <section><h3>SALDO A VINCULAR — POR DUEs</h3>
+          <table class="compact-table saldo-client-detail-table">
+            <thead><tr><th>DUE</th><th>Data</th><th>Saldo aberto</th></tr></thead>
+            <tbody>
+            {% for due in grupo.dues %}<tr><td>{{ due.numero or '-' }}</td><td>{{ due.data|date_br or '-' }}</td><td>{{ due.saldo|money }}</td></tr>
+            {% else %}<tr><td colspan="3" class="empty">Nenhuma DUE em aberto.</td></tr>{% endfor %}
+            </tbody>
+            <tfoot><tr><th colspan="2">Total DUEs</th><th>{{ grupo.saldo_due|money }}</th></tr></tfoot>
+          </table>
+        </section>
+      </div>
+    </section>
+    {% endfor %}
+  </div>
+</template>
+{% endfor %}
+
+<dialog data-saldo-client-dialog aria-labelledby="saldo-client-dialog-title">
+  <div class="saldo-client-dialog-shell">
+    <div class="report-actions"><button class="btn" type="button" data-saldo-client-print>Imprimir detalhamento</button><button class="btn secondary" type="button" data-saldo-client-close>Fechar</button></div>
+    <h2 id="saldo-client-dialog-title" class="sr-only">Detalhamento por cliente</h2>
+    <div data-saldo-client-dialog-content></div>
+  </div>
+</dialog>
 {% endblock %}

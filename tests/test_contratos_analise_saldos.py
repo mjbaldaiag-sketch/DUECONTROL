@@ -205,8 +205,10 @@ class ContractBalanceAnalysisTests(unittest.TestCase):
         self.assertIn(b"Saldo a vincular", html_bytes)
         self.assertIn(b"Saldo contratos em aberto", html_bytes)
         self.assertIn(b"Saldo contratos fora da tabela", html_bytes)
-        self.assertIn(b"Total geral dos grupos compat\xc3\xadveis", html_bytes)
-        self.assertIn(b"saldo-analysis-table", html_bytes)
+        self.assertIn(b"Total Geral por Cliente + Moeda", html_bytes)
+        self.assertIn(b"Total Geral por Empresa + Moeda", html_bytes)
+        self.assertIn(b"data-saldo-detail-target", html_bytes)
+        self.assertNotIn(b"Grupos compat\xc3\xadveis", html_bytes)
         self.assertIn(b"window.print()", html_bytes)
         self.assertNotIn(b"/vincular", html_bytes)
         self.assertNotIn(b"Vincular DUE", html_bytes)
@@ -250,6 +252,107 @@ class ContractBalanceAnalysisTests(unittest.TestCase):
         self.assertIn(b'class="pagination erp-pagination"', first_page.data)
         self.assertIn(b"Page Client 21", second_page.data)
         self.assertNotIn(b"C-PAGE-21", first_page.data)
+
+    def test_analysis_consolidations_sum_compatible_groups_without_recomputing_minimum(self):
+        conn = app.db()
+        self._due(
+            conn, "DUE-SECONDARY-CLIENT", "44555666000182", self.client_one,
+            "Cliente Um", "USD", 100,
+        )
+        self._contract(
+            conn, "C-SECONDARY-CLIENT", "44555666000182", self.client_one,
+            "Cliente Um", "USD", 10, "2026-10-01",
+        )
+        conn.commit()
+        try:
+            with app.app.test_request_context("/contratos/analise-saldos"):
+                app.g.global_context = {}
+                dados = app._montar_analise_saldos(conn)
+        finally:
+            conn.close()
+
+        client_total = next(
+            item for item in dados["totais_cliente_moeda"]
+            if item["cliente"] == "Cliente Um" and item["moeda"] == "USD"
+        )
+        self.assertEqual(client_total["saldo_due"], Decimal("360"))
+        self.assertEqual(client_total["saldo_contrato"], Decimal("400"))
+        self.assertEqual(client_total["saldo_compativel"], Decimal("170"))
+
+        company_total = next(
+            item for item in dados["totais_empresa_moeda"]
+            if item["empresa"] == "Secundária" and item["moeda"] == "USD"
+        )
+        self.assertEqual(company_total["saldo_due"], Decimal("200"))
+        self.assertEqual(company_total["saldo_contrato"], Decimal("10"))
+        self.assertEqual(company_total["saldo_compativel"], Decimal("10"))
+
+    def test_analysis_default_sort_uses_company_priority_and_all_headers_have_links(self):
+        conn = app.db()
+        self._due(
+            conn, "DUE-SECONDARY-ORDER", "44555666000182", self.client_two,
+            "Cliente Dois", "USD", 100,
+        )
+        self._contract(
+            conn, "C-SECONDARY-ORDER", "44555666000182", self.client_two,
+            "Cliente Dois", "USD", 100, "2026-10-02",
+        )
+        conn.commit()
+        try:
+            with app.app.test_request_context("/contratos/analise-saldos"):
+                app.g.global_context = {}
+                dados = app._montar_analise_saldos(conn)
+                _, sort, direction, _ = app.analise_saldos_sorting({})
+                ordered = app._ordenar_analise_saldos(dados["sugestoes"], sort, direction)
+        finally:
+            conn.close()
+
+        self.assertEqual(sort, "empresa")
+        self.assertEqual(direction, "ASC")
+        self.assertEqual(ordered[0]["empresa"], "Principal")
+        self.assertEqual(ordered[-1]["empresa"], "Secundária")
+
+        html = self.client.get(
+            "/contratos/analise-saldos?sort=saldo_due&direction=desc&page=1"
+        ).get_data(as_text=True)
+        for key in (
+            "cliente", "moeda", "saldo_due", "saldo_contrato", "saldo_compativel"
+        ):
+            self.assertIn(f"sort={key}", html)
+        self.assertIn("page=1", html)
+
+    def test_analysis_client_detail_contains_all_groups_sorted_items_and_print_modal(self):
+        conn = app.db()
+        try:
+            with app.app.test_request_context("/contratos/analise-saldos"):
+                app.g.global_context = {}
+                dados = app._montar_analise_saldos(conn)
+        finally:
+            conn.close()
+
+        detail = next(item for item in dados["detalhes_clientes"] if item["cliente"] == "Cliente Um")
+        self.assertGreaterEqual(len(detail["grupos"]), 1)
+        for group in detail["grupos"]:
+            contract_balances = [item["saldo"] for item in group["contratos"]]
+            due_balances = [item["saldo"] for item in group["dues"]]
+            date_key = lambda item: (
+                app.normalize_date(item.get("data")) is None,
+                app.normalize_date(item.get("data")) or "",
+                item.get("_id") or 0,
+            )
+            self.assertEqual(group["contratos"], sorted(group["contratos"], key=date_key))
+            self.assertEqual(group["dues"], sorted(group["dues"], key=date_key))
+            self.assertEqual(sum(contract_balances, Decimal("0")), group["saldo_contrato"])
+            self.assertEqual(sum(due_balances, Decimal("0")), group["saldo_due"])
+
+        response = self.client.get("/contratos/analise-saldos")
+        html = response.get_data(as_text=True)
+        self.assertIn("data-saldo-detail-target", html)
+        self.assertIn("data-saldo-client-dialog", html)
+        self.assertIn("data-saldo-client-print", html)
+        self.assertIn("CONTRATOS", html)
+        self.assertIn("DUEs", html)
+        self.assertIn("saldo-client-detail-columns", html)
 
 
 if __name__ == "__main__":

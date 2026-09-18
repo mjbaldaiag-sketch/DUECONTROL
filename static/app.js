@@ -867,4 +867,53 @@
     contractSelect.addEventListener('change', update);
     clear();
   }
+
+  const saldoClientDialog = document.querySelector('[data-saldo-client-dialog]');
+  if (saldoClientDialog) {
+    const saldoClientContent = saldoClientDialog.querySelector('[data-saldo-client-dialog-content]');
+    const saldoClientClose = saldoClientDialog.querySelector('[data-saldo-client-close]');
+    const saldoClientPrint = saldoClientDialog.querySelector('[data-saldo-client-print]');
+    const saldoClientTriggers = [...document.querySelectorAll('[data-saldo-detail-target]')];
+
+    const closeSaldoClientDialog = () => {
+      if (typeof saldoClientDialog.close === 'function') saldoClientDialog.close();
+      else saldoClientDialog.removeAttribute('open');
+      document.body.classList.remove('saldo-client-detail-printing');
+    };
+
+    const openSaldoClientDialog = (trigger) => {
+      const template = document.getElementById(trigger.dataset.saldoDetailTarget);
+      if (!template || !saldoClientContent) return;
+      saldoClientContent.replaceChildren(template.content.cloneNode(true));
+      const heading = saldoClientContent.querySelector('h1');
+      if (heading) saldoClientDialog.setAttribute('aria-label', heading.textContent.trim());
+      if (typeof saldoClientDialog.showModal === 'function') saldoClientDialog.showModal();
+      else saldoClientDialog.setAttribute('open', '');
+      if (saldoClientClose) saldoClientClose.focus();
+    };
+
+    saldoClientTriggers.forEach((trigger) => {
+      trigger.addEventListener('click', () => openSaldoClientDialog(trigger));
+    });
+    if (saldoClientClose) saldoClientClose.addEventListener('click', closeSaldoClientDialog);
+    saldoClientDialog.addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeSaldoClientDialog();
+    });
+    saldoClientDialog.addEventListener('click', (event) => {
+      if (event.target === saldoClientDialog) closeSaldoClientDialog();
+    });
+    if (saldoClientPrint) {
+      saldoClientPrint.addEventListener('click', () => {
+        document.body.classList.add('saldo-client-detail-printing');
+        window.print();
+      });
+    }
+    window.addEventListener('beforeprint', () => {
+      if (saldoClientDialog.open) document.body.classList.add('saldo-client-detail-printing');
+    });
+    window.addEventListener('afterprint', () => {
+      document.body.classList.remove('saldo-client-detail-printing');
+    });
+  }
 })();

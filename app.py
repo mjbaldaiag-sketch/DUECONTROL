@@ -3186,8 +3186,67 @@ def lista_contratos():
     )
 
 
-def consulta_analise_saldos(conn, incluir_resumo=False):
-    """Monta saldos abertos consolidados sem persistir ou alterar vínculos."""
+def _analise_saldos_publica(item):
+    return {
+        key: value for key, value in item.items()
+        if not key.startswith("_")
+    }
+
+
+def _analise_saldos_sort_value(item, sort):
+    if sort == "empresa":
+        prioridade = item.get("_empresa_prioridade")
+        try:
+            prioridade = int(prioridade) if prioridade is not None else None
+        except (TypeError, ValueError):
+            prioridade = None
+        return prioridade, item.get("_empresa_id") or 0
+    if sort == "cliente":
+        return normalize_client_name_key(item.get("cliente"))
+    if sort == "moeda":
+        return str(item.get("moeda") or "").strip().upper()
+    if sort == "saldo_due":
+        return decimal_value(item.get("saldo_due"))
+    if sort == "saldo_contrato":
+        return decimal_value(item.get("saldo_contrato"))
+    return decimal_value(item.get("saldo_compativel"))
+
+
+def _ordenar_analise_saldos(items, sort, direction):
+    items = list(items)
+    reverse = direction == "DESC"
+    if sort == "empresa":
+        configured = [item for item in items if item.get("_empresa_prioridade") is not None]
+        unconfigured = [item for item in items if item.get("_empresa_prioridade") is None]
+        configured.sort(key=lambda item: _analise_saldos_sort_value(item, sort), reverse=reverse)
+        unconfigured.sort(key=lambda item: item.get("_empresa_id") or 0, reverse=reverse)
+        return configured + unconfigured
+
+    populated = [item for item in items if _analise_saldos_sort_value(item, sort) not in (None, "")]
+    empty = [item for item in items if _analise_saldos_sort_value(item, sort) in (None, "")]
+    populated.sort(key=lambda item: _analise_saldos_sort_value(item, sort), reverse=reverse)
+    return populated + empty
+
+
+def analise_saldos_sorting(args):
+    fields = {
+        "empresa": ("empresa", "text"),
+        "cliente": ("cliente", "text"),
+        "moeda": ("moeda", "text"),
+        "saldo_due": ("saldo_due", "number"),
+        "saldo_contrato": ("saldo_contrato", "number"),
+        "saldo_compativel": ("saldo_compativel", "number"),
+    }
+    return fields, *build_sorting(
+        args,
+        fields,
+        default_sort="empresa",
+        default_direction="ASC",
+    )
+
+
+def _montar_analise_saldos(conn):
+    """Monta a análise sem persistir ou alterar vínculos."""
     due_global, due_global_params = global_context_sql("due", g.global_context)
     contract_global, contract_global_params = global_context_sql("contract", g.global_context)
     due_clause = f" WHERE {due_global}" if due_global else ""
@@ -3200,6 +3259,7 @@ def consulta_analise_saldos(conn, incluir_resumo=False):
         SELECT d.*, e.id AS analise_empresa_id,
                e.razao_social AS analise_empresa_razao_social,
                e.apelido AS analise_empresa_apelido,
+               e.prioridade AS analise_empresa_prioridade,
                cl.nome AS analise_cliente_nome,
                COALESCE(SUM({movement_effect_sql('m')}), 0) AS utilizado
         FROM dues d
@@ -3216,6 +3276,7 @@ def consulta_analise_saldos(conn, incluir_resumo=False):
         SELECT c.*, e.id AS analise_empresa_id,
                e.razao_social AS analise_empresa_razao_social,
                e.apelido AS analise_empresa_apelido,
+               e.prioridade AS analise_empresa_prioridade,
                cl.nome AS analise_cliente_nome,
                comp.descricao AS competencia_descricao,
                {contract_total_sql("c")} AS valor_moeda_consolidado,
@@ -3266,13 +3327,18 @@ def consulta_analise_saldos(conn, incluir_resumo=False):
 
     def group_for(key):
         return groups.setdefault(key, {
+            "empresa_id": key[0],
+            "cliente_key": key[2:],
             "empresa": None,
+            "empresa_prioridade": None,
             "cliente": None,
             "moeda": key[1],
             "saldo_due": Decimal("0"),
             "saldo_contrato": Decimal("0"),
             "due_ids": set(),
             "contrato_ids": set(),
+            "dues": [],
+            "contratos": [],
             "_data_contrato": None,
         })
 
@@ -3283,6 +3349,7 @@ def consulta_analise_saldos(conn, incluir_resumo=False):
         group = group_for(key)
         group["saldo_due"] += due["saldo"]
         group["due_ids"].add(due["id"])
+        group["dues"].append(due)
         due_group_by_id[due["id"]] = key
         group["empresa"] = (
             group["empresa"] or due.get("analise_empresa_apelido") or
@@ -3291,6 +3358,8 @@ def consulta_analise_saldos(conn, incluir_resumo=False):
         group["cliente"] = (
             group["cliente"] or due.get("analise_cliente_nome") or due.get("cliente")
         )
+        if group["empresa_prioridade"] is None:
+            group["empresa_prioridade"] = due.get("analise_empresa_prioridade")
 
     for contrato in contratos:
         key = compatibility_key(contrato)
@@ -3299,6 +3368,7 @@ def consulta_analise_saldos(conn, incluir_resumo=False):
         group = group_for(key)
         group["saldo_contrato"] += contrato["saldo"]
         group["contrato_ids"].add(contrato["id"])
+        group["contratos"].append(contrato)
         contract_group_by_id[contrato["id"]] = key
         group["empresa"] = (
             group["empresa"] or contrato.get("analise_empresa_apelido") or
@@ -3307,6 +3377,8 @@ def consulta_analise_saldos(conn, incluir_resumo=False):
         group["cliente"] = (
             group["cliente"] or contrato.get("analise_cliente_nome") or contrato.get("cliente")
         )
+        if group["empresa_prioridade"] is None:
+            group["empresa_prioridade"] = contrato.get("analise_empresa_prioridade")
         data_contrato = normalize_date(contrato.get("data_contrato"))
         if data_contrato is not None and (
             group["_data_contrato"] is None or data_contrato < group["_data_contrato"]
@@ -3336,6 +3408,10 @@ def consulta_analise_saldos(conn, incluir_resumo=False):
             "saldo_due": group["saldo_due"],
             "saldo_contrato": group["saldo_contrato"],
             "saldo_compativel": min(group["saldo_due"], group["saldo_contrato"]),
+            "_empresa_id": group["empresa_id"],
+            "_empresa_prioridade": group["empresa_prioridade"],
+            "_cliente_key": group["cliente_key"],
+            "_group_key": key,
             "_data_contrato": group["_data_contrato"],
         })
 
@@ -3365,8 +3441,143 @@ def consulta_analise_saldos(conn, incluir_resumo=False):
     resumo["saldo_contratos_fora_tabela"] = (
         resumo["saldo_contratos_aberto"] - resumo["saldo_contratos_compativel"]
     )
+
+    def aggregate_rows(key_getter, label_key):
+        aggregated = {}
+        for item in suggestions:
+            key = key_getter(item)
+            summary = aggregated.setdefault(key, {
+                "empresa": item["empresa"] if label_key == "empresa" else None,
+                "cliente": item["cliente"] if label_key == "cliente" else None,
+                "moeda": item["moeda"],
+                "saldo_due": Decimal("0"),
+                "saldo_contrato": Decimal("0"),
+                "saldo_compativel": Decimal("0"),
+                "_empresa_id": item.get("_empresa_id"),
+                "_empresa_prioridade": item.get("_empresa_prioridade"),
+                "_cliente_key": item.get("_cliente_key"),
+            })
+            summary["saldo_due"] += item["saldo_due"]
+            summary["saldo_contrato"] += item["saldo_contrato"]
+            summary["saldo_compativel"] += item["saldo_compativel"]
+            if label_key == "cliente":
+                current_company_order = (
+                    summary.get("_empresa_prioridade") is None,
+                    summary.get("_empresa_prioridade") or 0,
+                    summary.get("_empresa_id") or 0,
+                )
+                candidate_company_order = (
+                    item.get("_empresa_prioridade") is None,
+                    item.get("_empresa_prioridade") or 0,
+                    item.get("_empresa_id") or 0,
+                )
+                if candidate_company_order < current_company_order:
+                    summary["_empresa_id"] = item.get("_empresa_id")
+                    summary["_empresa_prioridade"] = item.get("_empresa_prioridade")
+        return list(aggregated.values())
+
+    totais_cliente_moeda = aggregate_rows(
+        lambda item: (item["_cliente_key"], item["moeda"]),
+        "cliente",
+    )
+    totais_empresa_moeda = aggregate_rows(
+        lambda item: (item["_empresa_id"], item["moeda"]),
+        "empresa",
+    )
+
+    details_by_client = {}
+    for item in suggestions:
+        group = groups[item["_group_key"]]
+        client_key = item["_cliente_key"]
+        detail = details_by_client.setdefault(client_key, {
+            "cliente": item["cliente"],
+            "saldo_due": Decimal("0"),
+            "saldo_contrato": Decimal("0"),
+            "saldo_compativel": Decimal("0"),
+            "grupos": [],
+        })
+        detail["saldo_due"] += item["saldo_due"]
+        detail["saldo_contrato"] += item["saldo_contrato"]
+        detail["saldo_compativel"] += item["saldo_compativel"]
+
+        contratos_detalhe = sorted(
+            (
+                {
+                    "numero": contrato.get("numero_contrato"),
+                    "data": contrato.get("data_contrato"),
+                    "saldo": contrato["saldo"],
+                    "_id": contrato.get("id"),
+                }
+                for contrato in group["contratos"]
+            ),
+            key=lambda contrato: (
+                normalize_date(contrato.get("data")) is None,
+                normalize_date(contrato.get("data")) or "",
+                contrato.get("_id") or 0,
+            ),
+        )
+        dues_detalhe = sorted(
+            (
+                {
+                    "numero": due.get("numero_due"),
+                    "data": due.get("data_due") or due.get("created_at"),
+                    "saldo": due["saldo"],
+                    "_id": due.get("id"),
+                }
+                for due in group["dues"]
+            ),
+            key=lambda due: (
+                normalize_date(due.get("data")) is None,
+                normalize_date(due.get("data")) or "",
+                due.get("_id") or 0,
+            ),
+        )
+        detail["grupos"].append({
+            "empresa": item["empresa"],
+            "moeda": item["moeda"],
+            "saldo_due": item["saldo_due"],
+            "saldo_contrato": item["saldo_contrato"],
+            "saldo_compativel": item["saldo_compativel"],
+            "contratos": contratos_detalhe,
+            "dues": dues_detalhe,
+            "_empresa_prioridade": item.get("_empresa_prioridade"),
+            "_empresa_id": item.get("_empresa_id"),
+        })
+
+    detail_list = []
+    for index, (client_key, detail) in enumerate(sorted(
+        details_by_client.items(),
+        key=lambda entry: normalize_client_name_key(entry[1].get("cliente")),
+    ), start=1):
+        detail["id"] = f"saldo-cliente-{index}"
+        detail["grupos"].sort(key=lambda group: (
+            group.get("_empresa_prioridade") is None,
+            group.get("_empresa_prioridade") or 0,
+            group.get("_empresa_id") or 0,
+            group.get("moeda") or "",
+        ))
+        detail_list.append(detail)
+        for item in suggestions:
+            if item["_cliente_key"] == client_key:
+                item["_detail_id"] = detail["id"]
+        for item in totais_cliente_moeda:
+            if item["_cliente_key"] == client_key:
+                item["_detail_id"] = detail["id"]
+
+    return {
+        "sugestoes": suggestions,
+        "resumo": resumo,
+        "totais_cliente_moeda": totais_cliente_moeda,
+        "totais_empresa_moeda": totais_empresa_moeda,
+        "detalhes_clientes": detail_list,
+    }
+
+
+def consulta_analise_saldos(conn, incluir_resumo=False):
+    dados = _montar_analise_saldos(conn)
+    suggestions = [_analise_saldos_publica(item) for item in dados["sugestoes"]]
     if incluir_resumo:
-        return suggestions, resumo
+        return suggestions, dados["resumo"]
     return suggestions
 
 
@@ -3374,19 +3585,35 @@ def consulta_analise_saldos(conn, incluir_resumo=False):
 def analise_saldos_contratos():
     conn = db()
     try:
-        suggestions, resumo = consulta_analise_saldos(conn, incluir_resumo=True)
+        dados = _montar_analise_saldos(conn)
     finally:
         conn.close()
+    _, sort, direction, sort_links = analise_saldos_sorting(request.args)
+    principal_rows = _ordenar_analise_saldos(
+        dados["totais_cliente_moeda"], sort, direction
+    )
     pagination = build_pagination(
-        request.args, len(suggestions), endpoint="analise_saldos_contratos"
+        request.args, len(principal_rows), endpoint="analise_saldos_contratos"
     )
     start = pagination["offset"]
-    visible_suggestions = suggestions[start:start + pagination["per_page"]]
+    visible_principal_rows = principal_rows[start:start + pagination["per_page"]]
+    visible_detail_ids = {
+        item.get("_detail_id") for item in visible_principal_rows
+    }
+    visible_details = [
+        detail for detail in dados["detalhes_clientes"]
+        if detail["id"] in visible_detail_ids
+    ]
     return render_template(
         "contratos_analise_saldos.html",
-        sugestoes=visible_suggestions,
-        total_sugestoes=len(suggestions),
-        resumo=resumo,
+        total_sugestoes=len(principal_rows),
+        resumo=dados["resumo"],
+        totais_cliente_moeda=visible_principal_rows,
+        totais_empresa_moeda=dados["totais_empresa_moeda"],
+        detalhes_clientes=visible_details,
+        sort=sort,
+        direction=direction,
+        sort_links=sort_links,
         pagination=pagination,
     )
 
@@ -3460,10 +3687,78 @@ def exportar_contratos():
     conn = db()
     try:
         rows, _ = consulta_contratos(conn, request.args)
+        contrato_ids = [row["id"] for row in rows]
+        invoice_links = []
+        if contrato_ids:
+            placeholders = ",".join("?" for _ in contrato_ids)
+            selected_contract_values = ",".join("(?)" for _ in contrato_ids)
+            invoice_links = conn.execute(f"""
+                WITH selected_contracts(id) AS (VALUES {selected_contract_values})
+                SELECT c.id AS contrato_id, c.numero_contrato,
+                       i.id AS invoice_id, i.numero_invoice, i.tipo_documento,
+                       COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social) AS empresa,
+                       cl.nome AS cliente, i.moeda,
+                       i.valor_moeda AS valor_invoice,
+                       v.valor_alocado AS valor_vinculado,
+                       'Vínculo direto' AS origem,
+                       NULL AS fechamento_id,
+                       v.created_at AS data_vinculo,
+                       v.observacao,
+                       1 AS origem_ordem, v.id AS relacao_id
+                FROM invoice_contrato_cambio v
+                JOIN contratos c ON c.id=v.contrato_id
+                JOIN selected_contracts sc ON sc.id=v.contrato_id
+                JOIN invoices i ON i.id=v.invoice_id
+                JOIN empresas e ON e.id=i.empresa_id
+                LEFT JOIN clientes cl ON cl.id=i.cliente_id
+
+                UNION ALL
+
+                SELECT c.id AS contrato_id, c.numero_contrato,
+                       i.id AS invoice_id, i.numero_invoice, i.tipo_documento,
+                       COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social) AS empresa,
+                       cl.nome AS cliente, i.moeda,
+                       i.valor_moeda AS valor_invoice,
+                       f.valor_moeda AS valor_vinculado,
+                       'Fechamento legado' AS origem,
+                       NULL AS fechamento_id,
+                       f.data_fechamento AS data_vinculo,
+                       f.observacao,
+                       2 AS origem_ordem, f.id AS relacao_id
+                FROM fechamentos_cambio f
+                JOIN contratos c ON c.id=f.contrato_id
+                JOIN selected_contracts sc ON sc.id=f.contrato_id
+                JOIN invoices i ON i.id=f.invoice_id
+                JOIN empresas e ON e.id=i.empresa_id
+                LEFT JOIN clientes cl ON cl.id=i.cliente_id
+                WHERE f.fechamento_id IS NULL
+
+                UNION ALL
+
+                SELECT c.id AS contrato_id, c.numero_contrato,
+                       i.id AS invoice_id, i.numero_invoice, i.tipo_documento,
+                       COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social) AS empresa,
+                       cl.nome AS cliente, i.moeda,
+                       i.valor_moeda AS valor_invoice,
+                       f.valor_moeda AS valor_vinculado,
+                       'Fechamento centralizado' AS origem,
+                       h.id AS fechamento_id,
+                       COALESCE(h.data_fechamento, f.data_fechamento) AS data_vinculo,
+                       f.observacao,
+                       3 AS origem_ordem, f.id AS relacao_id
+                FROM fechamentos_cambio f
+                JOIN fechamentos h ON h.id=f.fechamento_id
+                JOIN contratos c ON c.id=h.contrato_id
+                JOIN selected_contracts sc ON sc.id=h.contrato_id
+                JOIN invoices i ON i.id=f.invoice_id
+                JOIN empresas e ON e.id=i.empresa_id
+                LEFT JOIN clientes cl ON cl.id=i.cliente_id
+
+                ORDER BY numero_contrato, origem_ordem, numero_invoice, relacao_id
+            """, contrato_ids).fetchall()
     except ValueError as exc:
         conn.close()
         return str(exc), 400
-    contrato_ids = [row["id"] for row in rows]
     vinculos = []
     if contrato_ids:
         placeholders = ",".join("?" for _ in contrato_ids)
@@ -3493,6 +3788,16 @@ def exportar_contratos():
             return "Sim" if value else "Não"
         return value
 
+    invoice_numbers_by_contract = {}
+    invoice_ids_by_contract = {}
+    for row in invoice_links:
+        contract_id = row["contrato_id"]
+        invoice_numbers_by_contract.setdefault(contract_id, [])
+        invoice_ids_by_contract.setdefault(contract_id, set())
+        if row["invoice_id"] not in invoice_ids_by_contract[contract_id]:
+            invoice_ids_by_contract[contract_id].add(row["invoice_id"])
+            invoice_numbers_by_contract[contract_id].append(row["numero_invoice"])
+
     labels = {
         "id": "ID", "numero_contrato": "Número do contrato", "banco": "Banco legado",
         "banco_credito": "Banco de Crédito", "banco_liquidacao": "Banco de Liquidação",
@@ -3505,11 +3810,43 @@ def exportar_contratos():
         "empresa_id_filtro": "Empresa ID", "empresa_razao_social": "Empresa - Razão social",
         "empresa_apelido": "Empresa - Apelido", "competencia_descricao": "Competência",
         "vinculado": "Total vinculado", "saldo": "Saldo disponível",
+        "invoices_relacionadas": "Invoices relacionadas",
     }
     contratos_data = []
     for row in rows:
         item = decorate_contract(row)
+        item["invoices_relacionadas"] = " | ".join(
+            str(numero) for numero in invoice_numbers_by_contract.get(item["id"], [])
+        ) or None
         contratos_data.append({labels.get(key, key): excel_value(value, key) for key, value in item.items()})
+
+    invoice_labels = {
+        "contrato_id": "Contrato ID", "numero_contrato": "Número do contrato",
+        "invoice_id": "Invoice ID", "numero_invoice": "Invoice",
+        "tipo_documento": "Tipo de documento", "empresa": "Empresa",
+        "cliente": "Cliente", "moeda": "Moeda", "valor_invoice": "Valor da Invoice",
+        "valor_vinculado": "Valor vinculado", "origem": "Origem do vínculo",
+        "fechamento_id": "Fechamento ID", "data_vinculo": "Data do vínculo",
+        "observacao": "Observação",
+    }
+
+    def invoice_excel_value(value, field):
+        if value is None:
+            return None
+        if field == "data_vinculo":
+            return date_br(value)
+        if field in {"valor_invoice", "valor_vinculado"}:
+            return float(decimal_value(value))
+        return value
+
+    invoices_data = []
+    for row in invoice_links:
+        item = dict(row)
+        invoices_data.append({
+            invoice_labels[key]: invoice_excel_value(item.get(key), key)
+            for key in invoice_labels
+        })
+
     vinculos_data = []
     vinculo_labels = {
         "id": "Vínculo ID", "due_id": "DU-E ID", "contrato_id": "Contrato ID",
@@ -3523,12 +3860,15 @@ def exportar_contratos():
         vinculos_data.append({vinculo_labels.get(key, key): excel_value(value, key) for key, value in dict(row).items()})
 
     contrato_columns = list(labels.values())
+    invoice_columns = list(invoice_labels.values())
     vinculo_columns = list(vinculo_labels.values())
     contratos_df = pd.DataFrame(contratos_data, columns=contrato_columns)
+    invoices_df = pd.DataFrame(invoices_data, columns=invoice_columns)
     vinculos_df = pd.DataFrame(vinculos_data, columns=vinculo_columns)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         contratos_df.to_excel(writer, index=False, sheet_name="Contratos")
+        invoices_df.to_excel(writer, index=False, sheet_name="Invoices")
         vinculos_df.to_excel(writer, index=False, sheet_name="Vínculos")
         for worksheet in writer.book.worksheets:
             worksheet.freeze_panes = "A2"
@@ -3541,6 +3881,16 @@ def exportar_contratos():
                 letter = get_column_letter(column[0].column)
                 width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 12), 45)
                 worksheet.column_dimensions[letter].width = width
+        invoice_worksheet = writer.book["Invoices"]
+        invoice_headers = {
+            cell.value: cell.column for cell in invoice_worksheet[1]
+        }
+        for field in ("Valor da Invoice", "Valor vinculado"):
+            column_index = invoice_headers[field]
+            for row in invoice_worksheet.iter_rows(
+                min_row=2, min_col=column_index, max_col=column_index
+            ):
+                row[0].number_format = "#,##0.00"
     output.seek(0)
     return send_file(output, as_attachment=True, download_name="contratos_exportacao.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -5620,9 +5970,15 @@ def editar_contrato(contrato_id):
                 (contrato_id,),
             ).fetchone()
             central_previsao = None
-            if central_header and categoria_cambio == CATEGORIA_CAMBIO_EXPORTACAO:
+            if categoria_cambio == CATEGORIA_CAMBIO_EXPORTACAO:
+                previsao_form = request.form.get("previsao_embarque_dias")
+                previsao_atual = (
+                    central_header["previsao_embarque_dias"]
+                    if central_header and central_header["previsao_embarque_dias"] is not None
+                    else contrato["previsao_embarque_dias"]
+                )
                 central_previsao = parse_previsao_embarque_dias(
-                    central_header["previsao_embarque_dias"],
+                    previsao_form if str(previsao_form or "").strip() else previsao_atual,
                     required=True,
                 )
             numero = metadata["numero_contrato"]
@@ -5636,16 +5992,12 @@ def editar_contrato(contrato_id):
             conn.execute("""
                 UPDATE contratos SET numero_contrato=?, banco_liquidacao_id=?, banco_liquidacao=?,
                     data_fechamento=?, data_liquidacao=?, data_contrato=?, taxa_cambio=?,
-                    observacao=?, categoria_cambio=?
+                    observacao=?, categoria_cambio=?, previsao_embarque_dias=?
                 WHERE id=?
             """, (numero, metadata["banco_liquidacao_id"], metadata["banco_liquidacao"],
                   metadata["data_fechamento"], metadata["data_liquidacao"], metadata["data_fechamento"],
-                  metadata["taxa_cambio"], metadata["observacao"], categoria_cambio, contrato_id))
-            if categoria_cambio == CATEGORIA_CAMBIO_FINANCEIRO:
-                conn.execute(
-                    "UPDATE contratos SET previsao_embarque_dias=NULL WHERE id=?",
-                    (contrato_id,),
-                )
+                  metadata["taxa_cambio"], metadata["observacao"], categoria_cambio,
+                  central_previsao, contrato_id))
             conn.execute(
                 """
                 UPDATE fechamentos
@@ -5665,6 +6017,8 @@ def editar_contrato(contrato_id):
             form_contrato = dict(contrato)
             if request.form.get("categoria_cambio"):
                 form_contrato["categoria_cambio"] = request.form.get("categoria_cambio")
+            if "previsao_embarque_dias" in request.form:
+                form_contrato["previsao_embarque_dias"] = request.form.get("previsao_embarque_dias")
             return render_template("contrato_form_derived.html", contrato=form_contrato, resumo=resumo,
                                    contrapartes=contrapartes), 400
     conn.close()
