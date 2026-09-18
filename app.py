@@ -6240,15 +6240,18 @@ def exportar_dues():
     sort_fields, sort, direction, _ = dues_sorting(request.args)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     order = f"{sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, d.id {direction}"
+    normalized_due_cnpj = _global_normalized_cnpj_sql("d.cnpj")
+    normalized_company_cnpj = _global_normalized_cnpj_sql("e.cnpj")
 
     conn = db()
     try:
         due_rows = conn.execute(f"""
-            SELECT d.*, COALESCE(SUM(
+            SELECT d.*, e.apelido AS empresa_apelido, COALESCE(SUM(
                        CASE WHEN m.tipo IN ('UTILIZACAO','VINCULACAO')
                             THEN m.valor ELSE -m.valor END
                    ), 0) AS utilizado
             FROM dues d
+            LEFT JOIN empresas e ON {normalized_due_cnpj}={normalized_company_cnpj}
             LEFT JOIN due_movimentacoes m ON m.due_id=d.id
             {clause}
             GROUP BY d.id
@@ -6328,6 +6331,7 @@ def exportar_dues():
         ("id", "ID"), ("numero_due", "Número da DU-E"),
         ("chave_acesso", "Chave de acesso"), ("data_due", "Data da DU-E"),
         ("created_at", "Data de lançamento"), ("cnpj", "CNPJ"),
+        ("empresa_apelido", "Apelido Empresa"),
         ("cliente", "Cliente"), ("moeda", "Moeda"),
         ("valor_original", "Valor original"), ("utilizado", "Total utilizado"),
         ("saldo", "Saldo disponível"), ("status", "Status"),

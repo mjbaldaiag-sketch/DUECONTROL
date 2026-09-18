@@ -215,6 +215,22 @@ class DueNumberTests(unittest.TestCase):
         self.assertEqual([row[0] for row in rows], ["26BR000951958-9"])
         self.assertEqual(rows[0][2], rows[0][1][:10])
 
+    def test_global_excel_export_includes_company_alias(self):
+        conn = app.db()
+        conn.execute(
+            "INSERT INTO dues (numero_due, cnpj, moeda, valor_original) VALUES (?,?,?,?)",
+            ("26BR000951958-9", "45765914000181", "USD", 100),
+        )
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/dues/exportar")
+
+        self.assertEqual(response.status_code, 200)
+        exported = pd.read_excel(io.BytesIO(response.data), sheet_name="DU-Es")
+        self.assertIn("Apelido Empresa", exported.columns)
+        self.assertEqual(exported.iloc[0]["Apelido Empresa"], "Teste")
+
 
 if __name__ == "__main__":
     unittest.main()
