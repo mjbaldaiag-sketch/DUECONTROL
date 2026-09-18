@@ -9338,13 +9338,16 @@ def central_closing_headers(conn, filters=None, pagination=None, sort=None, dire
 
 def central_closing_navigation(conn, fechamento_id, filters=None, sort=None, direction="DESC",
                                global_context=None):
-    """Retorna somente os fechamentos vizinhos na ordem oficial da listagem."""
+    """Retorna os fechamentos vizinhos, usando o ID na ordem padrão."""
     where, params = central_closing_filter_sql(filters, global_context=global_context)
+    navigation_sort = sort or "id"
+    navigation_direction = direction if sort else "ASC"
+    navigation_order = central_closing_order_sql(navigation_sort, navigation_direction)
     row = conn.execute(f"""
         WITH ranked AS (
             SELECT h.id,
-                   LAG(h.id) OVER (ORDER BY {central_closing_order_sql(sort, direction)}) AS previous_id,
-                   LEAD(h.id) OVER (ORDER BY {central_closing_order_sql(sort, direction)}) AS next_id
+                   LAG(h.id) OVER (ORDER BY {navigation_order}) AS previous_id,
+                   LEAD(h.id) OVER (ORDER BY {navigation_order}) AS next_id
             FROM fechamentos h
             JOIN clientes cl ON cl.id=h.cliente_id
             JOIN contrapartes bc ON bc.id=h.banco_credito_id

@@ -160,6 +160,31 @@ class OrderingPaginationTests(unittest.TestCase):
         self.assertNotIn('aria-label="Próximo fechamento"', last_detail)
         self.assertIn("fechamento_cliente_id=1", first_detail)
 
+    def test_default_closing_navigation_follows_id_order(self):
+        conn = app.db()
+        closing_ids = []
+        for value in (100, 300, 200):
+            closing = conn.execute(
+                """INSERT INTO fechamentos
+                   (cliente_id, banco_credito_id, moeda, data_fechamento,
+                    data_liquidacao, banco_liquidacao_id, taxa_cambio, valor_brl)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (1, 1, "USD", "2026-01-01", "2026-01-02", 1, 5, value),
+            )
+            closing_ids.append(closing.lastrowid)
+        conn.commit()
+
+        first = app.central_closing_navigation(conn, closing_ids[0])
+        middle = app.central_closing_navigation(conn, closing_ids[1])
+        last = app.central_closing_navigation(conn, closing_ids[2])
+        conn.close()
+
+        self.assertEqual(first, {"previous_id": None, "next_id": closing_ids[1]})
+        self.assertEqual(middle, {
+            "previous_id": closing_ids[0], "next_id": closing_ids[2],
+        })
+        self.assertEqual(last, {"previous_id": closing_ids[1], "next_id": None})
+
     def test_eligible_invoice_sorting_is_deterministic(self):
         items = [
             {"id": 2, "numero_invoice": "B", "valor_fechamento": 10},

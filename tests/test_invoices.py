@@ -2698,7 +2698,7 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM contratos WHERE numero_contrato='CENTRAL-001'").fetchone()[0], 0)
         conn.close()
 
-    def test_central_closing_detail_navigates_in_registered_order_and_preserves_filters(self):
+    def test_central_closing_detail_navigates_in_id_order_and_preserves_filters(self):
         closings = [
             self._register_central_closing(
                 self._create_invoice("INV-NAV-LOW", "100,00"),
@@ -2719,30 +2719,31 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         ordered_ids = [row["id"] for row in ordered]
         conn.close()
         self.assertEqual(ordered_ids, [closings[1]["id"], closings[2]["id"], closings[0]["id"]])
+        navigation_ids = sorted(item["id"] for item in closings)
 
         first_html = self.client.get(
-            f"/invoices/fechamentos/{ordered_ids[0]}"
+            f"/invoices/fechamentos/{navigation_ids[0]}"
         ).get_data(as_text=True)
         self.assertIn('aria-disabled="true">← Anterior</span>', first_html)
         self.assertIn(
-            f'href="/invoices/fechamentos/{ordered_ids[1]}"', first_html
+            f'href="/invoices/fechamentos/{navigation_ids[1]}"', first_html
         )
 
         middle_html = self.client.get(
-            f"/invoices/fechamentos/{ordered_ids[1]}"
+            f"/invoices/fechamentos/{navigation_ids[1]}"
         ).get_data(as_text=True)
         self.assertIn(
-            f'href="/invoices/fechamentos/{ordered_ids[0]}"', middle_html
+            f'href="/invoices/fechamentos/{navigation_ids[0]}"', middle_html
         )
         self.assertIn(
-            f'href="/invoices/fechamentos/{ordered_ids[2]}"', middle_html
+            f'href="/invoices/fechamentos/{navigation_ids[2]}"', middle_html
         )
 
         last_html = self.client.get(
-            f"/invoices/fechamentos/{ordered_ids[2]}"
+            f"/invoices/fechamentos/{navigation_ids[2]}"
         ).get_data(as_text=True)
         self.assertIn(
-            f'href="/invoices/fechamentos/{ordered_ids[1]}"', last_html
+            f'href="/invoices/fechamentos/{navigation_ids[1]}"', last_html
         )
         self.assertIn('aria-disabled="true">Próximo →</span>', last_html)
 
