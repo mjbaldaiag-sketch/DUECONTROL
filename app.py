@@ -971,19 +971,7 @@ def init_db():
             conn.execute("ALTER TABLE dues ADD COLUMN competencia_id INTEGER")
         if "cliente_id" not in due_columns:
             conn.execute("ALTER TABLE dues ADD COLUMN cliente_id INTEGER")
-        conn.execute("""
-            UPDATE dues
-            SET cliente_id=(
-                SELECT MIN(c.id)
-                FROM clientes c
-                WHERE c.nome=dues.cliente
-            )
-            WHERE cliente_id IS NULL
-              AND cliente IS NOT NULL
-              AND (
-                  SELECT COUNT(*) FROM clientes c2 WHERE c2.nome=dues.cliente
-              )=1
-        """)
+        normalizar_clientes_dues(conn)
         ndf_columns = {row[1] for row in conn.execute("PRAGMA table_info(ndfs)")}
         if "cliente_id" not in ndf_columns:
             conn.execute("ALTER TABLE ndfs ADD COLUMN cliente_id INTEGER")
@@ -1842,6 +1830,41 @@ def ensure_invoice_import_clients(conn, rows, country_overrides=None, client_ove
             row["cliente_id"] = client["id"]
             row["cliente"] = client["nome"]
     return groups
+
+def normalizar_clientes_dues(conn):
+    """Vincula DU-Es aos clientes cadastrados e grava o nome canonico.
+
+    A coluna ``cliente`` permanece por compatibilidade com registros legados,
+    mas ``cliente_id`` e a fonte oficial do relacionamento. Quando o ID ja
+    existe, ele prevalece; quando falta, usamos a mesma resolucao tolerante
+    adotada pela importacao de Invoices. Nomes sem correspondencia segura sao
+    preservados para analise manual, sem criar clientes automaticamente.
+    """
+    rows = conn.execute("""
+        SELECT id, cliente, cliente_id
+        FROM dues
+        WHERE cliente_id IS NOT NULL
+           OR (cliente IS NOT NULL AND TRIM(cliente) <> '')
+        ORDER BY id
+    """).fetchall()
+    updated = 0
+    for row in rows:
+        client = None
+        if row["cliente_id"] is not None:
+            client = conn.execute(
+                "SELECT id, nome FROM clientes WHERE id=?", (row["cliente_id"],)
+            ).fetchone()
+        if client is None and row["cliente"]:
+            client, _ = resolve_import_client(conn, row["cliente"])
+        if client is None:
+            continue
+        if row["cliente_id"] != client["id"] or row["cliente"] != client["nome"]:
+            conn.execute(
+                "UPDATE dues SET cliente=?, cliente_id=? WHERE id=?",
+                (client["nome"], client["id"], row["id"]),
+            )
+            updated += 1
+    return updated
 
 def clientes_for_form(conn):
     return conn.execute("""
@@ -6528,11 +6551,15 @@ def importar_dues():
         flash(f"Não foi possível ler o arquivo Excel: {exc}", "danger")
         return redirect(url_for("consulta_dues"))
 
-    conn = db()
-    existentes = {str(row[0]).strip() for row in conn.execute("SELECT numero_due FROM dues")}
-    chaves_existentes = {str(row[0]).strip().upper() for row in conn.execute("SELECT chave_acesso FROM dues WHERE chave_acesso IS NOT NULL AND chave_acesso <> ''")}
-    conn.close()
     registros, rejeitados, vistos_numeros, vistos_chaves = [], [], set(), set()
+    clientes_normalizados = 0
+
+    conn = db()
+    try:
+        existentes = {str(row[0]).strip() for row in conn.execute("SELECT numero_due FROM dues")}
+        chaves_existentes = {str(row[0]).strip().upper() for row in conn.execute("SELECT chave_acesso FROM dues WHERE chave_acesso IS NOT NULL AND chave_acesso <> ''")}
+    finally:
+        conn.close()
 
     def valor_linha(row, coluna, default=None):
         value = row[coluna] if coluna in df.columns else default
@@ -6562,8 +6589,30 @@ def importar_dues():
             moeda = str(valor_linha(row, "moeda", "USD") or "USD").strip().upper()
             if not moeda:
                 moeda = "USD"
+            cliente_input = normalize_client_name_display(valor_linha(row, "cliente"))
+            cliente_id = None
+            cliente = cliente_input
+            if cliente_input:
+                conn = db()
+                try:
+                    cliente_registro, candidatos = resolve_import_client(conn, cliente_input)
+                finally:
+                    conn.close()
+                if not cliente_registro:
+                    if candidatos:
+                        raise ValueError(
+                            f"o cliente '{cliente_input}' corresponde a mais de um cliente cadastrado"
+                        )
+                    raise ValueError(
+                        f"o cliente '{cliente_input}' nÃ£o estÃ¡ cadastrado; "
+                        "use o nome de um cliente cadastrado"
+                    )
+                cliente_id = cliente_registro["id"]
+                cliente = cliente_registro["nome"]
+                if cliente != cliente_input:
+                    clientes_normalizados += 1
             created_at = launch_timestamp()
-            registros.append((chave, numero, valor_linha(row, "cnpj"), valor_linha(row, "cliente"),
+            registros.append((chave, numero, valor_linha(row, "cnpj"), cliente, cliente_id,
                               moeda, valor_original, status_from_balance(valor_original), created_at,
                               created_at[:10]))
             vistos_numeros.add(numero)
@@ -6579,8 +6628,8 @@ def importar_dues():
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     conn.executemany("""INSERT INTO dues
-                        (chave_acesso,numero_due,cnpj,cliente,moeda,valor_original,status,created_at,data_due)
-                        VALUES (?,?,?,?,?,?,?,?,?)""", registros)
+                        (chave_acesso,numero_due,cnpj,cliente,cliente_id,moeda,valor_original,status,created_at,data_due)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)""", registros)
                     conn.commit()
                     break
                 except sqlite3.OperationalError as exc:
@@ -6598,6 +6647,7 @@ def importar_dues():
             conn.close()
 
     resumo = {"encontrados": len(df), "importados": len(registros), "rejeitados": len(rejeitados),
+              "clientes_normalizados": clientes_normalizados,
               "erros": rejeitados}
     return render_template("due_import_resultado.html", resumo=resumo)
 

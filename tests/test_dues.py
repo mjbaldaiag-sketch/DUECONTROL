@@ -215,6 +215,71 @@ class DueNumberTests(unittest.TestCase):
         self.assertEqual([row[0] for row in rows], ["26BR000951958-9"])
         self.assertEqual(rows[0][2], rows[0][1][:10])
 
+    def test_excel_import_normalizes_registered_client_name_and_links_id(self):
+        conn = app.db()
+        conn.execute(
+            "INSERT INTO clientes (nome, pais) VALUES (?,?)",
+            ("ETG COMMODITIES B. V.", "NL"),
+        )
+        conn.commit()
+        client_id = conn.execute(
+            "SELECT id FROM clientes WHERE nome=?", ("ETG COMMODITIES B. V.",)
+        ).fetchone()[0]
+        conn.close()
+
+        frame = pd.DataFrame([{
+            "numero_due": "26BR0011495381",
+            "chave_acesso": "42345678901234",
+            "cliente": "  ETG   COMMODITIES  ",
+            "valor_original": 100,
+        }])
+        workbook = io.BytesIO()
+        frame.to_excel(workbook, index=False)
+        workbook.seek(0)
+
+        response = self.client.post(
+            "/dues/importar",
+            data={"arquivo": (workbook, "due-client.xlsx")},
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Clientes normalizados", response.get_data(as_text=True))
+        conn = app.db()
+        due = conn.execute(
+            "SELECT cliente, cliente_id FROM dues WHERE numero_due=?",
+            ("26BR001149538-1",),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(tuple(due), ("ETG COMMODITIES B. V.", client_id))
+
+    def test_init_migrates_legacy_due_client_name_to_registered_client(self):
+        conn = app.db()
+        conn.execute(
+            "INSERT INTO clientes (nome, pais) VALUES (?,?)",
+            ("LOUIS DREYFUS COMPANY SUISSE SA", "CH"),
+        )
+        conn.execute(
+            "INSERT INTO dues (numero_due, cliente, moeda, valor_original) VALUES (?,?,?,?)",
+            ("26BR001148381-2", "LOUIS DREYFUS COMPANY SUISSE", "USD", 100),
+        )
+        conn.commit()
+        client_id = conn.execute(
+            "SELECT id FROM clientes WHERE nome=?",
+            ("LOUIS DREYFUS COMPANY SUISSE SA",),
+        ).fetchone()[0]
+        conn.close()
+
+        app.init_db()
+
+        conn = app.db()
+        due = conn.execute(
+            "SELECT cliente, cliente_id FROM dues WHERE numero_due=?",
+            ("26BR001148381-2",),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(tuple(due), ("LOUIS DREYFUS COMPANY SUISSE SA", client_id))
+
     def test_global_excel_export_includes_company_alias(self):
         conn = app.db()
         conn.execute(
