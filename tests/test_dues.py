@@ -183,16 +183,19 @@ class DueNumberTests(unittest.TestCase):
             {
                 "numero_due": "26br0009519589",
                 "chave_acesso": "12345678901234",
+                "cnpj": "45.765.914/0001-81",
                 "valor_original": 100,
             },
             {
                 "numero_due": "26BR000951958-9",
                 "chave_acesso": "22345678901234",
+                "cnpj": "45.765.914/0001-81",
                 "valor_original": 100,
             },
             {
                 "numero_due": "26BR000951958@0",
                 "chave_acesso": "32345678901234",
+                "cnpj": "45.765.914/0001-81",
                 "valor_original": 100,
             },
         ])
@@ -230,6 +233,7 @@ class DueNumberTests(unittest.TestCase):
         frame = pd.DataFrame([{
             "numero_due": "26BR0011495381",
             "chave_acesso": "42345678901234",
+            "cnpj": "45.765.914/0001-81",
             "cliente": "  ETG   COMMODITIES  ",
             "valor_original": 100,
         }])
@@ -252,6 +256,32 @@ class DueNumberTests(unittest.TestCase):
         ).fetchone()
         conn.close()
         self.assertEqual(tuple(due), ("ETG COMMODITIES B. V.", client_id))
+
+    def test_excel_import_assigns_current_open_competence_by_company(self):
+        frame = pd.DataFrame([{
+            "numero_due": "26BR0011495392",
+            "chave_acesso": "52345678901234",
+            "cnpj": "45.765.914/0001-81",
+            "valor_original": 100,
+        }])
+        workbook = io.BytesIO()
+        frame.to_excel(workbook, index=False)
+        workbook.seek(0)
+
+        response = self.client.post(
+            "/dues/importar",
+            data={"arquivo": (workbook, "due-competence.xlsx")},
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        conn = app.db()
+        due = conn.execute(
+            "SELECT competencia_id FROM dues WHERE numero_due=?",
+            ("26BR001149539-2",),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(due["competencia_id"], 1)
 
     def test_init_migrates_legacy_due_client_name_to_registered_client(self):
         conn = app.db()
@@ -279,6 +309,25 @@ class DueNumberTests(unittest.TestCase):
         ).fetchone()
         conn.close()
         self.assertEqual(tuple(due), ("LOUIS DREYFUS COMPANY SUISSE SA", client_id))
+
+    def test_init_migrates_missing_due_competence_by_company_and_operation_date(self):
+        conn = app.db()
+        conn.execute(
+            "INSERT INTO dues (numero_due, cnpj, moeda, valor_original, data_due) VALUES (?,?,?,?,?)",
+            ("26BR001149539-2", "45.765.914/0001-81", "USD", 100, "2026-09-22"),
+        )
+        conn.commit()
+        conn.close()
+
+        app.init_db()
+
+        conn = app.db()
+        due = conn.execute(
+            "SELECT competencia_id FROM dues WHERE numero_due=?",
+            ("26BR001149539-2",),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(due["competencia_id"], 1)
 
     def test_global_excel_export_includes_company_alias(self):
         conn = app.db()

@@ -972,6 +972,7 @@ def init_db():
         if "cliente_id" not in due_columns:
             conn.execute("ALTER TABLE dues ADD COLUMN cliente_id INTEGER")
         normalizar_clientes_dues(conn)
+        normalizar_competencias_dues(conn)
         ndf_columns = {row[1] for row in conn.execute("PRAGMA table_info(ndfs)")}
         if "cliente_id" not in ndf_columns:
             conn.execute("ALTER TABLE ndfs ADD COLUMN cliente_id INTEGER")
@@ -986,6 +987,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contratos_cliente ON contratos(cliente_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ndfs_cliente ON ndfs(cliente_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_cliente ON dues(cliente_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_competencia ON dues(competencia_id)")
         movimentacao_columns = {row[1] for row in conn.execute("PRAGMA table_info(due_movimentacoes)")}
         if "contrato_id" not in movimentacao_columns:
             conn.execute("ALTER TABLE due_movimentacoes ADD COLUMN contrato_id INTEGER")
@@ -1862,6 +1864,35 @@ def normalizar_clientes_dues(conn):
             conn.execute(
                 "UPDATE dues SET cliente=?, cliente_id=? WHERE id=?",
                 (client["nome"], client["id"], row["id"]),
+            )
+            updated += 1
+    return updated
+
+def normalizar_competencias_dues(conn, data_referencia=None):
+    """Atribui a competencia aberta correspondente as DU-Es sem vinculo."""
+    data_atual = data_referencia or date.today().isoformat()
+    rows = conn.execute("""
+        SELECT id, cnpj, data_due, created_at
+        FROM dues
+        WHERE competencia_id IS NULL
+        ORDER BY id
+    """).fetchall()
+    updated = 0
+    for row in rows:
+        empresa_id = empresa_id_por_cnpj(conn, row["cnpj"])
+        if not empresa_id:
+            continue
+        data_operacao = row["data_due"] or (row["created_at"] or "")[:10] or data_atual
+        try:
+            competencia = sugerir_competencia(conn, empresa_id, data_operacao)
+        except ValueError:
+            competencia = None
+        if not competencia and data_operacao != data_atual:
+            competencia = sugerir_competencia(conn, empresa_id, data_atual)
+        if competencia:
+            conn.execute(
+                "UPDATE dues SET competencia_id=? WHERE id=?",
+                (competencia["id"], row["id"]),
             )
             updated += 1
     return updated
@@ -6542,7 +6573,7 @@ def importar_dues():
     try:
         df = pd.read_excel(arquivo)
         df.columns = [str(c).strip().lower() for c in df.columns]
-        obrigatorias = {"chave_acesso", "numero_due", "valor_original"}
+        obrigatorias = {"chave_acesso", "numero_due", "cnpj", "valor_original"}
         faltantes = sorted(obrigatorias - set(df.columns))
         if faltantes:
             flash("O Excel precisa conter as colunas obrigatórias: " + ", ".join(sorted(obrigatorias)) + ".", "danger")
@@ -6553,6 +6584,8 @@ def importar_dues():
 
     registros, rejeitados, vistos_numeros, vistos_chaves = [], [], set(), set()
     clientes_normalizados = 0
+    competencias_atribuidas = 0
+    data_importacao = date.today().isoformat()
 
     conn = db()
     try:
@@ -6585,10 +6618,27 @@ def importar_dues():
             if valor_bruto is None or str(valor_bruto).strip() == "":
                 raise ValueError("valor_original é obrigatório")
             valor_original = parse_number(valor_bruto)
+            cnpj = normalize_import_cnpj(valor_linha(row, "cnpj"))
+            if not cnpj:
+                raise ValueError("CNPJ obrigatorio e deve ser valido")
             ensure_non_negative_balance(valor_original, "valor_original não pode ser negativo")
             moeda = str(valor_linha(row, "moeda", "USD") or "USD").strip().upper()
             if not moeda:
                 moeda = "USD"
+            conn = db()
+            try:
+                empresa_id = empresa_id_por_cnpj(conn, cnpj)
+                if not empresa_id:
+                    raise ValueError(f"a empresa do CNPJ {format_cnpj(cnpj)} nao esta cadastrada")
+                competencia = sugerir_competencia(conn, empresa_id, data_importacao)
+                if not competencia:
+                    raise ValueError(
+                        f"nao existe competencia aberta para a empresa do CNPJ {format_cnpj(cnpj)} "
+                        f"na data {date_br(data_importacao)}"
+                    )
+                competencia_id = competencia["id"]
+            finally:
+                conn.close()
             cliente_input = normalize_client_name_display(valor_linha(row, "cliente"))
             cliente_id = None
             cliente = cliente_input
@@ -6611,10 +6661,11 @@ def importar_dues():
                 cliente = cliente_registro["nome"]
                 if cliente != cliente_input:
                     clientes_normalizados += 1
+            competencias_atribuidas += 1
             created_at = launch_timestamp()
-            registros.append((chave, numero, valor_linha(row, "cnpj"), cliente, cliente_id,
+            registros.append((chave, numero, cnpj, cliente, cliente_id,
                               moeda, valor_original, status_from_balance(valor_original), created_at,
-                              created_at[:10]))
+                              data_importacao, competencia_id))
             vistos_numeros.add(numero)
             vistos_chaves.add(chave)
         except (TypeError, ValueError, InvalidOperation) as exc:
@@ -6628,8 +6679,8 @@ def importar_dues():
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     conn.executemany("""INSERT INTO dues
-                        (chave_acesso,numero_due,cnpj,cliente,cliente_id,moeda,valor_original,status,created_at,data_due)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)""", registros)
+                        (chave_acesso,numero_due,cnpj,cliente,cliente_id,moeda,valor_original,status,created_at,data_due,competencia_id)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""", registros)
                     conn.commit()
                     break
                 except sqlite3.OperationalError as exc:
@@ -6648,6 +6699,7 @@ def importar_dues():
 
     resumo = {"encontrados": len(df), "importados": len(registros), "rejeitados": len(rejeitados),
               "clientes_normalizados": clientes_normalizados,
+              "competencias_atribuidas": competencias_atribuidas,
               "erros": rejeitados}
     return render_template("due_import_resultado.html", resumo=resumo)
 
