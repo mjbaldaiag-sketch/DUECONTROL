@@ -17,13 +17,14 @@
     <div><span>Categoria Câmbio</span><strong>{{ form_data.categoria_cambio }}</strong></div>
     {% if form_data.categoria_cambio == 'Câmbio Exportação' %}<div><span>PREVISÃO EMBARQUE</span><strong>{{ form_data.previsao_embarque_dias ~ ' dias' if form_data.previsao_embarque_dias else '-' }}</strong></div>{% endif %}
     <div><span>Grupos</span><strong>{{ groups|length }}</strong></div>
+    <div><span>Regra de conversão BRL</span><strong>{{ 'Half-Down' if form_data.regra_conversao_brl == 'HALF_DOWN' else 'Half-Up' }}</strong></div>
   </div>
   {% for group in groups %}
     <section class="central-closing-group">
       <div class="section-heading"><h2>Grupo {{ loop.index }} — {{ group.cliente_nome }}</h2><strong>{{ group.valor_moeda|money }} {{ group.moeda }}</strong></div>
       <p class="muted">Banco de Crédito: {{ group.banco_credito_nome }} · Banco de Liquidação: {{ group.banco_liquidacao_nome }} · Moeda: {{ group.moeda }} · Taxa: {{ group.taxa_cambio|rate }} · BRL: {{ group.valor_brl|money }}</p>
       {% for item in group.invoices %}<input type="hidden" name="valor_fechamento_{{ item.id }}" value="{{ item.valor_moeda }}">{% endfor %}<table class="compact-table"><thead><tr><th>Invoice</th><th>Empresa</th><th>Valor reservado</th><th>BRL</th></tr></thead><tbody>
-        {% for item in group.invoices %}<tr><td>{{ item.numero_invoice }}</td><td>{{ item.empresa_apelido or item.empresa_razao_social }}</td><td>{{ item.valor_moeda|money }} {{ group.moeda }}</td><td>{{ (item.valor_moeda * group.taxa_cambio)|money }}</td></tr>{% endfor %}
+        {% for item in group.invoices %}<tr><td>{{ item.numero_invoice }}</td><td>{{ item.empresa_apelido or item.empresa_razao_social }}</td><td>{{ item.valor_moeda|money }} {{ group.moeda }}</td><td>{{ item.valor_brl|money }}</td></tr>{% endfor %}
       </tbody></table>
       <label class="central-closing-contract-field">Número novo de Contrato de Câmbio (opcional)<input name="numero_contrato_{{ group.index }}" maxlength="120" placeholder="Deixe vazio para vincular depois"></label>
     </section>

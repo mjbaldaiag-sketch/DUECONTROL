@@ -2,14 +2,25 @@
 {% from "_pagination.html" import render_pagination %}
 {% block content %}
 {% set editando = contraparte_em_edicao is not none %}
-<div class="page-heading"><div><h1>{{ 'Editar Banco / Contraparte' if editando else 'Cadastrar Banco / Contrapartes' }}</h1><p class="muted">Cadastre os bancos e tradings para reutilizar nos NDFs.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
-<form method="post" action="{{ url_for('editar_contraparte', contraparte_id=contraparte_em_edicao.id) if editando else url_for('cadastro_contrapartes') }}" class="form">
+{% set regra_atual = regra_conversao_brl %}
+<div class="page-heading"><div><h1>{{ 'Editar Banco / Contraparte' if editando else 'Cadastrar Banco / Contrapartes' }}</h1><p class="muted">Cadastre os bancos e configure a regra de conversão BRL.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
+{% if editando %}<div class="flash info" role="status">Editando <strong>{{ contraparte_em_edicao.nome }}</strong>. Escolha a regra e clique em <strong>Salvar alterações</strong> para confirmar.</div>{% endif %}
+<form id="contraparte-form" method="post" action="{{ url_for('editar_contraparte', contraparte_id=contraparte_em_edicao.id) if editando else url_for('cadastro_contrapartes') }}" class="form">
   <label>Nome*<input name="nome" value="{{ nome|default('') }}" required></label>
-  <div class="form-actions"><button>{{ 'Salvar alterações' if editando else 'Cadastrar Banco / Contraparte' }}</button><a class="btn secondary" href="{{ url_for('cadastro_contrapartes') }}">Cancelar</a></div>
+  <label>Regra de conversão BRL*
+    <select name="regra_conversao_brl" required>
+      <option value="HALF_DOWN" {{ 'selected' if regra_atual == 'HALF_DOWN' else '' }}>Half-Down</option>
+      <option value="HALF_UP" {{ 'selected' if regra_atual != 'HALF_DOWN' else '' }}>Half-Up</option>
+    </select>
+    <small class="muted">Usada em novos cálculos de valor moeda × taxa de câmbio.</small>
+  </label>
+  <div class="form-actions"><button type="submit">{{ 'Salvar alterações' if editando else 'Cadastrar Banco / Contraparte' }}</button><a class="btn secondary" href="{{ url_for('cadastro_contrapartes') }}">Cancelar</a></div>
 </form>
 <h2>Banco / Contrapartes cadastrados</h2>
-<div class="table-wrap"><table><thead><tr><th>Nome</th><th>Ações</th></tr></thead><tbody>
-{% for contraparte in contrapartes %}<tr><td>{{ contraparte.nome }}</td><td class="row-actions"><a href="{{ url_for('editar_contraparte', contraparte_id=contraparte.id) }}">Editar</a></td></tr>{% else %}<tr><td class="empty" colspan="2">Nenhum Banco / Contraparte cadastrado.</td></tr>{% endfor %}
+<div class="table-wrap"><table><thead><tr><th>Nome</th><th>Regra de conversão BRL</th><th>Vínculos</th><th>Ações</th></tr></thead><tbody>
+{% for contraparte in contrapartes %}<tr id="contraparte-{{ contraparte.id }}"><td>{{ contraparte.nome }}</td><td><span class="status {{ 'status-concluido' if contraparte.regra_conversao_brl == 'HALF_DOWN' else 'status-pendente' }}">{{ 'Half-Down' if contraparte.regra_conversao_brl == 'HALF_DOWN' else 'Half-Up' }}</span></td><td>
+  {% if contraparte.total_vinculos %}<details><summary>{{ contraparte.total_vinculos }} vínculo(s)</summary><div class="client-links">{% if contraparte.vinculos.configuracoes %}<div>Configurações padrão ({{ contraparte.vinculos.configuracoes|length }})</div>{% endif %}{% if contraparte.vinculos.contratos %}<div>Contratos ({{ contraparte.vinculos.contratos|length }})</div>{% endif %}{% if contraparte.vinculos.fechamentos %}<div>Fechamentos ({{ contraparte.vinculos.fechamentos|length }})</div>{% endif %}{% if contraparte.vinculos.invoices %}<div>Invoices ({{ contraparte.vinculos.invoices|length }})</div>{% endif %}{% if contraparte.vinculos.recebimentos %}<div>Recebimentos ({{ contraparte.vinculos.recebimentos|length }})</div>{% endif %}{% if contraparte.vinculos.ndfs %}<div>NDFs ({{ contraparte.vinculos.ndfs|length }})</div>{% endif %}</div></details>{% else %}<span class="muted">Sem vínculos</span>{% endif %}
+</td><td class="row-actions"><a class="btn secondary" href="{{ url_for('editar_contraparte', contraparte_id=contraparte.id) }}#contraparte-form">Editar</a>{% if contraparte.total_vinculos == 0 %}<form method="post" action="{{ url_for('excluir_contraparte', contraparte_id=contraparte.id) }}" onsubmit="return confirm('Excluir este Banco / Contraparte? Esta ação não pode ser desfeita.');"><button class="link-danger" type="submit">Excluir</button></form>{% else %}<span class="muted" title="Remova os vínculos antes de excluir">Exclusão bloqueada</span>{% endif %}</td></tr>{% else %}<tr><td class="empty" colspan="4">Nenhum Banco / Contraparte cadastrado.</td></tr>{% endfor %}
 </tbody></table></div>
 {{ render_pagination(pagination, 'Paginação de bancos e contrapartes') }}
 {% endblock %}

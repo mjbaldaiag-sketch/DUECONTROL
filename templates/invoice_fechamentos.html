@@ -44,6 +44,7 @@
 </form>
 {{ render_pagination(eligible_pagination, 'Paginação de Invoices elegíveis') }}
 
+<div hidden data-central-bank-rules>{% for banco in contrapartes %}<span data-bank-id="{{ banco.id }}" data-conversion-rule="{{ banco.regra_conversao_brl or 'HALF_UP' }}"></span>{% endfor %}</div>
 <dialog data-central-closing-dialog aria-labelledby="central-closing-dialog-title">
   <form method="post" action="{{ url_for('registrar_fechamentos_invoices') }}" data-central-closing-dialog-form>
     <h2 id="central-closing-dialog-title">Registrar fechamento de câmbio</h2>

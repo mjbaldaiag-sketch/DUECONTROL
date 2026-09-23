@@ -7,7 +7,7 @@ import secrets
 import tempfile
 from html import escape as html_escape
 from pathlib import Path
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_DOWN, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 import io
 import time
@@ -28,6 +28,10 @@ INVOICE_CONTRACT_SCHEMA_VERSION = 1
 INVOICE_SCHEMA_VERSION = 15
 
 SALDO_TOLERANCE = Decimal("0.005")
+CONVERSION_RULE_HALF_DOWN = "HALF_DOWN"
+CONVERSION_RULE_HALF_UP = "HALF_UP"
+CONVERSION_RULE_DEFAULT = CONVERSION_RULE_HALF_UP
+CONVERSION_RULES = (CONVERSION_RULE_HALF_DOWN, CONVERSION_RULE_HALF_UP)
 STATUS_PENDENTE = "PENDENTE"
 STATUS_CONCLUIDO = "CONCLUÍDO"
 STATUS_PARCIAL = "PARCIAL"
@@ -398,6 +402,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS contrapartes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         nome TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        regra_conversao_brl TEXT NOT NULL DEFAULT 'HALF_UP',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -724,6 +729,14 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_fechamentos_contrato ON fechamentos(contrato_id);
             CREATE INDEX IF NOT EXISTS idx_fechamentos_data ON fechamentos(data_fechamento);
         """)
+        contraparte_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(contrapartes)")
+        }
+        if "regra_conversao_brl" not in contraparte_columns:
+            conn.execute(
+                "ALTER TABLE contrapartes ADD COLUMN regra_conversao_brl TEXT "
+                "NOT NULL DEFAULT 'HALF_UP'"
+            )
         configuracoes_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(configuracoes_padrao)")
         }
@@ -1135,6 +1148,18 @@ def parse_number(value):
         raise ValueError("Valor inválido. Use o formato 1.234,56.")
 
 
+def parse_decimal_number(value):
+    if value is None or str(value).strip() == "":
+        return Decimal("0")
+    text = str(value).strip().replace(" ", "")
+    if "," in text:
+        text = text.replace(".", "").replace(",", ".")
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        raise ValueError("Valor inválido. Use o formato 1.234,56.")
+
+
 def parse_exchange_rate(value):
     """Converte e valida a taxa sem fazer os cálculos monetários em float."""
     if value is None or str(value).strip() == "":
@@ -1158,10 +1183,44 @@ def closing_brl_unrounded_value(valor_moeda, taxa_cambio):
     return decimal_value(valor_moeda) * decimal_value(taxa_cambio)
 
 
-def closing_brl_value(valor_moeda, taxa_cambio):
+def normalize_conversion_rule(value, default=CONVERSION_RULE_DEFAULT):
+    if value is None or str(value).strip() == "":
+        return default
+    normalized = str(value).strip().upper().replace("-", "_")
+    aliases = {
+        "HALFDOWN": CONVERSION_RULE_HALF_DOWN,
+        "HALF_DOWN": CONVERSION_RULE_HALF_DOWN,
+        "HALFUP": CONVERSION_RULE_HALF_UP,
+        "HALF_UP": CONVERSION_RULE_HALF_UP,
+    }
+    rule = aliases.get(normalized)
+    if rule is None:
+        raise ValueError("A regra de conversão deve ser Half-Down ou Half-Up.")
+    return rule
+
+
+def get_bank_conversion_rule(conn, banco_id):
+    if banco_id in (None, ""):
+        return CONVERSION_RULE_DEFAULT
+    try:
+        banco_id = int(banco_id)
+    except (TypeError, ValueError):
+        return CONVERSION_RULE_DEFAULT
+    row = conn.execute(
+        "SELECT regra_conversao_brl FROM contrapartes WHERE id=?", (banco_id,)
+    ).fetchone()
+    return normalize_conversion_rule(row["regra_conversao_brl"] if row else None)
+
+
+def closing_brl_value(valor_moeda, taxa_cambio, regra=CONVERSION_RULE_DEFAULT):
     """Calcula o BRL e arredonda apenas na precisão monetária final."""
     value = closing_brl_unrounded_value(valor_moeda, taxa_cambio)
-    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    rounding = (
+        ROUND_HALF_DOWN
+        if normalize_conversion_rule(regra) == CONVERSION_RULE_HALF_DOWN
+        else ROUND_HALF_UP
+    )
+    return value.quantize(Decimal("0.01"), rounding=rounding)
 
 
 def selected_record_ids(form, operation="excluir"):
@@ -1988,9 +2047,137 @@ def clientes_com_vinculos(conn, pagination=None):
         result.append(item)
     return result
 
+def contraparte_vinculos(conn, contraparte_id):
+    """Retorna os vínculos que impedem a exclusão de uma contraparte.
+
+    Algumas tabelas guardam a contraparte por chave estrangeira e contratos/NDFs
+    antigos também podem conservar o nome do banco como texto. Ambos os formatos
+    são considerados para que a exclusão nunca deixe referências órfãs na aplicação.
+    """
+    contraparte = conn.execute(
+        "SELECT id, nome FROM contrapartes WHERE id=?", (contraparte_id,)
+    ).fetchone()
+    if not contraparte:
+        return {}
+
+    def fetch(sql, params=()):
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    vinculos = {
+        "configuracoes": fetch(
+            """
+            SELECT cp.id,
+                   COALESCE(NULLIF(e.apelido, ''), e.razao_social) AS descricao
+            FROM configuracoes_padrao cp
+            LEFT JOIN empresas e ON e.id=cp.empresa_id
+            WHERE cp.banco_credito_id=?
+               OR cp.banco_referenciado_id=?
+               OR cp.banco_liquidacao_id=?
+            ORDER BY cp.id
+            """,
+            (contraparte_id, contraparte_id, contraparte_id),
+        ),
+        "fechamentos": fetch(
+            """
+            SELECT id, 'Fechamento ' || id AS descricao
+            FROM fechamentos
+            WHERE banco_credito_id=? OR banco_liquidacao_id=?
+            ORDER BY id
+            """,
+            (contraparte_id, contraparte_id),
+        ),
+        "invoices": fetch(
+            """
+            SELECT id, numero_invoice AS descricao
+            FROM invoices
+            WHERE banco_referenciado_id=?
+            ORDER BY numero_invoice, id
+            """,
+            (contraparte_id,),
+        ),
+        "recebimentos": fetch(
+            """
+            SELECT id, 'Recebimento ' || id AS descricao
+            FROM recebimentos_invoice
+            WHERE banco_credito_id=?
+            ORDER BY id
+            """,
+            (contraparte_id,),
+        ),
+        "ndfs": fetch(
+            """
+            SELECT id, numero_operacao AS descricao
+            FROM ndfs
+            WHERE contraparte_id=? OR contraparte=? COLLATE NOCASE
+            ORDER BY numero_operacao, id
+            """,
+            (contraparte_id, contraparte["nome"]),
+        ),
+    }
+
+    contratos = fetch(
+        """
+        SELECT id, numero_contrato, banco, banco_credito, banco_liquidacao
+        FROM contratos
+        WHERE banco_liquidacao_id=? OR banco_id=?
+        ORDER BY numero_contrato, id
+        """,
+        (contraparte_id, contraparte_id),
+    )
+    contratos = [
+        {"id": row["id"], "descricao": row["numero_contrato"]}
+        for row in contratos
+    ]
+    contrato_ids = {row["id"] for row in contratos}
+    nome_chave = contraparte["nome"].strip().casefold()
+    for row in conn.execute(
+        """
+        SELECT id, numero_contrato, banco, banco_credito, banco_liquidacao
+        FROM contratos
+        WHERE banco IS NOT NULL OR banco_credito IS NOT NULL OR banco_liquidacao IS NOT NULL
+        ORDER BY numero_contrato, id
+        """
+    ).fetchall():
+        campos = (row["banco"], row["banco_credito"], row["banco_liquidacao"])
+        tokens = {
+            parte.strip().casefold()
+            for campo in campos if campo
+            for parte in str(campo).split(",")
+            if parte.strip()
+        }
+        if row["id"] not in contrato_ids and nome_chave in tokens:
+            contrato_ids.add(row["id"])
+            contratos.append({"id": row["id"], "descricao": row["numero_contrato"]})
+    contratos.sort(key=lambda row: (str(row["descricao"] or "").casefold(), row["id"]))
+    vinculos["contratos"] = contratos
+    return vinculos
+
+
+def contrapartes_com_vinculos(conn, pagination=None):
+    query = """
+        SELECT id, nome, regra_conversao_brl
+        FROM contrapartes
+        ORDER BY nome, id
+    """
+    params = []
+    if pagination:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([pagination["per_page"], pagination["offset"]])
+    contrapartes = conn.execute(query, params).fetchall()
+    result = []
+    for contraparte in contrapartes:
+        item = dict(contraparte)
+        item["vinculos"] = contraparte_vinculos(conn, contraparte["id"])
+        item["total_vinculos"] = sum(
+            len(registros) for registros in item["vinculos"].values()
+        )
+        result.append(item)
+    return result
+
+
 def contrapartes_for_form(conn):
     return conn.execute("""
-        SELECT id, nome
+        SELECT id, nome, regra_conversao_brl
         FROM contrapartes
         ORDER BY nome, id
     """).fetchall()
@@ -2068,7 +2255,10 @@ def cliente_da_selecao(conn, raw_id, current_id=None, required=False):
 def contraparte_da_selecao(conn, raw_id, current_id=None, required=False):
     if raw_id in (None, ""):
         if current_id:
-            contraparte = conn.execute("SELECT id, nome FROM contrapartes WHERE id=?", (current_id,)).fetchone()
+            contraparte = conn.execute(
+                "SELECT id, nome, regra_conversao_brl FROM contrapartes WHERE id=?",
+                (current_id,),
+            ).fetchone()
             if contraparte:
                 return contraparte
         if required:
@@ -2078,7 +2268,10 @@ def contraparte_da_selecao(conn, raw_id, current_id=None, required=False):
         contraparte_id = int(raw_id)
     except (TypeError, ValueError):
         raise ValueError("Selecione um Banco / Contraparte cadastrado.")
-    contraparte = conn.execute("SELECT id, nome FROM contrapartes WHERE id=?", (contraparte_id,)).fetchone()
+    contraparte = conn.execute(
+        "SELECT id, nome, regra_conversao_brl FROM contrapartes WHERE id=?",
+        (contraparte_id,),
+    ).fetchone()
     if not contraparte:
         raise ValueError("O Banco / Contraparte selecionado não foi encontrado.")
     return contraparte
@@ -4015,7 +4208,10 @@ def report_brl_value(item):
     if item.get("valor_reais") is not None:
         return item["valor_reais"]
     if item.get("taxa_cambio") is not None:
-        return item["valor_moeda"] * item["taxa_cambio"]
+        return closing_brl_value(
+            item["valor_moeda"], item["taxa_cambio"],
+            item.get("regra_conversao_brl", CONVERSION_RULE_DEFAULT),
+        )
     return None
 
 def add_report_item(summary, item):
@@ -4264,7 +4460,8 @@ def build_contract_report_context(args, forced_granularity=None):
         rows = conn.execute(f"""SELECT c.id, c.numero_contrato, c.data_contrato, c.cnpj, c.moeda,
                 c.valor_moeda, {contract_total_sql("c")} AS valor_moeda_consolidado,
                 c.taxa_cambio, c.valor_reais, c.cliente, c.cliente_id,
-                c.banco, c.banco_credito, c.banco_liquidacao, c.competencia_id,
+                c.banco, c.banco_credito, c.banco_liquidacao, c.banco_liquidacao_id,
+                bl.regra_conversao_brl, c.competencia_id,
                 c.categoria_cambio,
                 e.id AS empresa_id, e.razao_social AS empresa_razao_social,
                 e.apelido AS empresa_apelido, e.prioridade AS empresa_prioridade,
@@ -4275,6 +4472,7 @@ def build_contract_report_context(args, forced_granularity=None):
             LEFT JOIN empresas e ON REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(c.cnpj,''),'.',''),'/',''),'-',''),' ','')=e.cnpj
             LEFT JOIN competencias comp ON comp.id=c.competencia_id
             LEFT JOIN clientes cl ON cl.id=c.cliente_id
+            LEFT JOIN contrapartes bl ON bl.id=c.banco_liquidacao_id
             LEFT JOIN ptax_cotacoes p ON p.moeda=c.moeda AND p.data_cotacao=date(c.data_contrato)
             {clause}
             ORDER BY """ + empresa_order_sql("e") + """,
@@ -5585,13 +5783,18 @@ def excluir_cliente(cliente_id):
 def cadastro_contrapartes():
     conn = db()
     nome = (request.form.get("nome") or "").strip() if request.method == "POST" else ""
+    regra_conversao_brl = (
+        request.form.get("regra_conversao_brl", CONVERSION_RULE_DEFAULT)
+        if request.method == "POST" else CONVERSION_RULE_DEFAULT
+    )
     if request.method == "POST":
         try:
             if not nome:
                 raise ValueError("O nome do Banco / Contraparte é obrigatório.")
+            regra_conversao_brl = normalize_conversion_rule(regra_conversao_brl)
             conn.execute(
-                "INSERT INTO contrapartes (nome) VALUES (?)",
-                (nome,),
+                "INSERT INTO contrapartes (nome, regra_conversao_brl) VALUES (?,?)",
+                (nome, regra_conversao_brl),
             )
             conn.commit()
             conn.close()
@@ -5605,32 +5808,38 @@ def cadastro_contrapartes():
             flash(str(exc), "danger")
     contrapartes_total = conn.execute("SELECT COUNT(*) FROM contrapartes").fetchone()[0]
     pagination = build_pagination(request.args, contrapartes_total, endpoint="cadastro_contrapartes")
-    contrapartes = conn.execute("""
-        SELECT id, nome
-        FROM contrapartes
-        ORDER BY nome, id
-        LIMIT ? OFFSET ?
-    """, (pagination["per_page"], pagination["offset"])).fetchall()
+    contrapartes = contrapartes_com_vinculos(conn, pagination)
     conn.close()
-    return render_template("contrapartes.html", contrapartes=contrapartes, nome=nome,
-                           contraparte_em_edicao=None, pagination=pagination)
+    return render_template(
+        "contrapartes.html", contrapartes=contrapartes, nome=nome,
+        regra_conversao_brl=regra_conversao_brl,
+        regras_conversao=CONVERSION_RULES,
+        contraparte_em_edicao=None, pagination=pagination,
+    )
 
 
 @app.route("/configuracoes/contrapartes/<int:contraparte_id>/editar", methods=["GET", "POST"])
 def editar_contraparte(contraparte_id):
     conn = db()
     contraparte = conn.execute(
-        "SELECT id, nome FROM contrapartes WHERE id=?", (contraparte_id,)
+        "SELECT id, nome, regra_conversao_brl FROM contrapartes WHERE id=?",
+        (contraparte_id,),
     ).fetchone()
     if not contraparte:
         conn.close()
         return "Banco / Contraparte não encontrado", 404
 
     nome = (request.form.get("nome") or "").strip() if request.method == "POST" else contraparte["nome"]
+    regra_conversao_brl = (
+        request.form.get("regra_conversao_brl", CONVERSION_RULE_DEFAULT)
+        if request.method == "POST"
+        else contraparte["regra_conversao_brl"]
+    )
     if request.method == "POST":
         try:
             if not nome:
                 raise ValueError("O nome do Banco / Contraparte é obrigatório.")
+            regra_conversao_brl = normalize_conversion_rule(regra_conversao_brl)
             conn.execute("BEGIN IMMEDIATE")
             duplicate = conn.execute(
                 "SELECT 1 FROM contrapartes WHERE nome=? COLLATE NOCASE AND id<>?",
@@ -5640,7 +5849,10 @@ def editar_contraparte(contraparte_id):
                 raise ValueError("Já existe um Banco / Contraparte cadastrado com este nome.")
 
             old_name = contraparte["nome"]
-            conn.execute("UPDATE contrapartes SET nome=? WHERE id=?", (nome, contraparte_id))
+            conn.execute(
+                "UPDATE contrapartes SET nome=?, regra_conversao_brl=? WHERE id=?",
+                (nome, regra_conversao_brl, contraparte_id),
+            )
 
             # Contratos legados mantêm os nomes bancários como texto além dos IDs.
             # Atualize apenas os tokens que representam esta contraparte para não
@@ -5680,7 +5892,7 @@ def editar_contraparte(contraparte_id):
             conn.commit()
             conn.close()
             flash("Banco / Contraparte atualizado com sucesso.", "success")
-            return redirect(url_for("cadastro_contrapartes"))
+            return redirect(url_for("cadastro_contrapartes") + f"#contraparte-{contraparte_id}")
         except sqlite3.IntegrityError:
             conn.rollback()
             flash("Já existe um Banco / Contraparte cadastrado com este nome.", "danger")
@@ -5693,17 +5905,67 @@ def editar_contraparte(contraparte_id):
 
     contrapartes_total = conn.execute("SELECT COUNT(*) FROM contrapartes").fetchone()[0]
     pagination = build_pagination(request.args, contrapartes_total, endpoint="cadastro_contrapartes")
-    contrapartes = conn.execute("""
-        SELECT id, nome
-        FROM contrapartes
-        ORDER BY nome, id
-        LIMIT ? OFFSET ?
-    """, (pagination["per_page"], pagination["offset"])).fetchall()
+    contrapartes = contrapartes_com_vinculos(conn, pagination)
     conn.close()
     return render_template(
         "contrapartes.html", contrapartes=contrapartes, nome=nome,
+        regra_conversao_brl=regra_conversao_brl,
+        regras_conversao=CONVERSION_RULES,
         contraparte_em_edicao=contraparte, pagination=pagination,
     )
+
+
+@app.route("/configuracoes/contrapartes/<int:contraparte_id>/excluir", methods=["POST"])
+def excluir_contraparte(contraparte_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        contraparte = conn.execute(
+            "SELECT id, nome FROM contrapartes WHERE id=?", (contraparte_id,)
+        ).fetchone()
+        if not contraparte:
+            conn.rollback()
+            return "Banco / Contraparte não encontrado", 404
+
+        vinculos = contraparte_vinculos(conn, contraparte_id)
+        total_vinculos = sum(len(registros) for registros in vinculos.values())
+        if total_vinculos:
+            conn.rollback()
+            categorias = {
+                "configuracoes": "configurações padrão",
+                "contratos": "contratos",
+                "fechamentos": "fechamentos",
+                "invoices": "Invoices",
+                "recebimentos": "recebimentos",
+                "ndfs": "NDFs",
+            }
+            resumo = ", ".join(
+                f"{categorias[chave]} ({len(registros)})"
+                for chave, registros in vinculos.items()
+                if registros
+            )
+            flash(
+                f"Não é possível excluir {contraparte['nome']}: existem "
+                f"{total_vinculos} vínculo(s) ({resumo}). Remova os vínculos antes de excluir.",
+                "danger",
+            )
+            return redirect(url_for("cadastro_contrapartes") + f"#contraparte-{contraparte_id}")
+
+        conn.execute("DELETE FROM contrapartes WHERE id=?", (contraparte_id,))
+        conn.commit()
+        flash("Banco / Contraparte excluído com sucesso.", "success")
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        flash(
+            "Não foi possível excluir este Banco / Contraparte porque ele possui vínculos.",
+            "danger",
+        )
+    except sqlite3.Error:
+        conn.rollback()
+        flash("Não foi possível excluir o Banco / Contraparte.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("cadastro_contrapartes"))
 
 def competencias_sorting(args):
     fields = {
@@ -6043,6 +6305,11 @@ def editar_contrato(contrato_id):
                 raise ValueError("Já existe um Contrato Câmbio com esse número.")
             if metadata["data_fechamento"] and metadata["data_liquidacao"] and metadata["data_liquidacao"] < metadata["data_fechamento"]:
                 raise ValueError("A data de liquidação não pode ser anterior ao fechamento.")
+            recalculate_brl = (
+                metadata["banco_liquidacao_id"] != contrato["banco_liquidacao_id"]
+                or decimal_value(metadata["taxa_cambio"])
+                != decimal_value(contrato["taxa_cambio"])
+            )
             conn.execute("""
                 UPDATE contratos SET numero_contrato=?, banco_liquidacao_id=?, banco_liquidacao=?,
                     data_fechamento=?, data_liquidacao=?, data_contrato=?, taxa_cambio=?,
@@ -6060,7 +6327,7 @@ def editar_contrato(contrato_id):
                 """,
                 (categoria_cambio, central_previsao, contrato_id),
             )
-            sync_contract_cache(conn, contrato_id)
+            sync_contract_cache(conn, contrato_id, recalculate_brl=recalculate_brl)
             conn.commit(); conn.close()
             flash("Contrato Câmbio atualizado com sucesso.", "success")
             return redirect(url_for("detalhe_contrato", contrato_id=contrato_id))
@@ -7639,7 +7906,8 @@ def invoice_summary(conn, invoice_id):
     recebimentos = invoice_receipt_rows(conn, invoice_id)
     cambios = conn.execute("""
         SELECT v.*, c.numero_contrato, c.moeda AS contrato_moeda,
-               c.banco_liquidacao, c.data_fechamento, c.data_liquidacao,
+               c.banco_liquidacao, c.banco_liquidacao_id,
+               c.data_fechamento, c.data_liquidacao,
                c.taxa_cambio, c.valor_reais AS contrato_valor_reais,
                c.categoria_cambio
         FROM invoice_contrato_cambio v
@@ -7658,7 +7926,8 @@ def invoice_summary(conn, invoice_id):
                bank_liquidacao.nome AS fechamento_banco_liquidacao_nome,
                COALESCE(h.contrato_id, f.contrato_id) AS contrato_id_efetivo,
                c.numero_contrato, c.moeda AS contrato_moeda,
-               c.banco_liquidacao, c.data_liquidacao, c.taxa_cambio,
+               c.banco_liquidacao, c.banco_liquidacao_id,
+               c.data_liquidacao, c.taxa_cambio,
                c.valor_reais AS contrato_valor_reais, c.categoria_cambio
         FROM fechamentos_cambio f
         LEFT JOIN fechamentos h ON h.id=f.fechamento_id
@@ -7693,6 +7962,11 @@ def invoice_summary(conn, invoice_id):
                 row["fechamento_taxa_cambio"]
                 if row["fechamento_taxa_cambio"] is not None
                 else row["taxa_cambio"]
+            ),
+            "banco_liquidacao_id": (
+                row["fechamento_banco_liquidacao_id"]
+                if row["fechamento_banco_liquidacao_id"] is not None
+                else row["banco_liquidacao_id"]
             ),
             "valor_alocado": row["valor_moeda"],
         })
@@ -7735,7 +8009,37 @@ def invoice_summary(conn, invoice_id):
     ]
     taxa_volume = sum((valor for valor, taxa in taxa_rows if taxa is not None), Decimal("0"))
     taxa_valor = sum((valor * decimal_value(taxa) for valor, taxa in taxa_rows if taxa is not None), Decimal("0"))
-    valor_brl_calculado = taxa_valor
+    conversion_rows = [
+        (
+            decimal_value(row["valor_alocado"]),
+            row["taxa_cambio"],
+            row["banco_liquidacao_id"],
+        )
+        for row in cambios
+        if row["taxa_cambio"] is not None
+    ]
+    conversion_rows.extend(
+        (
+            decimal_value(row["valor_moeda"]),
+            row["fechamento_taxa_cambio"]
+            if row["fechamento_taxa_cambio"] is not None
+            else row["taxa_cambio"],
+            row["fechamento_banco_liquidacao_id"]
+            if row["fechamento_banco_liquidacao_id"] is not None
+            else row["banco_liquidacao_id"],
+        )
+        for row in fechamentos if row["contrato_id_efetivo"]
+    )
+    valor_brl_calculado = sum(
+        (
+            closing_brl_value(
+                amount, rate, get_bank_conversion_rule(conn, bank_id)
+            )
+            for amount, rate, bank_id in conversion_rows
+            if rate is not None
+        ),
+        Decimal("0"),
+    )
     try:
         status = normalize_invoice_status(invoice["status"], default=INVOICE_STATUS_AGUARDANDO_RECEBIMENTO)
     except ValueError:
@@ -8361,7 +8665,10 @@ def resolve_counterparty(conn, raw_id, required=False):
         record_id = int(raw_id)
     except (TypeError, ValueError):
         raise ValueError("Selecione um Banco / Contraparte válido.")
-    row = conn.execute("SELECT id, nome FROM contrapartes WHERE id=?", (record_id,)).fetchone()
+    row = conn.execute(
+        "SELECT id, nome, regra_conversao_brl FROM contrapartes WHERE id=?",
+        (record_id,),
+    ).fetchone()
     if not row:
         raise ValueError("O Banco / Contraparte selecionado não foi encontrado.")
     return row
@@ -8475,7 +8782,7 @@ def contract_for_invoice(conn, invoice, metadata):
                      tuple(updates.values()) + (contrato["id"],))
     return contrato["id"]
 
-def sync_contract_cache(conn, contrato_id):
+def sync_contract_cache(conn, contrato_id, recalculate_brl=False):
     contrato = conn.execute("SELECT * FROM contratos WHERE id=?", (contrato_id,)).fetchone()
     if not contrato:
         return None
@@ -8535,8 +8842,23 @@ def sync_contract_cache(conn, contrato_id):
     if central_header and central_header["valor_brl"] is not None:
         valor_reais = decimal_value(central_header["valor_brl"])
     else:
-        valor_reais = (total_value * decimal_value(contrato["taxa_cambio"])
-                       if contrato["taxa_cambio"] is not None else None)
+        same_financial_inputs = (
+            not recalculate_brl
+            and contrato["valor_reais"] is not None
+            and decimal_value(contrato["valor_moeda"]) == total_value
+            and contrato["taxa_cambio"] is not None
+        )
+        if same_financial_inputs:
+            valor_reais = decimal_value(contrato["valor_reais"])
+        else:
+            valor_reais = (
+                closing_brl_value(
+                    total_value,
+                    contrato["taxa_cambio"],
+                    get_bank_conversion_rule(conn, contrato["banco_liquidacao_id"]),
+                )
+                if contrato["taxa_cambio"] is not None else None
+            )
     linked = decimal_value(conn.execute("""
         SELECT COALESCE(SUM(valor),0) FROM due_movimentacoes
         WHERE contrato_id=? AND tipo='VINCULACAO'
@@ -9173,6 +9495,9 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
         raise ValueError("A Data de Liquidação não pode ser anterior à Data de Fechamento.")
     rate = parse_exchange_rate(taxa_cambio)
     banco_liquidacao = resolve_counterparty(conn, banco_liquidacao_id, required=True)
+    regra_conversao_brl = normalize_conversion_rule(
+        banco_liquidacao["regra_conversao_brl"]
+    )
     categoria = normalize_cambio_category(categoria_cambio)
 
     invoices = [central_closing_invoice(conn, invoice_id) for invoice_id in ids]
@@ -9200,7 +9525,7 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
         if raw_amount is None:
             requested_amount = invoice["valor_fechamento"]
         else:
-            requested_amount = decimal_value(parse_number(raw_amount))
+            requested_amount = parse_decimal_number(raw_amount)
         if requested_amount <= SALDO_TOLERANCE:
             raise ValueError(
                 f"Informe um valor de fechamento maior que zero para a Invoice {invoice['numero_invoice']}."
@@ -9231,6 +9556,7 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
             "valor_brl": Decimal("0"),
             "banco_liquidacao_id": banco_liquidacao["id"],
             "banco_liquidacao_nome": banco_liquidacao["nome"],
+            "regra_conversao_brl": regra_conversao_brl,
         })
         item = {
             "id": invoice["id"],
@@ -9239,6 +9565,9 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
             "empresa_apelido": invoice["empresa_apelido"],
             "empresa_razao_social": invoice["empresa_razao_social"],
             "valor_moeda": invoice["valor_fechamento"],
+            "valor_brl": closing_brl_value(
+                invoice["valor_fechamento"], rate, regra_conversao_brl
+            ),
             "total_recebido": invoice["total_recebido"],
             "saldo_fechamentos": invoice["saldo_fechamentos"],
             "fechamento_parcial": invoice["fechamento_parcial"],
@@ -9247,7 +9576,9 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
         group["valor_moeda"] += invoice["valor_fechamento"]
 
     for group in groups_by_key.values():
-        group["valor_brl"] = closing_brl_value(group["valor_moeda"], group["taxa_cambio"])
+        group["valor_brl"] = closing_brl_value(
+            group["valor_moeda"], group["taxa_cambio"], group["regra_conversao_brl"]
+        )
 
     groups = list(groups_by_key.values())
     groups.sort(key=lambda group: (group["banco_credito_nome"].casefold(), group["moeda"]))
@@ -9500,10 +9831,12 @@ def central_closing_report_items(conn, filters=None):
                e.id AS empresa_id, e.prioridade AS empresa_prioridade,
                c.numero_contrato, COALESCE(f.moeda, h.moeda) AS moeda,
                COALESCE(f.valor_moeda, 0) AS valor_moeda, h.taxa_cambio,
+               h.banco_liquidacao_id, bl.regra_conversao_brl,
                h.valor_brl AS fechamento_valor_brl
         FROM fechamentos h
         JOIN clientes cl ON cl.id=h.cliente_id
         JOIN contrapartes bc ON bc.id=h.banco_credito_id
+        JOIN contrapartes bl ON bl.id=h.banco_liquidacao_id
         LEFT JOIN contratos c ON c.id=h.contrato_id
         LEFT JOIN fechamentos_cambio f ON f.fechamento_id=h.id
         LEFT JOIN invoices i ON i.id=f.invoice_id
@@ -9699,7 +10032,10 @@ def central_closing_report_context(args):
     report_items = [dict(item) for item in report_items]
     for item in report_items:
         item["valor_brl"] = (
-            closing_brl_unrounded_value(item["valor_moeda"], item["taxa_cambio"])
+            closing_brl_value(
+                item["valor_moeda"], item["taxa_cambio"],
+                item.get("regra_conversao_brl", CONVERSION_RULE_DEFAULT),
+            )
             if item["taxa_cambio"] is not None
             else None
         )
@@ -10626,6 +10962,7 @@ def previsualizar_fechamentos_invoices():
             "data_liquidacao": request.form.get("data_liquidacao", ""),
             "taxa_cambio": request.form.get("taxa_cambio", ""),
             "banco_liquidacao_id": request.form.get("banco_liquidacao_id", ""),
+            "regra_conversao_brl": groups[0]["regra_conversao_brl"] if groups else CONVERSION_RULE_DEFAULT,
             "categoria_cambio": request.form.get("categoria_cambio", ""),
             "previsao_embarque_dias": str(groups[0]["previsao_embarque_dias"])
             if groups and groups[0]["previsao_embarque_dias"] is not None
@@ -10783,6 +11120,19 @@ def editar_fechamento_invoice(fechamento_id):
         banco_liquidacao = resolve_counterparty(
             conn, request.form.get("banco_liquidacao_id"), required=True
         )
+        regra_conversao_brl = normalize_conversion_rule(
+            banco_liquidacao["regra_conversao_brl"]
+        )
+        financeiros_inalterados = (
+            detail["banco_liquidacao_id"] == banco_liquidacao["id"]
+            and detail["taxa_cambio"] is not None
+            and decimal_value(detail["taxa_cambio"]) == decimal_value(taxa_cambio)
+        )
+        valor_brl = (
+            decimal_value(detail["valor_brl"])
+            if financeiros_inalterados and detail["valor_brl"] is not None
+            else closing_brl_value(detail["valor_moeda"], taxa_cambio, regra_conversao_brl)
+        )
         group = dict(detail)
         group.update({
             "data_fechamento": data_fechamento,
@@ -10790,9 +11140,10 @@ def editar_fechamento_invoice(fechamento_id):
             "taxa_cambio": taxa_cambio,
             "categoria_cambio": categoria_cambio,
             "previsao_embarque_dias": previsao_embarque_dias,
-            "valor_brl": closing_brl_value(detail["valor_moeda"], taxa_cambio),
+            "valor_brl": valor_brl,
             "banco_liquidacao_id": banco_liquidacao["id"],
             "banco_liquidacao_nome": banco_liquidacao["nome"],
+            "regra_conversao_brl": regra_conversao_brl,
         })
         for item in detail["items"]:
             invoice_ids.append(item["invoice_id"])

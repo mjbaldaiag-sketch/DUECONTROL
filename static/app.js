@@ -346,38 +346,100 @@
     const brlTotalValue = dialog ? dialog.querySelector('[data-central-brl-total-value]') : null;
     const dialogContracts = dialog ? dialog.querySelector('[data-central-closing-contracts]') : null;
     const liquidationBank = dialogForm ? dialogForm.querySelector('[name="banco_liquidacao_id"]') : null;
+    const bankRuleElements = [...document.querySelectorAll('[data-central-bank-rules] [data-bank-id]')];
+    const bankRules = new Map(bankRuleElements.map((item) => [
+      item.dataset.bankId, item.dataset.conversionRule || 'HALF_UP',
+    ]));
+    if (liquidationBank) {
+      [...liquidationBank.options].forEach((option) => {
+        option.dataset.conversionRule = bankRules.get(option.value) || 'HALF_UP';
+      });
+    }
     const categorySelect = dialogForm ? dialogForm.querySelector('[data-central-cambio-category]') : null;
     const rateInput = dialogForm ? dialogForm.querySelector('[name="taxa_cambio"]') : null;
     const previsaoLabel = dialogForm ? dialogForm.querySelector('[data-previsao-embarque-label]') : null;
     const previsaoInput = dialogForm ? dialogForm.querySelector('[data-previsao-embarque]') : null;
     const cancel = dialog ? dialog.querySelector('[data-central-cancel]') : null;
     const selected = () => checkboxes.filter((checkbox) => checkbox.checked);
-    const parseDisplayedNumber = (value) => {
-      const text = String(value || '').trim().replace(/\s/g, '');
-      if (!text) return 0;
-      const normalized = text.includes(',')
-        ? text.replace(/\./g, '').replace(',', '.') : text;
-      const number = Number(normalized);
-      return Number.isFinite(number) ? number : 0;
+    const decimalParts = (value) => {
+      let text = String(value || '').trim().replace(/\s/g, '');
+      if (!text) return { digits: 0n, scale: 0 };
+      if (text.includes(',')) text = text.replace(/\./g, '').replace(',', '.');
+      const negative = text.startsWith('-');
+      if (negative) text = text.slice(1);
+      const pieces = text.split('.');
+      if (pieces.length > 2) {
+        const fraction = pieces.pop();
+        text = `${pieces.join('')}.${fraction}`;
+      }
+      const [whole, fraction = ''] = text.split('.');
+      const digitsText = `${whole || '0'}${fraction}`.replace(/^0+(?=\d)/, '') || '0';
+      return {
+        digits: (negative ? -1n : 1n) * BigInt(digitsText),
+        scale: fraction.length,
+      };
     };
-    const formatDisplayedMoney = (value) => new Intl.NumberFormat('pt-BR', {
-      minimumFractionDigits: 2, maximumFractionDigits: 2,
-    }).format(Number(value || 0));
+    const decimalSum = (values) => {
+      const parts = values.map(decimalParts);
+      const scale = parts.reduce((max, item) => Math.max(max, item.scale), 0);
+      const digits = parts.reduce(
+        (sum, item) => sum + item.digits * (10n ** BigInt(scale - item.scale)), 0n,
+      );
+      return { digits, scale };
+    };
+    const formatDecimalMoney = (value) => {
+      let { digits, scale } = value;
+      const negative = digits < 0n;
+      if (negative) digits = -digits;
+      if (scale < 2) digits *= 10n ** BigInt(2 - scale);
+      if (scale > 2) {
+        const divisor = 10n ** BigInt(scale - 2);
+        const remainder = digits % divisor;
+        digits /= divisor;
+        if (remainder * 2n >= divisor) digits += 1n;
+      }
+      const text = digits.toString().padStart(3, '0');
+      const integer = text.slice(0, -2).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+      return `${negative ? '-' : ''}${integer},${text.slice(-2)}`;
+    };
+    const formatDisplayedMoney = (value) => formatDecimalMoney(value);
+    const conversionPreview = (amount, rate, rule) => {
+      const amountValue = typeof amount === 'string' ? decimalParts(amount) : amount;
+      const rateValue = typeof rate === 'string' ? decimalParts(rate) : rate;
+      const numerator = amountValue.digits * rateValue.digits;
+      const scale = amountValue.scale + rateValue.scale;
+      const targetScale = 2;
+      if (scale <= targetScale) {
+        return formatDecimalMoney({
+          digits: numerator * (10n ** BigInt(targetScale - scale)),
+          scale: targetScale,
+        });
+      }
+      const divisor = 10n ** BigInt(scale - targetScale);
+      let cents = numerator / divisor;
+      const remainder = numerator % divisor;
+      const isHalfUp = rule !== 'HALF_DOWN';
+      if (remainder * 2n > divisor || (isHalfUp && remainder * 2n === divisor)) cents += 1n;
+      return formatDecimalMoney({ digits: cents, scale: targetScale });
+    };
     const syncDialogTotals = () => {
       if (!dialogSummary || !selectedTotal || !brlTotal || !brlTotalValue) return;
       const selectedIds = new Set(selected().map((checkbox) => `valor_fechamento_${checkbox.value}`));
       const amountInputs = dialogItems
         ? [...dialogItems.querySelectorAll('input[name^="valor_fechamento_"]')]
           .filter((input) => selectedIds.has(input.name)) : [];
-      const total = amountInputs.length
-        ? amountInputs.reduce((sum, input) => sum + parseDisplayedNumber(input.value), 0)
-        : selected().reduce(
-          (sum, checkbox) => sum + parseDisplayedNumber(checkbox.dataset.invoiceAvailable), 0
-        );
-      const rate = parseDisplayedNumber(rateInput ? rateInput.value : '');
+      const total = decimalSum(
+        amountInputs.length
+          ? amountInputs.map((input) => input.value)
+          : selected().map((checkbox) => checkbox.dataset.invoiceAvailable || '0'),
+      );
+      const rate = decimalParts(rateInput ? rateInput.value : '');
+      const selectedRule = liquidationBank && liquidationBank.selectedOptions.length
+        ? liquidationBank.selectedOptions[0].dataset.conversionRule || 'HALF_UP'
+        : 'HALF_UP';
       selectedTotal.textContent = `USD ${formatDisplayedMoney(total)}`;
-      brlTotalValue.textContent = `R$ ${formatDisplayedMoney(total * rate)}`;
-      brlTotal.hidden = !rateInput || rate <= 0;
+      brlTotalValue.textContent = `R$ ${conversionPreview(total, rate, selectedRule)}`;
+      brlTotal.hidden = !rateInput || rate.digits <= 0n;
       dialogSummary.hidden = selected().length === 0;
     };
     const selectedPrevisaoDefault = () => {
@@ -562,6 +624,7 @@
     });
     if (categorySelect) categorySelect.addEventListener('change', () => syncPrevisao(true));
     if (rateInput) rateInput.addEventListener('input', syncDialogTotals);
+    if (liquidationBank) liquidationBank.addEventListener('change', syncDialogTotals);
     if (previsaoInput) previsaoInput.addEventListener('input', validatePrevisao);
     if (submit && dialog) submit.addEventListener('click', () => {
       if (!selected().length || !sameClient(selected())) {
