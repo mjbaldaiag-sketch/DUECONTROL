@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading"><div><h1>{{ 'Editar contrato comercial' if edit_mode|default(false) else 'Novo contrato comercial' }}</h1><p class="muted">O contrato cambial existente não é utilizado nesta tela.</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('lista_contratos_comerciais') }}">Voltar</a></div></div>
+<form method="post" class="form">
+  <label>Número do contrato*<input name="numero_contrato" value="{{ contrato.numero_contrato or '' }}" required></label>
+  <label>Empresa*<select name="empresa_id" required><option value="">Selecione uma empresa</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if empresa_id and (empresa_id|string) == (empresa.id|string) else '' }}>{{ empresa.apelido or empresa.razao_social }}{% if empresa.cnpj %} — {{ empresa.cnpj|cnpj }}{% endif %}</option>{% endfor %}</select></label>
+  <label>Competência / Safra*<select name="competencia_id" required><option value="">Selecione uma Competência</option>{% for competencia in competencias %}<option value="{{ competencia.id }}" {{ 'selected' if contrato.competencia_id and (contrato.competencia_id|string) == (competencia.id|string) else '' }}>{{ competencia.descricao }} — {{ competencia.apelido or competencia.razao_social }} ({{ competencia.data_inicial|date_br }} a {{ competencia.data_final|date_br }})</option>{% endfor %}</select></label>
+  <label>Comprador*<select name="cliente_id" required><option value="">Selecione um comprador</option>{% for cliente in clientes %}<option value="{{ cliente.id }}" {{ 'selected' if contrato.cliente_id and (contrato.cliente_id|string) == (cliente.id|string) else '' }}>{{ cliente.nome }}{% if cliente.pais %} — {{ cliente.pais|pais_nome }}{% endif %}</option>{% endfor %}</select></label>
+  <label>Mercado*<select name="mercado" required>{% for mercado in mercados %}<option value="{{ mercado }}" {{ 'selected' if contrato.mercado == mercado else '' }}>{{ mercado|market_label }}</option>{% endfor %}</select></label>
+  <label>Data do contrato*<input type="date" name="data_contrato" value="{{ contrato.data_contrato or '' }}" required></label>
+  <label>Observação<textarea name="observacao">{{ contrato.observacao or '' }}</textarea></label>
+  <div class="form-actions"><button>{{ 'Salvar alterações' if edit_mode|default(false) else 'Cadastrar contrato' }}</button><a class="btn secondary" href="{{ url_for('lista_contratos_comerciais') }}">Cancelar</a></div>
+</form>
+{% endblock %}

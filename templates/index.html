@@ -2,7 +2,17 @@
 {% from "_pagination.html" import render_pagination %}
 {% from "_sorting.html" import sortable_header %}
 {% block content %}
-<h1>Dashboard</h1><p class="muted">Controle de DU-Es, Contratos de Câmbio e Derivativos</p>
+<div class="dashboard-page">
+<section class="dashboard-hero" aria-labelledby="dashboard-title">
+  <div>
+    <span class="dashboard-eyebrow">Visão geral operacional</span>
+    <h1 id="dashboard-title">Dashboard</h1>
+    <p class="muted">Acompanhe os principais fluxos de exportação em um só lugar.</p>
+  </div>
+  <div class="dashboard-hero-status"><span class="dashboard-status-dot" aria-hidden="true"></span><span>Visão consolidada</span></div>
+</section>
+<section class="dashboard-section" aria-labelledby="dashboard-indicators-title">
+<div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">Indicadores principais</span><h2 id="dashboard-indicators-title">Resumo da operação</h2></div><span class="dashboard-section-meta">Acesso rápido por módulo</span></div>
 <div class="dashboard-summary-cards" aria-label="Resumo do sistema">
   <a class="dashboard-summary-card dashboard-summary-card--invoice" href="{{ url_for('lista_invoices') }}" aria-label="Total Invoices: {{ resumo.invoices }}">
     <span>Total Invoices</span><strong>{{ resumo.invoices }}</strong>
@@ -20,10 +30,38 @@
     <span>Total Contratos sem vínculo</span><strong>{{ resumo.contratos_sem_vinculo }}</strong>
   </a>
 </div>
-<h2>DU-Es</h2><table class="compact-table" data-sortable-server><thead><tr>{{ sortable_header('DU-E', 'numero_due', dues_sort, dues_direction, dues_sort_links) }}{{ sortable_header('Apelido da empresa', 'empresa', dues_sort, dues_direction, dues_sort_links) }}{{ sortable_header('Chave de Acesso', 'chave_acesso', dues_sort, dues_direction, dues_sort_links) }}{{ sortable_header('Data de Lançamento', 'data_due', dues_sort, dues_direction, dues_sort_links, 'date') }}{{ sortable_header('Cliente', 'cliente', dues_sort, dues_direction, dues_sort_links) }}{{ sortable_header('Moeda', 'moeda', dues_sort, dues_direction, dues_sort_links) }}{{ sortable_header('Valor', 'valor_original', dues_sort, dues_direction, dues_sort_links, 'number') }}{{ sortable_header('Utilizado', 'utilizado', dues_sort, dues_direction, dues_sort_links, 'number') }}{{ sortable_header('Saldo', 'saldo', dues_sort, dues_direction, dues_sort_links, 'number') }}{{ sortable_header('Status', 'status', dues_sort, dues_direction, dues_sort_links) }}</tr></thead><tbody>
-{% for d in dues %}<tr><td data-sort-value="{{ d.numero_due }}"><a href="{{url_for('due_detalhe',due_id=d.id)}}">{{d.numero_due}}</a> <button type="button" class="copy-data-btn" data-copy-value="{{ d.numero_due }}" aria-label="Copiar DU-E"><span aria-hidden="true">⧉</span></button></td><td data-sort-value="{{ d.empresa_apelido or '' }}">{{d.empresa_apelido or '-'}}</td><td data-sort-value="{{ d.chave_acesso or '' }}">{{d.chave_acesso or 'Sem chave'}}{% if d.chave_acesso %} <button type="button" class="copy-data-btn" data-copy-value="{{ d.chave_acesso }}" aria-label="Copiar Chave de Acesso"><span aria-hidden="true">⧉</span></button>{% endif %}</td><td>{{d.created_at|date_br}}</td><td>{{d.cliente or ''}}</td><td>{{d.moeda}}</td><td>{{d.valor_original|money}}</td><td>{{d.utilizado|money}}</td><td>{{d.saldo|money}}</td><td><span class="status {{ d.status|status_class }}">{{d.status}}</span></td></tr>{% else %}<tr class="empty"><td colspan="10">Nenhuma DU-E cadastrada.</td></tr>{% endfor %}</tbody></table>
-{{ render_pagination(dues_pagination, 'Paginação de DU-Es') }}
+</section>
+<section class="dashboard-section" aria-labelledby="dashboard-safra-title">
+<div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">Planejamento físico e comercial</span><h2 id="dashboard-safra-title">Safra física/comercial</h2></div><span class="dashboard-section-meta">Volumes e contratos</span></div>
+<div class="dashboard-summary-cards" aria-label="Resumo físico e comercial da Safra">
+  <a class="dashboard-summary-card" href="{{ url_for('lista_producoes') }}" aria-label="Produção estimada: {{ resumo.producao_estimada|money }}">
+    <span>Produção estimada</span><strong>{{ resumo.producao_estimada|money }}</strong>
+  </a>
+  <a class="dashboard-summary-card" href="{{ url_for('lista_producoes') }}" aria-label="Produção realizada: {{ resumo.producao_realizada|money }}">
+    <span>Produção realizada</span><strong>{{ resumo.producao_realizada|money }}</strong>
+  </a>
+  <a class="dashboard-summary-card" href="{{ url_for('lista_contratos_comerciais') }}" aria-label="Volume contratado: {{ resumo.volume_contratado|money }}">
+    <span>Volume contratado</span><strong>{{ resumo.volume_contratado|money }}</strong>
+  </a>
+  <a class="dashboard-summary-card" href="{{ url_for('lista_contratos_comerciais') }}" aria-label="Volume fixado: {{ resumo.volume_fixado|money }}">
+    <span>Volume fixado</span><strong>{{ resumo.volume_fixado|money }}</strong>
+  </a>
+  <a class="dashboard-summary-card" href="{{ url_for('lista_contratos_comerciais') }}" aria-label="Volume a fixar: {{ resumo.volume_a_fixar|money }}">
+    <span>Volume a fixar</span><strong>{{ resumo.volume_a_fixar|money }}</strong>
+  </a>
+</div>
+<section class="dashboard-data-section" aria-labelledby="dashboard-dues-title">
+<div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">Acompanhamento</span><h2 id="dashboard-dues-title">DU-Es recentes</h2></div><a class="dashboard-section-link" href="{{ url_for('consulta_dues') }}">Ver todas <span aria-hidden="true">→</span></a></div>
+<div class="dashboard-table-card"><table class="compact-table" data-sortable-server><thead><tr>{{ sortable_header('DU-E', 'numero_due', dues_sort, dues_direction, dues_sort_links) }}{{ sortable_header('Apelido da empresa', 'empresa', dues_sort, dues_direction, dues_sort_links) }}{{ sortable_header('Chave de Acesso', 'chave_acesso', dues_sort, dues_direction, dues_sort_links) }}{{ sortable_header('Data de Lançamento', 'data_due', dues_sort, dues_direction, dues_sort_links, 'date') }}{{ sortable_header('Cliente', 'cliente', dues_sort, dues_direction, dues_sort_links) }}{{ sortable_header('Moeda', 'moeda', dues_sort, dues_direction, dues_sort_links) }}{{ sortable_header('Valor', 'valor_original', dues_sort, dues_direction, dues_sort_links, 'number') }}{{ sortable_header('Utilizado', 'utilizado', dues_sort, dues_direction, dues_sort_links, 'number') }}{{ sortable_header('Saldo', 'saldo', dues_sort, dues_direction, dues_sort_links, 'number') }}{{ sortable_header('Status', 'status', dues_sort, dues_direction, dues_sort_links) }}</tr></thead><tbody>
+{% for d in dues %}<tr><td data-sort-value="{{ d.numero_due }}"><a href="{{url_for('due_detalhe',due_id=d.id)}}">{{d.numero_due}}</a> <button type="button" class="copy-data-btn" data-copy-value="{{ d.numero_due }}" aria-label="Copiar DU-E"><span aria-hidden="true">⧉</span></button></td><td data-sort-value="{{ d.empresa_apelido or '' }}">{{d.empresa_apelido or '-'}}</td><td data-sort-value="{{ d.chave_acesso or '' }}">{{d.chave_acesso or 'Sem chave'}}{% if d.chave_acesso %} <button type="button" class="copy-data-btn" data-copy-value="{{ d.chave_acesso }}" aria-label="Copiar Chave de Acesso"><span aria-hidden="true">⧉</span></button>{% endif %}</td><td>{{d.created_at|date_br}}</td><td>{{d.cliente or ''}}</td><td>{{d.moeda}}</td><td>{{d.valor_original|money}}</td><td>{{d.utilizado|money}}</td><td>{{d.saldo|money}}</td><td><span class="status {{ d.status|status_class }}">{{d.status}}</span></td></tr>{% else %}<tr class="empty"><td colspan="10">Nenhuma DU-E cadastrada.</td></tr>{% endfor %}</tbody></table></div>
+<div class="dashboard-table-pagination">{{ render_pagination(dues_pagination, 'Paginação de DU-Es') }}</div>
+<section class="dashboard-data-section dashboard-data-section--contracts" aria-labelledby="dashboard-contracts-title">
+<div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">Acompanhamento</span><h2 id="dashboard-contracts-title">Gestão de Contratos de Câmbio</h2></div><a class="dashboard-section-link" href="{{ url_for('lista_contratos') }}">Ver todos <span aria-hidden="true">→</span></a></div>
 <h2>Gestão de Contratos de Câmbio</h2><table class="compact-table" data-sortable-server><thead><tr>{{ sortable_header('Contrato Câmbio', 'numero_contrato', contratos_sort, contratos_direction, contratos_sort_links) }}{{ sortable_header('Categoria Câmbio', 'categoria_cambio', contratos_sort, contratos_direction, contratos_sort_links) }}{{ sortable_header('Apelido da empresa', 'empresa', contratos_sort, contratos_direction, contratos_sort_links) }}{{ sortable_header('Banco', 'banco', contratos_sort, contratos_direction, contratos_sort_links) }}{{ sortable_header('Data contrato', 'data_contrato', contratos_sort, contratos_direction, contratos_sort_links, 'date') }}{{ sortable_header('Data liquidação', 'data_liquidacao', contratos_sort, contratos_direction, contratos_sort_links, 'date') }}{{ sortable_header('Cliente', 'cliente', contratos_sort, contratos_direction, contratos_sort_links) }}{{ sortable_header('Moeda', 'moeda', contratos_sort, contratos_direction, contratos_sort_links) }}{{ sortable_header('Valor moeda', 'valor_moeda', contratos_sort, contratos_direction, contratos_sort_links, 'number') }}{{ sortable_header('Vinculado', 'vinculado', contratos_sort, contratos_direction, contratos_sort_links, 'number') }}{{ sortable_header('Saldo', 'saldo', contratos_sort, contratos_direction, contratos_sort_links, 'number') }}{{ sortable_header('Status', 'status', contratos_sort, contratos_direction, contratos_sort_links) }}</tr></thead><tbody>
 {% for c in contratos %}<tr><td data-sort-value="{{ c.numero_contrato }}"><a href="{{url_for('detalhe_contrato',contrato_id=c.id)}}">{{c.numero_contrato}}</a> <button type="button" class="copy-data-btn" data-copy-value="{{ c.numero_contrato }}" aria-label="Copiar Contrato Câmbio"><span aria-hidden="true">⧉</span></button></td><td>{{c.categoria_cambio}}</td><td data-sort-value="{{ c.empresa_apelido or '' }}">{{c.empresa_apelido or '-'}}</td><td>{{c.banco or '-'}}</td><td data-sort-value="{{ c.data_contrato or '' }}">{{c.data_contrato|date_br}}</td><td data-sort-value="{{ c.data_liquidacao or '' }}">{{c.data_liquidacao|date_br}}</td><td>{{c.cliente or ''}}</td><td>{{c.moeda}}</td><td>{{c.valor_moeda|money}}</td><td>{{c.vinculado|money}}</td><td>{{c.saldo|money}}</td><td><span class="status {{ c.status|status_class }}">{{c.status}}</span></td></tr>{% else %}<tr class="empty"><td colspan="12">Nenhum Contrato Câmbio cadastrado.</td></tr>{% endfor %}</tbody></table>
 {{ render_pagination(contratos_pagination, 'Paginação de Contratos Câmbio') }}
+</section>
+</section>
+</section>
+</div>
 {% endblock %}

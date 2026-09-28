@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading"><div><h1>{{ 'Editar item comercial' if edit_mode|default(false) else 'Novo item comercial' }}</h1><p class="muted">Contrato {{ contrato.numero_contrato }} — {{ contrato.competencia_descricao }}</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('detalhe_contrato_comercial', contrato_id=contrato.id) }}">Voltar ao contrato</a></div></div>
+<form method="post" class="form">
+  <label>Mês de referência*<input type="month" name="mes_referencia" value="{{ item.mes_referencia or '' }}" required></label>
+  <label>Tranche<input name="tranche" value="{{ item.tranche or '' }}" placeholder="Ex.: T1"></label>
+  <label>Produto*<input name="produto" value="{{ item.produto or 'AÇÚCAR' }}" required></label>
+  <label>Unidade*<input name="unidade" value="{{ item.unidade or 'MT' }}" required></label>
+  <label>Volume contratado*<input name="volume_contratado" inputmode="decimal" value="{{ item.volume_contratado or '' }}" required></label>
+  <label>Qualidade<input name="qualidade" value="{{ item.qualidade or '' }}" placeholder="Ex.: ESALQ - 3,5% desc"></label>
+  <label>Moeda*<input name="moeda" maxlength="3" value="{{ item.moeda or 'USD' }}" required></label>
+  <label>Incoterm<select name="incoterm"><option value="">Não informado</option>{% for incoterm in ['FCA','FOB','CFR','CIF'] %}<option value="{{ incoterm }}" {{ 'selected' if item.incoterm == incoterm else '' }}>{{ incoterm }}</option>{% endfor %}</select></label>
+  <label>Preço contratado<input name="preco_contratado" inputmode="decimal" value="{{ item.preco_contratado if item.preco_contratado is not none else '' }}"></label>
+  <label>Observação<textarea name="observacao">{{ item.observacao or '' }}</textarea></label>
+  <div class="form-actions"><button>{{ 'Salvar alterações' if edit_mode|default(false) else 'Cadastrar item' }}</button><a class="btn secondary" href="{{ url_for('detalhe_contrato_comercial', contrato_id=contrato.id) }}">Cancelar</a></div>
+</form>
+{% endblock %}

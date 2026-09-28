@@ -25,7 +25,9 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 15
+INVOICE_SCHEMA_VERSION = 16
+INVOICE_LEGACY_SCHEMA_VERSION = 15
+SAFRA_SCHEMA_VERSION = 16
 
 SALDO_TOLERANCE = Decimal("0.005")
 CONVERSION_RULE_HALF_DOWN = "HALF_DOWN"
@@ -129,8 +131,17 @@ NDF_POSICOES = ("COMPRA", "VENDA")
 PTAX_MOEDAS = ("USD", "EUR")
 TABLE_PAGE_SIZE = 20
 
+SAFRA_PRODUTO_PADRAO = "AÇÚCAR"
+SAFRA_UNIDADE_PADRAO = "MT"
+MERCADOS_COMERCIAIS = ("INTERNO", "EXTERNO", "SPOT")
+STATUS_CONTRATO_COMERCIAL_ABERTO = "ABERTO"
+STATUS_CONTRATO_COMERCIAL_CANCELADO = "CANCELADO"
+STATUS_FIXACAO_ATIVA = "ATIVA"
+STATUS_FIXACAO_CANCELADA = "CANCELADA"
+INCOTERMS_COMERCIAIS = ("FCA", "FOB", "CFR", "CIF")
 
-def build_pagination(args, total, page_param="page", endpoint=None, per_page=TABLE_PAGE_SIZE):
+
+def build_pagination(args, total, page_param="page", endpoint=None, per_page=TABLE_PAGE_SIZE, fixed_args=None):
     """Monta o estado comum de paginação sem descartar filtros ou outras tabelas."""
     try:
         page = max(1, int(args.get(page_param, 1)))
@@ -142,6 +153,7 @@ def build_pagination(args, total, page_param="page", endpoint=None, per_page=TAB
         key: value for key, value in args.items()
         if key != page_param and value not in (None, "")
     }
+    base_args.update(fixed_args or {})
 
     def page_args(target_page):
         return {**base_args, page_param: target_page}
@@ -729,6 +741,112 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_fechamentos_contrato ON fechamentos(contrato_id);
             CREATE INDEX IF NOT EXISTS idx_fechamentos_data ON fechamentos(data_fechamento);
         """)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS producoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                empresa_id INTEGER NOT NULL,
+                competencia_id INTEGER NOT NULL,
+                produto TEXT NOT NULL DEFAULT 'AÇÚCAR',
+                mes_referencia TEXT NOT NULL,
+                tranche TEXT NOT NULL DEFAULT '',
+                unidade TEXT NOT NULL DEFAULT 'MT',
+                quantidade_estimada REAL NOT NULL DEFAULT 0 CHECK(quantidade_estimada >= 0),
+                quantidade_realizada REAL CHECK(quantidade_realizada IS NULL OR quantidade_realizada >= 0),
+                observacao TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE RESTRICT,
+                FOREIGN KEY (competencia_id) REFERENCES competencias(id) ON DELETE RESTRICT,
+                UNIQUE(empresa_id, competencia_id, produto, mes_referencia, tranche, unidade)
+            );
+
+            CREATE TABLE IF NOT EXISTS contratos_comerciais (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                numero_contrato TEXT NOT NULL,
+                empresa_id INTEGER NOT NULL,
+                competencia_id INTEGER NOT NULL,
+                cliente_id INTEGER NOT NULL,
+                mercado TEXT NOT NULL CHECK(mercado IN ('INTERNO','EXTERNO','SPOT')),
+                data_contrato TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ABERTO' CHECK(status IN ('ABERTO','CANCELADO')),
+                observacao TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE RESTRICT,
+                FOREIGN KEY (competencia_id) REFERENCES competencias(id) ON DELETE RESTRICT,
+                FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT,
+                UNIQUE(empresa_id, numero_contrato)
+            );
+
+            CREATE TABLE IF NOT EXISTS contrato_comercial_itens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                contrato_id INTEGER NOT NULL,
+                mes_referencia TEXT NOT NULL,
+                tranche TEXT NOT NULL DEFAULT '',
+                produto TEXT NOT NULL DEFAULT 'AÇÚCAR',
+                unidade TEXT NOT NULL DEFAULT 'MT',
+                volume_contratado REAL NOT NULL CHECK(volume_contratado >= 0),
+                qualidade TEXT,
+                moeda TEXT NOT NULL DEFAULT 'USD',
+                incoterm TEXT,
+                preco_contratado REAL,
+                observacao TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (contrato_id) REFERENCES contratos_comerciais(id) ON DELETE CASCADE,
+                UNIQUE(contrato_id, mes_referencia, tranche, produto, unidade)
+            );
+
+            CREATE TABLE IF NOT EXISTS fixacoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                contrato_item_id INTEGER NOT NULL,
+                data_fixacao TEXT NOT NULL,
+                volume_fixado REAL NOT NULL CHECK(volume_fixado > 0),
+                quantidade_lotes REAL,
+                tela TEXT,
+                data_referencia_ny TEXT,
+                ny_cents REAL,
+                premio REAL,
+                ajuste_preco REAL,
+                preco_unitario REAL,
+                moeda TEXT NOT NULL DEFAULT 'USD',
+                status TEXT NOT NULL DEFAULT 'ATIVA' CHECK(status IN ('ATIVA','CANCELADA')),
+                observacao TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (contrato_item_id) REFERENCES contrato_comercial_itens(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS auditoria_eventos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entidade TEXT NOT NULL,
+                entidade_id INTEGER NOT NULL,
+                acao TEXT NOT NULL,
+                dados_anteriores TEXT,
+                dados_novos TEXT,
+                usuario TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_producoes_empresa_competencia
+                ON producoes(empresa_id, competencia_id);
+            CREATE INDEX IF NOT EXISTS idx_producoes_mes
+                ON producoes(competencia_id, mes_referencia);
+            CREATE INDEX IF NOT EXISTS idx_contratos_comerciais_empresa_competencia
+                ON contratos_comerciais(empresa_id, competencia_id);
+            CREATE INDEX IF NOT EXISTS idx_contratos_comerciais_cliente
+                ON contratos_comerciais(cliente_id);
+            CREATE INDEX IF NOT EXISTS idx_contrato_comercial_itens_contrato
+                ON contrato_comercial_itens(contrato_id);
+            CREATE INDEX IF NOT EXISTS idx_contrato_comercial_itens_mes
+                ON contrato_comercial_itens(mes_referencia);
+            CREATE INDEX IF NOT EXISTS idx_fixacoes_item_status
+                ON fixacoes(contrato_item_id, status);
+            CREATE INDEX IF NOT EXISTS idx_fixacoes_data
+                ON fixacoes(data_fixacao);
+            CREATE INDEX IF NOT EXISTS idx_auditoria_entidade
+                ON auditoria_eventos(entidade, entidade_id, created_at);
+        """)
         contraparte_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(contrapartes)")
         }
@@ -777,7 +895,7 @@ def init_db():
         conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_fechamentos_cambio_grupo_invoice
                        ON fechamentos_cambio(fechamento_id, invoice_id)
                        WHERE fechamento_id IS NOT NULL""")
-        if schema_version < INVOICE_SCHEMA_VERSION:
+        if schema_version < INVOICE_LEGACY_SCHEMA_VERSION:
             invoice_columns = {row[1] for row in conn.execute("PRAGMA table_info(invoices)")}
             if "contrato_comercial" not in invoice_columns:
                 conn.execute("ALTER TABLE invoices ADD COLUMN contrato_comercial TEXT")
@@ -825,7 +943,7 @@ def init_db():
                 normalized_status = INVOICE_STATUS_AGUARDANDO_RECEBIMENTO
             if normalized_status != invoice["status"]:
                 conn.execute("UPDATE invoices SET status=? WHERE id=?", (normalized_status, invoice["id"]))
-        if schema_version < INVOICE_SCHEMA_VERSION or status_schema_migrated:
+        if schema_version < INVOICE_LEGACY_SCHEMA_VERSION or status_schema_migrated:
             conn.execute("""
                 UPDATE invoices
                 SET status=?, status_manual=0
@@ -864,7 +982,7 @@ def init_db():
                   AND r.banco_credito_id IS NOT NULL
               )
         """)
-        conn.execute(f"PRAGMA user_version = {INVOICE_SCHEMA_VERSION}")
+        conn.execute(f"PRAGMA user_version = {SAFRA_SCHEMA_VERSION}")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(dues)")}
         if "chave_acesso" not in columns:
             conn.execute("ALTER TABLE dues ADD COLUMN chave_acesso TEXT")
@@ -901,7 +1019,7 @@ def init_db():
             "WHERE categoria_cambio IS NULL OR TRIM(categoria_cambio)=''",
             (CATEGORIA_CAMBIO_EXPORTACAO,),
         )
-        if schema_version < INVOICE_SCHEMA_VERSION:
+        if schema_version < INVOICE_LEGACY_SCHEMA_VERSION:
             conn.execute(
                 """
                 UPDATE fechamentos
@@ -1023,7 +1141,7 @@ def init_db():
                 (link["due_id"], link["contrato_id"], link["id"], date.today().isoformat(),
                  "VINCULACAO", f"VINCULO:{link['id']}", link["valor_vinculado"],
                  "Movimentação criada na migração do vínculo existente."))
-        if schema_version < INVOICE_SCHEMA_VERSION:
+        if schema_version < INVOICE_LEGACY_SCHEMA_VERSION:
             migrar_vinculos_due_contrato_empresas(conn)
         recalculate_statuses(conn)
         conn.commit()
@@ -2797,6 +2915,18 @@ GLOBAL_CONTEXT_ENDPOINTS = frozenset({
     "lista_contratos",
     "analise_saldos_contratos",
     "consulta_dues",
+    "lista_producoes",
+    "novo_producao",
+    "editar_producao",
+    "lista_contratos_comerciais",
+    "novo_contrato_comercial",
+    "editar_contrato_comercial",
+    "detalhe_contrato_comercial",
+    "novo_item_contrato_comercial",
+    "editar_item_contrato_comercial",
+    "lista_fixacoes",
+    "nova_fixacao",
+    "editar_fixacao",
 })
 GLOBAL_CONTEXT_EMPRESA_KEY = "global_context_empresa_id"
 GLOBAL_CONTEXT_COMPETENCIA_KEY = "global_context_competencia"
@@ -3069,10 +3199,1022 @@ def global_context_sql(scope, context=None, alias=None):
             )
             clauses.append(f"({invoice_period} OR {contract_period})")
             params.extend([inicio, fim, *contract_params])
+    elif scope in {"production", "commercial"}:
+        alias = alias or ("p" if scope == "production" else "cc")
+        if empresa_id:
+            clauses.append(f"{alias}.empresa_id=?")
+            params.append(empresa_id)
+        if inicio and fim:
+            clauses.append(
+                f"EXISTS (SELECT 1 FROM competencias gl_c WHERE gl_c.id={alias}.competencia_id "
+                "AND gl_c.data_inicial=? AND gl_c.data_final=?)"
+            )
+            params.extend([inicio, fim])
     else:
         raise ValueError(f"Escopo de contexto global desconhecido: {scope}")
 
     return (" AND ".join(clauses) if clauses else ""), params
+
+
+def safra_month(value):
+    """Normaliza o mês da Safra para o formato canônico YYYY-MM."""
+    raw = "" if value is None else str(value).strip()
+    if re.fullmatch(r"\d{4}-\d{2}", raw):
+        try:
+            datetime.strptime(raw, "%Y-%m")
+            return raw
+        except ValueError:
+            pass
+    raise ValueError("O mês/tranche deve estar no formato AAAA-MM e ser válido.")
+
+
+def safra_month_in_competencia(month, competencia):
+    """Valida o mês mensal contra o intervalo da Competência selecionada."""
+    month = safra_month(month)
+    month_start = f"{month}-01"
+    next_month = (datetime.strptime(month_start, "%Y-%m-%d") + timedelta(days=32)).replace(day=1)
+    month_end = (next_month - timedelta(days=1)).strftime("%Y-%m-%d")
+    if month_start < competencia["data_inicial"] or month_end > competencia["data_final"]:
+        raise ValueError(
+            f"O mês {month} está fora do período da Competência "
+            f"({competencia['data_inicial']} a {competencia['data_final']})."
+        )
+    return month
+
+
+def safra_competencia_empresa(conn, empresa_id, competencia_id):
+    empresa_id = form_record_id(empresa_id)
+    competencia_id = form_record_id(competencia_id)
+    if not empresa_id or not competencia_id:
+        raise ValueError("Empresa e Competência são obrigatórias.")
+    competencia = conn.execute("""
+        SELECT c.*, e.razao_social, e.apelido
+        FROM competencias c
+        JOIN empresas e ON e.id=c.empresa_id
+        WHERE c.id=? AND c.empresa_id=?
+    """, (competencia_id, empresa_id)).fetchone()
+    if not competencia:
+        raise ValueError("A Competência selecionada não pertence à empresa informada.")
+    return competencia
+
+
+def safra_date_in_competencia(value, competencia, required=True, label="Data"):
+    parsed = parse_date(value)
+    if not parsed:
+        if required:
+            raise ValueError(f"{label} é obrigatória.")
+        return None
+    if parsed < competencia["data_inicial"] or parsed > competencia["data_final"]:
+        raise ValueError(
+            f"{label} deve estar dentro da Competência "
+            f"({competencia['data_inicial']} a {competencia['data_final']})."
+        )
+    return parsed
+
+
+def safra_non_negative(value, label, allow_blank=False):
+    if allow_blank and (value is None or str(value).strip() == ""):
+        return None
+    number = parse_number(value)
+    if number < 0:
+        raise ValueError(f"{label} não pode ser negativo.")
+    return number
+
+
+def safra_positive(value, label):
+    number = safra_non_negative(value, label)
+    if number <= 0:
+        raise ValueError(f"{label} deve ser maior que zero.")
+    return number
+
+
+def safra_optional_number(value, label):
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return parse_number(value)
+    except ValueError as exc:
+        raise ValueError(f"{label}: {exc}")
+
+
+def comercial_market(value):
+    market = (value or "").strip().upper()
+    if market not in MERCADOS_COMERCIAIS:
+        raise ValueError("Selecione um mercado válido: interno, externo ou spot.")
+    return market
+
+
+def comercial_currency(value, default="USD"):
+    currency = (value or default).strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise ValueError("A moeda deve conter exatamente três letras.")
+    return currency
+
+
+def comercial_incoterm(value, required=False):
+    raw = (value or "").strip().upper()
+    normalized = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+    if not normalized:
+        if required:
+            raise ValueError("O Incoterm é obrigatório.")
+        return None
+    if normalized == "FOBIZACAO" or normalized not in INCOTERMS_COMERCIAIS:
+        raise ValueError("Use um Incoterm válido (FCA, FOB, CFR ou CIF). FOBIZAÇÃO não é Incoterm.")
+    return normalized
+
+
+def safra_auditoria(conn, entidade, entidade_id, acao, anteriores=None, novos=None):
+    conn.execute("""
+        INSERT INTO auditoria_eventos
+            (entidade, entidade_id, acao, dados_anteriores, dados_novos, usuario)
+        VALUES (?,?,?,?,?,?)
+    """, (
+        entidade,
+        entidade_id,
+        acao,
+        json.dumps(anteriores, ensure_ascii=False, default=str) if anteriores is not None else None,
+        json.dumps(novos, ensure_ascii=False, default=str) if novos is not None else None,
+        session.get("usuario") or session.get("user") or session.get("username"),
+    ))
+
+
+def safra_row_dict(row):
+    return dict(row) if row else None
+
+
+def safra_contract_item_totals(conn, item_id):
+    row = conn.execute("""
+        SELECT i.volume_contratado,
+               COALESCE(SUM(CASE WHEN f.status=? THEN f.volume_fixado ELSE 0 END), 0) AS volume_fixado
+        FROM contrato_comercial_itens i
+        LEFT JOIN fixacoes f ON f.contrato_item_id=i.id
+        WHERE i.id=?
+        GROUP BY i.id
+    """, (STATUS_FIXACAO_ATIVA, item_id)).fetchone()
+    if not row:
+        return None
+    contratado = float(row["volume_contratado"] or 0)
+    fixado = float(row["volume_fixado"] or 0)
+    return {
+        "volume_contratado": contratado,
+        "volume_fixado": fixado,
+        "volume_a_fixar": max(0.0, contratado - fixado),
+    }
+
+
+def safra_contract_status(contract, volume_contratado, volume_fixado):
+    if contract["status"] == STATUS_CONTRATO_COMERCIAL_CANCELADO:
+        return STATUS_CONTRATO_COMERCIAL_CANCELADO
+    if volume_contratado > 0 and volume_fixado >= volume_contratado - float(SALDO_TOLERANCE):
+        return "FIXADO"
+    if volume_fixado > float(SALDO_TOLERANCE):
+        return "PARCIAL"
+    return STATUS_CONTRATO_COMERCIAL_ABERTO
+
+
+def safra_contract_summary(conn, contract_id):
+    row = conn.execute("""
+        SELECT cc.*, e.razao_social, e.apelido,
+               c.descricao AS competencia_descricao,
+               c.data_inicial AS competencia_data_inicial,
+               c.data_final AS competencia_data_final,
+               cl.nome AS cliente_nome, cl.pais AS cliente_pais,
+               COALESCE((SELECT SUM(i2.volume_contratado)
+                         FROM contrato_comercial_itens i2 WHERE i2.contrato_id=cc.id), 0) AS volume_contratado,
+               COALESCE((SELECT SUM(f2.volume_fixado)
+                         FROM fixacoes f2
+                         JOIN contrato_comercial_itens i3 ON i3.id=f2.contrato_item_id
+                         WHERE i3.contrato_id=cc.id AND f2.status=?), 0) AS volume_fixado
+        FROM contratos_comerciais cc
+        JOIN empresas e ON e.id=cc.empresa_id
+        JOIN competencias c ON c.id=cc.competencia_id
+        JOIN clientes cl ON cl.id=cc.cliente_id
+        WHERE cc.id=?
+    """, (STATUS_FIXACAO_ATIVA, contract_id)).fetchone()
+    if not row:
+        return None
+    data = dict(row)
+    data["volume_a_fixar"] = max(0.0, float(data["volume_contratado"] or 0) - float(data["volume_fixado"] or 0))
+    data["status_exibicao"] = safra_contract_status(
+        row, float(data["volume_contratado"] or 0), float(data["volume_fixado"] or 0)
+    )
+    return data
+
+
+def safra_context_matches(row, context, empresa_key="empresa_id", competencia_initial_key="competencia_data_inicial", competencia_final_key="competencia_data_final"):
+    if not row:
+        return False
+    if context.get("empresa_id") and int(row[empresa_key]) != int(context["empresa_id"]):
+        return False
+    if context.get(competencia_initial_key):
+        if row["data_inicial"] != context[competencia_initial_key] or row["data_final"] != context[competencia_final_key]:
+            return False
+    return True
+
+
+def safra_empresas_competencias(conn):
+    empresas = conn.execute(
+        "SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY "
+        + empresa_order_sql()
+    ).fetchall()
+    competencias = conn.execute("""
+        SELECT c.id, c.empresa_id, c.descricao, c.data_inicial, c.data_final, c.status,
+               e.razao_social, e.apelido
+        FROM competencias c JOIN empresas e ON e.id=c.empresa_id
+        ORDER BY e.prioridade, e.id, c.data_inicial DESC, c.descricao, c.id
+    """).fetchall()
+    return empresas, competencias
+
+
+def safra_mercado_label(value):
+    return {"INTERNO": "Interno", "EXTERNO": "Externo", "SPOT": "Spot"}.get(value, value or "")
+
+
+@app.template_filter("month_br")
+def month_br(value):
+    if not value:
+        return ""
+    try:
+        return datetime.strptime(str(value), "%Y-%m").strftime("%m/%Y")
+    except ValueError:
+        return str(value)
+
+
+@app.template_filter("market_label")
+def market_label(value):
+    return safra_mercado_label(value)
+
+
+@app.route("/safra/producao", methods=["GET", "POST"])
+def lista_producoes():
+    conn = db()
+    producao = None
+    form = request.form if request.method == "POST" else {}
+    if request.method == "POST":
+        try:
+            empresa_id = form_record_id(form.get("empresa_id"))
+            competencia = safra_competencia_empresa(conn, empresa_id, form.get("competencia_id"))
+            mes = safra_month_in_competencia(form.get("mes_referencia"), competencia)
+            produto = (form.get("produto") or SAFRA_PRODUTO_PADRAO).strip() or SAFRA_PRODUTO_PADRAO
+            unidade = (form.get("unidade") or SAFRA_UNIDADE_PADRAO).strip().upper()
+            if not re.fullmatch(r"[A-Z0-9_À-Ú]+", unidade, re.IGNORECASE):
+                raise ValueError("A unidade deve ser informada.")
+            estimada = safra_non_negative(form.get("quantidade_estimada"), "A produção estimada")
+            realizada = safra_non_negative(
+                form.get("quantidade_realizada"), "A produção realizada", allow_blank=True
+            )
+            tranche = (form.get("tranche") or "").strip()
+            cursor = conn.execute("""
+                INSERT INTO producoes
+                    (empresa_id, competencia_id, produto, mes_referencia, tranche, unidade,
+                     quantidade_estimada, quantidade_realizada, observacao)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                empresa_id, competencia["id"], produto, mes, tranche, unidade,
+                estimada, realizada, (form.get("observacao") or "").strip() or None,
+            ))
+            producao_id = cursor.lastrowid
+            safra_auditoria(conn, "PRODUCAO", producao_id, "CRIADO", novos={
+                "empresa_id": empresa_id, "competencia_id": competencia["id"],
+                "produto": produto, "mes_referencia": mes, "tranche": tranche,
+                "unidade": unidade, "quantidade_estimada": estimada,
+                "quantidade_realizada": realizada,
+            })
+            conn.commit()
+            conn.close()
+            flash("Produção cadastrada com sucesso.", "success")
+            return redirect(url_for("lista_producoes"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe uma produção para essa combinação de Competência, mês, tranche, produto e unidade.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+        producao = dict(form)
+
+    filters = {
+        "empresa_id": form_record_id(request.args.get("empresa_id")),
+        "competencia_id": form_record_id(request.args.get("competencia_id")),
+        "mes_referencia": (request.args.get("mes_referencia") or "").strip(),
+        "tranche": (request.args.get("tranche") or "").strip(),
+    }
+    where = []
+    params = []
+    if filters["empresa_id"]:
+        where.append("p.empresa_id=?")
+        params.append(filters["empresa_id"])
+    if filters["competencia_id"]:
+        where.append("p.competencia_id=?")
+        params.append(filters["competencia_id"])
+    if filters["mes_referencia"]:
+        try:
+            filters["mes_referencia"] = safra_month(filters["mes_referencia"])
+            where.append("p.mes_referencia=?")
+            params.append(filters["mes_referencia"])
+        except ValueError:
+            flash("Filtro de mês inválido.", "danger")
+    if filters["tranche"]:
+        where.append("p.tranche LIKE ?")
+        params.append(f"%{filters['tranche']}%")
+    global_clause, global_params = global_context_sql("production", g.global_context, "p")
+    if global_clause:
+        where.append(global_clause)
+        params.extend(global_params)
+    where_sql = " WHERE " + " AND ".join(where) if where else ""
+    sort_fields = {
+        "empresa": "COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social)",
+        "competencia": "c.data_inicial",
+        "mes_referencia": "p.mes_referencia",
+        "tranche": "p.tranche",
+        "quantidade_estimada": "p.quantidade_estimada",
+        "quantidade_realizada": "p.quantidade_realizada",
+    }
+    sort, direction, sort_links = build_sorting(
+        request.args, sort_fields, default_sort="mes_referencia", default_direction="DESC"
+    )
+    total = conn.execute(
+        "SELECT COUNT(*) FROM producoes p JOIN empresas e ON e.id=p.empresa_id "
+        "JOIN competencias c ON c.id=p.competencia_id" + where_sql, params
+    ).fetchone()[0]
+    pagination = build_pagination(request.args, total, endpoint="lista_producoes")
+    order_sql = f"{sort_sql_term(sort_fields[sort], direction)}, p.id DESC" if sort else "p.mes_referencia DESC, p.id DESC"
+    producoes = conn.execute("""
+        SELECT p.*, e.razao_social, e.apelido, c.descricao AS competencia_descricao,
+               c.data_inicial, c.data_final
+        FROM producoes p
+        JOIN empresas e ON e.id=p.empresa_id
+        JOIN competencias c ON c.id=p.competencia_id
+    """ + where_sql + " ORDER BY " + order_sql + " LIMIT ? OFFSET ?", params + [pagination["per_page"], pagination["offset"]]).fetchall()
+    empresas, competencias = safra_empresas_competencias(conn)
+    selected_empresa_id = form_record_id(form.get("empresa_id")) if request.method == "POST" else filters["empresa_id"]
+    selected_competencia_id = form_record_id(form.get("competencia_id")) if request.method == "POST" else filters["competencia_id"]
+    if not selected_empresa_id and g.global_context.get("empresa_id"):
+        selected_empresa_id = g.global_context["empresa_id"]
+    conn.close()
+    return render_template(
+        "safra_producoes.html", producao=producao, producoes=producoes,
+        empresas=empresas, competencias=competencias,
+        empresa_id=selected_empresa_id, competencia_id=selected_competencia_id,
+        filters=filters, pagination=pagination, sort=sort, direction=direction,
+        sort_links=sort_links,
+    )
+
+
+@app.route("/safra/producao/novo", methods=["GET", "POST"])
+def novo_producao():
+    if request.method == "GET":
+        return lista_producoes()
+    return lista_producoes()
+
+
+@app.route("/safra/producao/<int:producao_id>/editar", methods=["GET", "POST"])
+def editar_producao(producao_id):
+    conn = db()
+    current = conn.execute("SELECT * FROM producoes WHERE id=?", (producao_id,)).fetchone()
+    if not current:
+        conn.close()
+        return "Produção não encontrada", 404
+    if request.method == "POST":
+        try:
+            empresa_id = form_record_id(request.form.get("empresa_id"))
+            competencia = safra_competencia_empresa(conn, empresa_id, request.form.get("competencia_id"))
+            mes = safra_month_in_competencia(request.form.get("mes_referencia"), competencia)
+            produto = (request.form.get("produto") or SAFRA_PRODUTO_PADRAO).strip() or SAFRA_PRODUTO_PADRAO
+            unidade = (request.form.get("unidade") or SAFRA_UNIDADE_PADRAO).strip().upper()
+            estimada = safra_non_negative(request.form.get("quantidade_estimada"), "A produção estimada")
+            realizada = safra_non_negative(request.form.get("quantidade_realizada"), "A produção realizada", allow_blank=True)
+            tranche = (request.form.get("tranche") or "").strip()
+            novos = {
+                "empresa_id": empresa_id, "competencia_id": competencia["id"], "produto": produto,
+                "mes_referencia": mes, "tranche": tranche, "unidade": unidade,
+                "quantidade_estimada": estimada, "quantidade_realizada": realizada,
+                "observacao": (request.form.get("observacao") or "").strip() or None,
+            }
+            conn.execute("""
+                UPDATE producoes SET empresa_id=?, competencia_id=?, produto=?, mes_referencia=?,
+                    tranche=?, unidade=?, quantidade_estimada=?, quantidade_realizada=?,
+                    observacao=?, updated_at=CURRENT_TIMESTAMP WHERE id=?
+            """, (*novos.values(), producao_id))
+            safra_auditoria(conn, "PRODUCAO", producao_id, "ALTERADO", safra_row_dict(current), novos)
+            conn.commit()
+            conn.close()
+            flash("Produção atualizada com sucesso.", "success")
+            return redirect(url_for("lista_producoes"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe uma produção para essa combinação de Competência, mês, tranche, produto e unidade.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+    empresas, competencias = safra_empresas_competencias(conn)
+    conn.close()
+    return render_template(
+        "safra_producoes.html", producao=current if request.method == "GET" else dict(request.form),
+        producoes=[], empresas=empresas, competencias=competencias,
+        empresa_id=form_record_id(request.form.get("empresa_id")) if request.method == "POST" else current["empresa_id"],
+        competencia_id=form_record_id(request.form.get("competencia_id")) if request.method == "POST" else current["competencia_id"],
+        filters={}, pagination=build_pagination({}, 0, endpoint="lista_producoes"),
+        sort=None, direction="DESC", sort_links={}, edit_mode=True,
+    )
+
+
+def safra_contract_context_ok(contract):
+    context = g.global_context
+    if context.get("empresa_id") and int(contract["empresa_id"]) != int(context["empresa_id"]):
+        return False
+    if context.get("competencia_data_inicial"):
+        if (contract["competencia_data_inicial"] != context["competencia_data_inicial"] or
+                contract["competencia_data_final"] != context["competencia_data_final"]):
+            return False
+    return True
+
+
+def safra_load_contract(conn, contract_id):
+    contract = safra_contract_summary(conn, contract_id)
+    if not contract or not safra_contract_context_ok(contract):
+        return None
+    return contract
+
+
+@app.route("/safra/contratos")
+def lista_contratos_comerciais():
+    conn = db()
+    filters = {
+        "numero_contrato": (request.args.get("numero_contrato") or "").strip(),
+        "empresa_id": form_record_id(request.args.get("empresa_id")),
+        "competencia_id": form_record_id(request.args.get("competencia_id")),
+        "cliente_id": form_record_id(request.args.get("cliente_id")),
+        "mercado": (request.args.get("mercado") or "").strip().upper(),
+        "status": (request.args.get("status") or "").strip().upper(),
+    }
+    where, params = [], []
+    if filters["numero_contrato"]:
+        where.append("cc.numero_contrato LIKE ?")
+        params.append(f"%{filters['numero_contrato']}%")
+    if filters["empresa_id"]:
+        where.append("cc.empresa_id=?")
+        params.append(filters["empresa_id"])
+    if filters["competencia_id"]:
+        where.append("cc.competencia_id=?")
+        params.append(filters["competencia_id"])
+    if filters["cliente_id"]:
+        where.append("cc.cliente_id=?")
+        params.append(filters["cliente_id"])
+    if filters["mercado"]:
+        if filters["mercado"] not in MERCADOS_COMERCIAIS:
+            flash("Mercado inválido.", "danger")
+            filters["mercado"] = ""
+        else:
+            where.append("cc.mercado=?")
+            params.append(filters["mercado"])
+    if filters["status"]:
+        if filters["status"] not in (STATUS_CONTRATO_COMERCIAL_ABERTO, STATUS_CONTRATO_COMERCIAL_CANCELADO, "PARCIAL", "FIXADO"):
+            flash("Status de contrato comercial inválido.", "danger")
+            filters["status"] = ""
+        elif filters["status"] in (STATUS_CONTRATO_COMERCIAL_ABERTO, STATUS_CONTRATO_COMERCIAL_CANCELADO):
+            where.append("cc.status=?")
+            params.append(filters["status"])
+    global_clause, global_params = global_context_sql("commercial", g.global_context, "cc")
+    if global_clause:
+        where.append(global_clause)
+        params.extend(global_params)
+    if filters["status"] in ("PARCIAL", "FIXADO"):
+        expected_status = filters["status"]
+        where.append("""(
+            CASE
+                WHEN cc.status='CANCELADO' THEN 'CANCELADO'
+                WHEN COALESCE((SELECT SUM(i2.volume_contratado) FROM contrato_comercial_itens i2 WHERE i2.contrato_id=cc.id),0)>0
+                 AND COALESCE((SELECT SUM(f2.volume_fixado) FROM fixacoes f2
+                               JOIN contrato_comercial_itens i3 ON i3.id=f2.contrato_item_id
+                               WHERE i3.contrato_id=cc.id AND f2.status='ATIVA'),0)
+                     >= COALESCE((SELECT SUM(i4.volume_contratado) FROM contrato_comercial_itens i4 WHERE i4.contrato_id=cc.id),0)-?
+                    THEN 'FIXADO'
+                WHEN COALESCE((SELECT SUM(f3.volume_fixado) FROM fixacoes f3
+                               JOIN contrato_comercial_itens i5 ON i5.id=f3.contrato_item_id
+                               WHERE i5.contrato_id=cc.id AND f3.status='ATIVA'),0)>?
+                    THEN 'PARCIAL'
+                ELSE 'ABERTO'
+            END
+        )=?""")
+        params.extend([float(SALDO_TOLERANCE), float(SALDO_TOLERANCE), expected_status])
+    where_sql = " WHERE " + " AND ".join(where) if where else ""
+    sort_fields = {
+        "numero_contrato": "cc.numero_contrato",
+        "empresa": "COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social)",
+        "competencia": "c.data_inicial",
+        "cliente": "cl.nome",
+        "mercado": "cc.mercado",
+        "data_contrato": "cc.data_contrato",
+        "volume_contratado": "volume_contratado",
+        "volume_fixado": "volume_fixado",
+        "volume_a_fixar": "volume_a_fixar",
+        "status": "status_exibicao",
+    }
+    sort, direction, sort_links = build_sorting(
+        request.args, sort_fields, default_sort="data_contrato", default_direction="DESC"
+    )
+    base_query = """
+        FROM contratos_comerciais cc
+        JOIN empresas e ON e.id=cc.empresa_id
+        JOIN competencias c ON c.id=cc.competencia_id
+        JOIN clientes cl ON cl.id=cc.cliente_id
+        LEFT JOIN (
+            SELECT i.contrato_id,
+                   SUM(i.volume_contratado) AS volume_contratado
+            FROM contrato_comercial_itens i
+            GROUP BY i.contrato_id
+        ) contracted ON contracted.contrato_id=cc.id
+        LEFT JOIN (
+            SELECT i.contrato_id, SUM(f.volume_fixado) AS volume_fixado
+            FROM contrato_comercial_itens i
+            JOIN fixacoes f ON f.contrato_item_id=i.id AND f.status='ATIVA'
+            GROUP BY i.contrato_id
+        ) fixed ON fixed.contrato_id=cc.id
+    """
+    total = conn.execute("SELECT COUNT(*) " + base_query + where_sql, params).fetchone()[0]
+    pagination = build_pagination(request.args, total, endpoint="lista_contratos_comerciais")
+    order_sql = f"{sort_sql_term(sort_fields[sort], direction)}, cc.id DESC" if sort else "cc.data_contrato DESC, cc.id DESC"
+    rows = conn.execute("""
+        SELECT cc.*, e.razao_social, e.apelido, c.descricao AS competencia_descricao,
+               c.data_inicial AS competencia_data_inicial, c.data_final AS competencia_data_final,
+               cl.nome AS cliente_nome, cl.pais AS cliente_pais,
+               COALESCE(contracted.volume_contratado,0) AS volume_contratado,
+               COALESCE(fixed.volume_fixado,0) AS volume_fixado,
+               MAX(0, COALESCE(contracted.volume_contratado,0)-COALESCE(fixed.volume_fixado,0)) AS volume_a_fixar
+        """ + base_query + where_sql + " ORDER BY " + order_sql + " LIMIT ? OFFSET ?",
+        params + [pagination["per_page"], pagination["offset"]],
+    ).fetchall()
+    contratos = []
+    for row in rows:
+        item = dict(row)
+        item["status_exibicao"] = safra_contract_status(
+            row, float(item["volume_contratado"] or 0), float(item["volume_fixado"] or 0)
+        )
+        contratos.append(item)
+    empresas, competencias = safra_empresas_competencias(conn)
+    clientes = conn.execute("SELECT id, nome, pais FROM clientes ORDER BY nome, pais").fetchall()
+    conn.close()
+    return render_template(
+        "safra_contratos.html", contratos=contratos, empresas=empresas,
+        competencias=competencias, clientes=clientes, filters=filters,
+        mercados=MERCADOS_COMERCIAIS,
+        status_options=(STATUS_CONTRATO_COMERCIAL_ABERTO, "PARCIAL", "FIXADO", STATUS_CONTRATO_COMERCIAL_CANCELADO),
+        pagination=pagination, sort=sort, direction=direction, sort_links=sort_links,
+    )
+
+
+def safra_contract_form_data(conn, source, current=None):
+    empresa_id = form_record_id(source.get("empresa_id"))
+    competencia_id = form_record_id(source.get("competencia_id"))
+    competencia = safra_competencia_empresa(conn, empresa_id, competencia_id)
+    numero = (source.get("numero_contrato") or "").strip()
+    if not numero:
+        raise ValueError("O número do contrato é obrigatório.")
+    cliente_id = form_record_id(source.get("cliente_id"))
+    if not cliente_id or not conn.execute("SELECT id FROM clientes WHERE id=?", (cliente_id,)).fetchone():
+        raise ValueError("Selecione um comprador cadastrado.")
+    data_contrato = safra_date_in_competencia(source.get("data_contrato"), competencia, label="A data do contrato")
+    return {
+        "numero_contrato": numero,
+        "empresa_id": empresa_id,
+        "competencia_id": competencia_id,
+        "cliente_id": cliente_id,
+        "mercado": comercial_market(source.get("mercado")),
+        "data_contrato": data_contrato,
+        "status": current["status"] if current else STATUS_CONTRATO_COMERCIAL_ABERTO,
+        "observacao": (source.get("observacao") or "").strip() or None,
+    }
+
+
+@app.route("/safra/contratos/novo", methods=["GET", "POST"])
+def novo_contrato_comercial():
+    conn = db()
+    data = None
+    if request.method == "POST":
+        try:
+            data = safra_contract_form_data(conn, request.form)
+            cursor = conn.execute("""
+                INSERT INTO contratos_comerciais
+                    (numero_contrato, empresa_id, competencia_id, cliente_id, mercado, data_contrato, status, observacao)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, tuple(data.values()))
+            contract_id = cursor.lastrowid
+            safra_auditoria(conn, "CONTRATO_COMERCIAL", contract_id, "CRIADO", novos=data)
+            conn.commit()
+            conn.close()
+            flash("Contrato comercial cadastrado com sucesso. Inclua os itens por mês/tranche.", "success")
+            return redirect(url_for("detalhe_contrato_comercial", contrato_id=contract_id))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe um contrato comercial com esse número para a empresa.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+    empresas, competencias = safra_empresas_competencias(conn)
+    clientes = conn.execute("SELECT id, nome, pais FROM clientes ORDER BY nome, pais").fetchall()
+    conn.close()
+    selected_empresa_id = form_record_id(request.form.get("empresa_id")) if request.method == "POST" else g.global_context.get("empresa_id")
+    return render_template(
+        "safra_contrato_form.html", contrato=data or {}, empresas=empresas,
+        competencias=competencias, clientes=clientes, mercados=MERCADOS_COMERCIAIS,
+        empresa_id=selected_empresa_id,
+    )
+
+
+@app.route("/safra/contratos/<int:contrato_id>/editar", methods=["GET", "POST"])
+def editar_contrato_comercial(contrato_id):
+    conn = db()
+    current = safra_contract_summary(conn, contrato_id)
+    if not current or not safra_contract_context_ok(current):
+        conn.close()
+        return "Contrato comercial não encontrado", 404
+    if request.method == "POST":
+        try:
+            data = safra_contract_form_data(conn, request.form, current=current)
+            duplicate = conn.execute(
+                "SELECT 1 FROM contratos_comerciais WHERE empresa_id=? AND numero_contrato=? AND id<>?",
+                (data["empresa_id"], data["numero_contrato"], contrato_id),
+            ).fetchone()
+            if duplicate:
+                raise ValueError("Já existe um contrato comercial com esse número para a empresa.")
+            conn.execute("""
+                UPDATE contratos_comerciais SET numero_contrato=?, empresa_id=?, competencia_id=?,
+                    cliente_id=?, mercado=?, data_contrato=?, observacao=?, updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+            """, (
+                data["numero_contrato"], data["empresa_id"], data["competencia_id"], data["cliente_id"],
+                data["mercado"], data["data_contrato"], data["observacao"], contrato_id,
+            ))
+            safra_auditoria(conn, "CONTRATO_COMERCIAL", contrato_id, "ALTERADO", current, data)
+            conn.commit()
+            conn.close()
+            flash("Contrato comercial atualizado com sucesso.", "success")
+            return redirect(url_for("detalhe_contrato_comercial", contrato_id=contrato_id))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Não foi possível atualizar o contrato comercial.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+        current = dict(request.form)
+        current["id"] = contrato_id
+    empresas, competencias = safra_empresas_competencias(conn)
+    clientes = conn.execute("SELECT id, nome, pais FROM clientes ORDER BY nome, pais").fetchall()
+    conn.close()
+    return render_template(
+        "safra_contrato_form.html", contrato=current, empresas=empresas,
+        competencias=competencias, clientes=clientes, mercados=MERCADOS_COMERCIAIS,
+        empresa_id=form_record_id(current.get("empresa_id")), edit_mode=True,
+    )
+
+
+@app.route("/safra/contratos/<int:contrato_id>/cancelar", methods=["POST"])
+def cancelar_contrato_comercial(contrato_id):
+    conn = db()
+    current = safra_contract_summary(conn, contrato_id)
+    if not current or not safra_contract_context_ok(current):
+        conn.close()
+        return "Contrato comercial não encontrado", 404
+    try:
+        active_fixations = conn.execute("""
+            SELECT COUNT(*) FROM fixacoes f
+            JOIN contrato_comercial_itens i ON i.id=f.contrato_item_id
+            WHERE i.contrato_id=? AND f.status=?
+        """, (contrato_id, STATUS_FIXACAO_ATIVA)).fetchone()[0]
+        if active_fixations:
+            raise ValueError("Cancele as Fixações ativas antes de cancelar o contrato comercial.")
+        before = dict(current)
+        conn.execute(
+            "UPDATE contratos_comerciais SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (STATUS_CONTRATO_COMERCIAL_CANCELADO, contrato_id),
+        )
+        safra_auditoria(conn, "CONTRATO_COMERCIAL", contrato_id, "CANCELADO", before, {"status": STATUS_CONTRATO_COMERCIAL_CANCELADO})
+        conn.commit()
+        flash("Contrato comercial cancelado com sucesso.", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_contrato_comercial", contrato_id=contrato_id))
+
+
+@app.route("/safra/contratos/<int:contrato_id>")
+def detalhe_contrato_comercial(contrato_id):
+    conn = db()
+    contrato = safra_load_contract(conn, contrato_id)
+    if not contrato:
+        conn.close()
+        return "Contrato comercial não encontrado", 404
+    itens = conn.execute("""
+        SELECT i.*, COALESCE(SUM(CASE WHEN f.status=? THEN f.volume_fixado ELSE 0 END),0) AS volume_fixado
+        FROM contrato_comercial_itens i
+        LEFT JOIN fixacoes f ON f.contrato_item_id=i.id
+        WHERE i.contrato_id=?
+        GROUP BY i.id
+        ORDER BY i.mes_referencia, i.tranche, i.id
+    """, (STATUS_FIXACAO_ATIVA, contrato_id)).fetchall()
+    itens = [dict(row, volume_a_fixar=max(0.0, float(row["volume_contratado"] or 0) - float(row["volume_fixado"] or 0))) for row in itens]
+    conn.close()
+    return render_template("safra_contrato_detalhe.html", contrato=contrato, itens=itens)
+
+
+def safra_item_form_data(conn, contrato, source):
+    mes = safra_month_in_competencia(source.get("mes_referencia"), {
+        "data_inicial": contrato["competencia_data_inicial"],
+        "data_final": contrato["competencia_data_final"],
+    })
+    produto = (source.get("produto") or SAFRA_PRODUTO_PADRAO).strip() or SAFRA_PRODUTO_PADRAO
+    unidade = (source.get("unidade") or SAFRA_UNIDADE_PADRAO).strip().upper()
+    if not unidade:
+        raise ValueError("A unidade é obrigatória.")
+    return {
+        "contrato_id": contrato["id"],
+        "mes_referencia": mes,
+        "tranche": (source.get("tranche") or "").strip(),
+        "produto": produto,
+        "unidade": unidade,
+        "volume_contratado": safra_non_negative(source.get("volume_contratado"), "O volume contratado"),
+        "qualidade": (source.get("qualidade") or "").strip() or None,
+        "moeda": comercial_currency(source.get("moeda"), default="USD"),
+        "incoterm": comercial_incoterm(source.get("incoterm")),
+        "preco_contratado": safra_optional_number(source.get("preco_contratado"), "Preço contratado"),
+        "observacao": (source.get("observacao") or "").strip() or None,
+    }
+
+
+@app.route("/safra/contratos/<int:contrato_id>/itens/novo", methods=["GET", "POST"])
+def novo_item_contrato_comercial(contrato_id):
+    conn = db()
+    contrato = safra_load_contract(conn, contrato_id)
+    if not contrato:
+        conn.close()
+        return "Contrato comercial não encontrado", 404
+    if request.method == "POST":
+        try:
+            if contrato["status"] == STATUS_CONTRATO_COMERCIAL_CANCELADO:
+                raise ValueError("Não é possível incluir item em contrato cancelado.")
+            data = safra_item_form_data(conn, contrato, request.form)
+            cursor = conn.execute("""
+                INSERT INTO contrato_comercial_itens
+                    (contrato_id, mes_referencia, tranche, produto, unidade, volume_contratado,
+                     qualidade, moeda, incoterm, preco_contratado, observacao)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, tuple(data.values()))
+            item_id = cursor.lastrowid
+            safra_auditoria(conn, "CONTRATO_COMERCIAL_ITEM", item_id, "CRIADO", novos=data)
+            conn.commit()
+            conn.close()
+            flash("Item comercial cadastrado com sucesso.", "success")
+            return redirect(url_for("detalhe_contrato_comercial", contrato_id=contrato_id))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe um item para esse mês, tranche, produto e unidade neste contrato.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+    conn.close()
+    return render_template("safra_item_form.html", contrato=contrato, item=dict(request.form), edit_mode=False)
+
+
+@app.route("/safra/contratos/<int:contrato_id>/itens/<int:item_id>/editar", methods=["GET", "POST"])
+def editar_item_contrato_comercial(contrato_id, item_id):
+    conn = db()
+    contrato = safra_load_contract(conn, contrato_id)
+    item = conn.execute("SELECT * FROM contrato_comercial_itens WHERE id=? AND contrato_id=?", (item_id, contrato_id)).fetchone()
+    if not contrato or not item:
+        conn.close()
+        return "Item comercial não encontrado", 404
+    if request.method == "POST":
+        try:
+            if contrato["status"] == STATUS_CONTRATO_COMERCIAL_CANCELADO:
+                raise ValueError("Não é possível editar item de contrato cancelado.")
+            data = safra_item_form_data(conn, contrato, request.form)
+            totals = safra_contract_item_totals(conn, item_id)
+            if totals and data["volume_contratado"] + float(SALDO_TOLERANCE) < totals["volume_fixado"]:
+                raise ValueError("O volume contratado não pode ser menor que o volume já fixado.")
+            conn.execute("""
+                UPDATE contrato_comercial_itens SET mes_referencia=?, tranche=?, produto=?, unidade=?,
+                    volume_contratado=?, qualidade=?, moeda=?, incoterm=?, preco_contratado=?,
+                    observacao=?, updated_at=CURRENT_TIMESTAMP WHERE id=?
+            """, (
+                data["mes_referencia"], data["tranche"], data["produto"], data["unidade"],
+                data["volume_contratado"], data["qualidade"], data["moeda"], data["incoterm"],
+                data["preco_contratado"], data["observacao"], item_id,
+            ))
+            safra_auditoria(conn, "CONTRATO_COMERCIAL_ITEM", item_id, "ALTERADO", safra_row_dict(item), data)
+            conn.commit()
+            conn.close()
+            flash("Item comercial atualizado com sucesso.", "success")
+            return redirect(url_for("detalhe_contrato_comercial", contrato_id=contrato_id))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe um item para esse mês, tranche, produto e unidade neste contrato.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+        item = dict(request.form)
+        item["id"] = item_id
+    conn.close()
+    return render_template("safra_item_form.html", contrato=contrato, item=item, edit_mode=True)
+
+
+def safra_load_item(conn, contrato_id, item_id):
+    contrato = safra_load_contract(conn, contrato_id)
+    item = conn.execute("""
+        SELECT i.*, cc.status AS contrato_status,
+               c.data_inicial AS competencia_data_inicial, c.data_final AS competencia_data_final
+        FROM contrato_comercial_itens i
+        JOIN contratos_comerciais cc ON cc.id=i.contrato_id
+        JOIN competencias c ON c.id=cc.competencia_id
+        WHERE i.id=? AND i.contrato_id=?
+    """, (item_id, contrato_id)).fetchone()
+    if not contrato or not item:
+        return None, None
+    return contrato, item
+
+
+def safra_fixation_form_data(source, item):
+    competencia_periodo = {
+        "data_inicial": item["competencia_data_inicial"],
+        "data_final": item["competencia_data_final"],
+    }
+    data_fixacao = safra_date_in_competencia(
+        source.get("data_fixacao"), competencia_periodo, label="A data da Fixação"
+    )
+    data_referencia = safra_date_in_competencia(
+        source.get("data_referencia_ny"), competencia_periodo, required=False, label="A data de referência NY"
+    )
+    moeda = comercial_currency(source.get("moeda"), default=item["moeda"] or "USD")
+    return {
+        "contrato_item_id": item["id"],
+        "data_fixacao": data_fixacao,
+        "volume_fixado": safra_positive(source.get("volume_fixado"), "O volume fixado"),
+        "quantidade_lotes": safra_non_negative(source.get("quantidade_lotes"), "A quantidade de lotes", allow_blank=True),
+        "tela": (source.get("tela") or "").strip() or None,
+        "data_referencia_ny": data_referencia,
+        "ny_cents": safra_optional_number(source.get("ny_cents"), "NY cents"),
+        "premio": safra_optional_number(source.get("premio"), "Prêmio"),
+        "ajuste_preco": safra_optional_number(source.get("ajuste_preco"), "Ajuste de preço"),
+        "preco_unitario": safra_optional_number(source.get("preco_unitario"), "Preço unitário"),
+        "moeda": moeda,
+        "observacao": (source.get("observacao") or "").strip() or None,
+    }
+
+
+@app.route("/safra/contratos/<int:contrato_id>/itens/<int:item_id>/fixacoes")
+def lista_fixacoes(contrato_id, item_id):
+    conn = db()
+    contrato, item = safra_load_item(conn, contrato_id, item_id)
+    if not contrato or not item:
+        conn.close()
+        return "Item comercial não encontrado", 404
+    totals = safra_contract_item_totals(conn, item_id)
+    fixacoes_total = conn.execute("SELECT COUNT(*) FROM fixacoes WHERE contrato_item_id=?", (item_id,)).fetchone()[0]
+    pagination = build_pagination(
+        request.args, fixacoes_total, endpoint="lista_fixacoes",
+        fixed_args={"contrato_id": contrato_id, "item_id": item_id},
+    )
+    fixacoes = conn.execute("""
+        SELECT * FROM fixacoes WHERE contrato_item_id=? ORDER BY data_fixacao DESC, id DESC
+        LIMIT ? OFFSET ?
+    """, (item_id, pagination["per_page"], pagination["offset"])).fetchall()
+    conn.close()
+    return render_template(
+        "safra_fixacoes.html", contrato=contrato, item=item, totals=totals,
+        fixacoes=fixacoes, fixacao=None, pagination=pagination,
+    )
+
+
+@app.route("/safra/contratos/<int:contrato_id>/itens/<int:item_id>/fixacoes/nova", methods=["GET", "POST"])
+def nova_fixacao(contrato_id, item_id):
+    conn = db()
+    contrato, item = safra_load_item(conn, contrato_id, item_id)
+    if not contrato or not item:
+        conn.close()
+        return "Item comercial não encontrado", 404
+    if request.method == "POST":
+        try:
+            if contrato["status"] == STATUS_CONTRATO_COMERCIAL_CANCELADO:
+                raise ValueError("Não é possível fixar item de contrato cancelado.")
+            data = safra_fixation_form_data(request.form, item)
+            totals = safra_contract_item_totals(conn, item_id)
+            if data["volume_fixado"] > totals["volume_a_fixar"] + float(SALDO_TOLERANCE):
+                raise ValueError(
+                    f"A Fixação excede o volume a fixar ({totals['volume_a_fixar']:.3f})."
+                )
+            cursor = conn.execute("""
+                INSERT INTO fixacoes
+                    (contrato_item_id, data_fixacao, volume_fixado, quantidade_lotes, tela,
+                     data_referencia_ny, ny_cents, premio, ajuste_preco, preco_unitario, moeda, observacao)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, tuple(data.values()))
+            fixation_id = cursor.lastrowid
+            safra_auditoria(conn, "FIXACAO", fixation_id, "CRIADO", novos=data)
+            conn.commit()
+            conn.close()
+            flash("Fixação cadastrada com sucesso.", "success")
+            return redirect(url_for("lista_fixacoes", contrato_id=contrato_id, item_id=item_id))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Não foi possível cadastrar a Fixação.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+    totals = safra_contract_item_totals(conn, item_id)
+    fixacoes_total = conn.execute("SELECT COUNT(*) FROM fixacoes WHERE contrato_item_id=?", (item_id,)).fetchone()[0]
+    pagination = build_pagination(
+        request.args, fixacoes_total, endpoint="lista_fixacoes",
+        fixed_args={"contrato_id": contrato_id, "item_id": item_id},
+    )
+    fixacoes = conn.execute(
+        "SELECT * FROM fixacoes WHERE contrato_item_id=? ORDER BY data_fixacao DESC, id DESC LIMIT ? OFFSET ?",
+        (item_id, pagination["per_page"], pagination["offset"]),
+    ).fetchall()
+    conn.close()
+    return render_template(
+        "safra_fixacoes.html", contrato=contrato, item=item, totals=totals,
+        fixacoes=fixacoes, fixacao=None, pagination=pagination,
+    )
+
+
+@app.route("/safra/contratos/<int:contrato_id>/itens/<int:item_id>/fixacoes/<int:fixacao_id>/editar", methods=["GET", "POST"])
+def editar_fixacao(contrato_id, item_id, fixacao_id):
+    conn = db()
+    contrato, item = safra_load_item(conn, contrato_id, item_id)
+    current = conn.execute("SELECT * FROM fixacoes WHERE id=? AND contrato_item_id=?", (fixacao_id, item_id)).fetchone()
+    if not contrato or not item or not current:
+        conn.close()
+        return "Fixação não encontrada", 404
+    if request.method == "POST":
+        try:
+            if current["status"] == STATUS_FIXACAO_CANCELADA:
+                raise ValueError("Não é possível editar uma Fixação cancelada.")
+            data = safra_fixation_form_data(request.form, item)
+            totals = safra_contract_item_totals(conn, item_id)
+            volume_disponivel = totals["volume_a_fixar"] + float(current["volume_fixado"] or 0)
+            if data["volume_fixado"] > volume_disponivel + float(SALDO_TOLERANCE):
+                raise ValueError(f"A Fixação excede o volume a fixar ({volume_disponivel:.3f}).")
+            conn.execute("""
+                UPDATE fixacoes SET data_fixacao=?, volume_fixado=?, quantidade_lotes=?, tela=?,
+                    data_referencia_ny=?, ny_cents=?, premio=?, ajuste_preco=?, preco_unitario=?,
+                    moeda=?, observacao=?, updated_at=CURRENT_TIMESTAMP WHERE id=?
+            """, (
+                data["data_fixacao"], data["volume_fixado"], data["quantidade_lotes"], data["tela"],
+                data["data_referencia_ny"], data["ny_cents"], data["premio"], data["ajuste_preco"],
+                data["preco_unitario"], data["moeda"], data["observacao"], fixacao_id,
+            ))
+            safra_auditoria(conn, "FIXACAO", fixacao_id, "ALTERADO", safra_row_dict(current), data)
+            conn.commit()
+            conn.close()
+            flash("Fixação atualizada com sucesso.", "success")
+            return redirect(url_for("lista_fixacoes", contrato_id=contrato_id, item_id=item_id))
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+        current = dict(request.form)
+        current["id"] = fixacao_id
+    totals = safra_contract_item_totals(conn, item_id)
+    fixacoes_total = conn.execute("SELECT COUNT(*) FROM fixacoes WHERE contrato_item_id=?", (item_id,)).fetchone()[0]
+    pagination = build_pagination(
+        request.args, fixacoes_total, endpoint="lista_fixacoes",
+        fixed_args={"contrato_id": contrato_id, "item_id": item_id},
+    )
+    fixacoes = conn.execute(
+        "SELECT * FROM fixacoes WHERE contrato_item_id=? ORDER BY data_fixacao DESC, id DESC LIMIT ? OFFSET ?",
+        (item_id, pagination["per_page"], pagination["offset"]),
+    ).fetchall()
+    conn.close()
+    return render_template(
+        "safra_fixacoes.html", contrato=contrato, item=item, totals=totals,
+        fixacoes=fixacoes, fixacao=current, pagination=pagination,
+    )
+
+
+@app.route("/safra/contratos/<int:contrato_id>/itens/<int:item_id>/fixacoes/<int:fixacao_id>/cancelar", methods=["POST"])
+def cancelar_fixacao(contrato_id, item_id, fixacao_id):
+    conn = db()
+    contrato, item = safra_load_item(conn, contrato_id, item_id)
+    current = conn.execute("SELECT * FROM fixacoes WHERE id=? AND contrato_item_id=?", (fixacao_id, item_id)).fetchone()
+    if not contrato or not item or not current:
+        conn.close()
+        return "Fixação não encontrada", 404
+    try:
+        if current["status"] == STATUS_FIXACAO_CANCELADA:
+            raise ValueError("A Fixação já está cancelada.")
+        conn.execute(
+            "UPDATE fixacoes SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (STATUS_FIXACAO_CANCELADA, fixacao_id),
+        )
+        safra_auditoria(conn, "FIXACAO", fixacao_id, "CANCELADO", safra_row_dict(current), {"status": STATUS_FIXACAO_CANCELADA})
+        conn.commit()
+        flash("Fixação cancelada com sucesso.", "success")
+    except ValueError as exc:
+        conn.rollback()
+        flash(str(exc), "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("lista_fixacoes", contrato_id=contrato_id, item_id=item_id))
 
 
 @app.route("/contexto-global", methods=["POST"])
@@ -3237,6 +4379,42 @@ def index():
               AND COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), 'Câmbio Exportação')<>?
         """, contract_global_params + [CATEGORIA_CAMBIO_FINANCEIRO]).fetchone()[0],
     }
+    producao_global, producao_global_params = global_context_sql("production", g.global_context, "p")
+    comercial_global, comercial_global_params = global_context_sql("commercial", g.global_context, "cc")
+    producao_where = f"WHERE {producao_global}" if producao_global else ""
+    comercial_where = f"WHERE {comercial_global} AND cc.status<>?" if comercial_global else "WHERE cc.status<>?"
+    resumo_producao = conn.execute("""
+        SELECT COALESCE(SUM(p.quantidade_estimada),0) AS estimada,
+               COALESCE(SUM(p.quantidade_realizada),0) AS realizada,
+               COUNT(*) AS registros
+        FROM producoes p
+    """ + producao_where, producao_global_params).fetchone()
+    resumo_comercial = conn.execute("""
+        WITH selecionados AS (
+            SELECT cc.id
+            FROM contratos_comerciais cc
+            """ + comercial_where + """
+        ), contratados AS (
+            SELECT COALESCE(SUM(i.volume_contratado),0) AS contratado
+            FROM contrato_comercial_itens i JOIN selecionados s ON s.id=i.contrato_id
+        ), fixados AS (
+            SELECT COALESCE(SUM(f.volume_fixado),0) AS fixado
+            FROM fixacoes f
+            JOIN contrato_comercial_itens i ON i.id=f.contrato_item_id
+            JOIN selecionados s ON s.id=i.contrato_id
+            WHERE f.status='ATIVA'
+        )
+        SELECT (SELECT contratado FROM contratados) AS contratado,
+               (SELECT fixado FROM fixados) AS fixado,
+               (SELECT COUNT(*) FROM selecionados) AS contratos
+    """, comercial_global_params + [STATUS_CONTRATO_COMERCIAL_CANCELADO]).fetchone()
+    resumo["producao_estimada"] = resumo_producao["estimada"]
+    resumo["producao_realizada"] = resumo_producao["realizada"]
+    resumo["producoes"] = resumo_producao["registros"]
+    resumo["contratos_comerciais"] = resumo_comercial["contratos"]
+    resumo["volume_contratado"] = resumo_comercial["contratado"]
+    resumo["volume_fixado"] = resumo_comercial["fixado"]
+    resumo["volume_a_fixar"] = max(0, float(resumo_comercial["contratado"] or 0) - float(resumo_comercial["fixado"] or 0))
     conn.close()
     return render_template("index.html", dues=dues, contratos=contratos, resumo=resumo,
                            dues_pagination=dues_pagination,

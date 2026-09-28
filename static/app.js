@@ -931,6 +931,101 @@
     clear();
   }
 
+  const sidebarBody = document.body;
+  const sidebarStorageKey = 'duecontrol.sidebar.state';
+  const sidebarIsMobile = () => window.matchMedia('(max-width: 720px)').matches;
+
+  const persistSidebarState = () => {
+    try {
+      window.localStorage.setItem(sidebarStorageKey, JSON.stringify({
+        collapsed: sidebarBody.classList.contains('sidebar-collapsed'),
+        hidden: sidebarBody.classList.contains('sidebar-is-hidden'),
+      }));
+    } catch (_) {
+      // A navegação continua funcionando mesmo quando o navegador bloqueia o storage.
+    }
+  };
+
+  const closeMobileSidebar = () => sidebarBody.classList.remove('sidebar-mobile-open');
+
+  document.querySelectorAll('[data-submenu-toggle]').forEach((toggle) => {
+    const submenu = document.getElementById(toggle.getAttribute('aria-controls'));
+    if (!submenu) return;
+    toggle.addEventListener('click', () => {
+      const expanded = toggle.getAttribute('aria-expanded') === 'true';
+      toggle.setAttribute('aria-expanded', String(!expanded));
+      submenu.hidden = expanded;
+    });
+  });
+
+  document.querySelectorAll('[data-sidebar-collapse]').forEach((button) => {
+    button.addEventListener('click', () => {
+      if (sidebarIsMobile()) {
+        closeMobileSidebar();
+        return;
+      }
+      sidebarBody.classList.toggle('sidebar-collapsed');
+      sidebarBody.classList.remove('sidebar-is-hidden');
+      const collapsed = sidebarBody.classList.contains('sidebar-collapsed');
+      button.setAttribute('aria-expanded', String(!collapsed));
+      button.setAttribute('aria-label', collapsed ? 'Expandir menu' : 'Recolher menu');
+      button.setAttribute('title', collapsed ? 'Expandir menu' : 'Recolher menu');
+      persistSidebarState();
+    });
+  });
+
+  document.querySelectorAll('[data-sidebar-toggle]').forEach((button) => {
+    button.addEventListener('click', () => {
+      if (sidebarIsMobile()) {
+        sidebarBody.classList.toggle('sidebar-mobile-open');
+        sidebarBody.classList.remove('sidebar-is-hidden');
+        return;
+      }
+      sidebarBody.classList.remove('sidebar-is-hidden');
+      persistSidebarState();
+    });
+  });
+
+  document.querySelectorAll('[data-sidebar-hide]').forEach((button) => {
+    button.addEventListener('click', () => {
+      sidebarBody.classList.add('sidebar-is-hidden');
+      sidebarBody.classList.remove('sidebar-mobile-open');
+      persistSidebarState();
+    });
+  });
+
+  document.querySelectorAll('[data-sidebar-show]').forEach((button) => {
+    button.addEventListener('click', () => {
+      sidebarBody.classList.remove('sidebar-is-hidden');
+      if (sidebarIsMobile()) sidebarBody.classList.add('sidebar-mobile-open');
+      persistSidebarState();
+    });
+  });
+
+  document.querySelectorAll('[data-sidebar-close]').forEach((button) => {
+    button.addEventListener('click', closeMobileSidebar);
+  });
+
+  document.querySelectorAll('.app-sidebar a').forEach((link) => {
+    link.addEventListener('click', () => {
+      if (sidebarIsMobile()) closeMobileSidebar();
+    });
+  });
+
+  try {
+    const savedSidebarState = JSON.parse(window.localStorage.getItem(sidebarStorageKey) || '{}');
+    if (!sidebarIsMobile() && savedSidebarState.hidden) sidebarBody.classList.add('sidebar-is-hidden');
+    if (!sidebarIsMobile() && savedSidebarState.collapsed && !savedSidebarState.hidden) sidebarBody.classList.add('sidebar-collapsed');
+    const collapsed = sidebarBody.classList.contains('sidebar-collapsed');
+    document.querySelectorAll('[data-sidebar-collapse]').forEach((button) => {
+      button.setAttribute('aria-expanded', String(!collapsed));
+      button.setAttribute('aria-label', collapsed ? 'Expandir menu' : 'Recolher menu');
+      button.setAttribute('title', collapsed ? 'Expandir menu' : 'Recolher menu');
+    });
+  } catch (_) {
+    // Estado inicial padrão quando localStorage não está disponível.
+  }
+
   const saldoClientDialog = document.querySelector('[data-saldo-client-dialog]');
   if (saldoClientDialog) {
     const saldoClientContent = saldoClientDialog.querySelector('[data-saldo-client-dialog-content]');
