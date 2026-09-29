@@ -25,9 +25,9 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 16
+INVOICE_SCHEMA_VERSION = 18
 INVOICE_LEGACY_SCHEMA_VERSION = 15
-SAFRA_SCHEMA_VERSION = 16
+SAFRA_SCHEMA_VERSION = 18
 
 SALDO_TOLERANCE = Decimal("0.005")
 CONVERSION_RULE_HALF_DOWN = "HALF_DOWN"
@@ -375,6 +375,78 @@ def migrate_invoice_status_constraint(conn):
         conn.rollback()
         conn.execute("PRAGMA foreign_keys = ON")
         raise
+
+
+def migrate_produtos_schema(conn):
+    """Cria o cadastro mestre de produtos e prepara a FK da produção.
+
+    A coluna textual ``producoes.produto`` é preservada para leitura de
+    registros legados. Novos registros usam ``produto_id`` e validam o
+    produto cadastrado e ativo da empresa selecionada.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS produtos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            empresa_id INTEGER NOT NULL,
+            nome TEXT NOT NULL,
+            ativo INTEGER NOT NULL DEFAULT 1 CHECK(ativo IN (0, 1)),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE RESTRICT,
+            UNIQUE(empresa_id, nome)
+        )
+    """)
+    producao_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(producoes)")
+    }
+    if "produto_id" not in producao_columns:
+        conn.execute(
+            "ALTER TABLE producoes ADD COLUMN produto_id INTEGER "
+            "REFERENCES produtos(id) ON DELETE RESTRICT"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_produtos_empresa_ativo "
+        "ON produtos(empresa_id, ativo, nome)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_producoes_produto "
+        "ON producoes(produto_id)"
+    )
+
+
+def migrate_unidades_schema(conn):
+    """Cria o cadastro mestre global de unidades e prepara suas FKs."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS unidades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            ativo INTEGER NOT NULL DEFAULT 1 CHECK(ativo IN (0, 1)),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(nome)
+        )
+    """)
+    for table_name in ("producoes", "contrato_comercial_itens"):
+        columns = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")
+        }
+        if "unidade_id" not in columns:
+            conn.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN unidade_id INTEGER "
+                "REFERENCES unidades(id) ON DELETE RESTRICT"
+            )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_unidades_ativo_nome "
+        "ON unidades(ativo, nome)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_producoes_unidade "
+        "ON producoes(unidade_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_contrato_comercial_itens_unidade "
+        "ON contrato_comercial_itens(unidade_id)"
+    )
 
 
 def init_db():
@@ -847,6 +919,9 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_auditoria_entidade
                 ON auditoria_eventos(entidade, entidade_id, created_at);
         """)
+        # Migrações v17/v18: Produtos e Unidades mestres.
+        migrate_produtos_schema(conn)
+        migrate_unidades_schema(conn)
         contraparte_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(contrapartes)")
         }
@@ -2352,6 +2427,96 @@ def form_record_id(value, fallback=None):
     except (TypeError, ValueError):
         return None
 
+
+def normalize_produto_nome(value):
+    """Normaliza o nome do produto sem perder acentos ou caracteres UTF-8."""
+    nome = unicodedata.normalize("NFC", str(value or "").strip()).upper()
+    nome = unicodedata.normalize("NFC", nome)
+    if not nome:
+        raise ValueError("O nome do produto é obrigatório.")
+    return nome
+
+
+def produto_form_data(form, conn, current=None):
+    empresa_id = form_record_id(
+        form.get("empresa_id"), current["empresa_id"] if current else None
+    )
+    if not empresa_id or not conn.execute(
+        "SELECT id FROM empresas WHERE id=?", (empresa_id,)
+    ).fetchone():
+        raise ValueError("Selecione uma empresa cadastrada.")
+    nome = normalize_produto_nome(form.get("nome"))
+    if current and empresa_id != current["empresa_id"]:
+        referencias = conn.execute(
+            "SELECT COUNT(*) FROM producoes WHERE produto_id=?", (current["id"],)
+        ).fetchone()[0]
+        if referencias:
+            raise ValueError(
+                "Não é possível trocar a empresa de um produto já usado em produção."
+            )
+    return {"empresa_id": empresa_id, "nome": nome}
+
+
+def produto_ativo_da_selecao(conn, raw_id, empresa_id):
+    produto_id = form_record_id(raw_id)
+    if not produto_id:
+        raise ValueError("Selecione um produto cadastrado e ativo.")
+    produto = conn.execute(
+        """
+        SELECT id, empresa_id, nome
+        FROM produtos
+        WHERE id=? AND empresa_id=? AND ativo=1
+        """,
+        (produto_id, empresa_id),
+    ).fetchone()
+    if not produto:
+        raise ValueError(
+            "O produto selecionado não foi encontrado ou está inativo para a empresa."
+        )
+    return produto
+
+
+def produtos_ativos_for_form(conn):
+    return conn.execute(
+        """
+        SELECT p.id, p.empresa_id, p.nome, e.razao_social, e.apelido
+        FROM produtos p
+        JOIN empresas e ON e.id=p.empresa_id
+        WHERE p.ativo=1
+        ORDER BY """ + empresa_order_sql("e") + ", p.nome, p.id"
+    ).fetchall()
+
+
+def normalize_unidade_nome(value):
+    """Normaliza o nome da unidade sem perder acentos ou caracteres UTF-8."""
+    nome = unicodedata.normalize("NFC", str(value or "").strip()).upper()
+    nome = unicodedata.normalize("NFC", nome)
+    if not nome:
+        raise ValueError("O nome da unidade é obrigatório.")
+    return nome
+
+
+def unidade_form_data(form):
+    return {"nome": normalize_unidade_nome(form.get("nome"))}
+
+
+def unidade_ativa_da_selecao(conn, raw_id):
+    unidade_id = form_record_id(raw_id)
+    if not unidade_id:
+        raise ValueError("Selecione uma unidade cadastrada e ativa.")
+    unidade = conn.execute(
+        "SELECT id, nome FROM unidades WHERE id=? AND ativo=1", (unidade_id,)
+    ).fetchone()
+    if not unidade:
+        raise ValueError("A unidade selecionada não foi encontrada ou está inativa.")
+    return unidade
+
+
+def unidades_ativas_for_form(conn):
+    return conn.execute(
+        "SELECT id, nome FROM unidades WHERE ativo=1 ORDER BY nome, id"
+    ).fetchall()
+
 def cliente_da_selecao(conn, raw_id, current_id=None, required=False):
     if raw_id in (None, ""):
         if current_id:
@@ -3455,10 +3620,8 @@ def lista_producoes():
             empresa_id = form_record_id(form.get("empresa_id"))
             competencia = safra_competencia_empresa(conn, empresa_id, form.get("competencia_id"))
             mes = safra_month_in_competencia(form.get("mes_referencia"), competencia)
-            produto = (form.get("produto") or SAFRA_PRODUTO_PADRAO).strip() or SAFRA_PRODUTO_PADRAO
-            unidade = (form.get("unidade") or SAFRA_UNIDADE_PADRAO).strip().upper()
-            if not re.fullmatch(r"[A-Z0-9_À-Ú]+", unidade, re.IGNORECASE):
-                raise ValueError("A unidade deve ser informada.")
+            produto = produto_ativo_da_selecao(conn, form.get("produto_id"), empresa_id)
+            unidade = unidade_ativa_da_selecao(conn, form.get("unidade_id"))
             estimada = safra_non_negative(form.get("quantidade_estimada"), "A produção estimada")
             realizada = safra_non_negative(
                 form.get("quantidade_realizada"), "A produção realizada", allow_blank=True
@@ -3466,18 +3629,22 @@ def lista_producoes():
             tranche = (form.get("tranche") or "").strip()
             cursor = conn.execute("""
                 INSERT INTO producoes
-                    (empresa_id, competencia_id, produto, mes_referencia, tranche, unidade,
+                    (empresa_id, competencia_id, produto_id, produto, mes_referencia, tranche,
+                     unidade_id, unidade,
                      quantidade_estimada, quantidade_realizada, observacao)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """, (
-                empresa_id, competencia["id"], produto, mes, tranche, unidade,
+                empresa_id, competencia["id"], produto["id"], produto["nome"], mes, tranche,
+                unidade["id"], unidade["nome"],
                 estimada, realizada, (form.get("observacao") or "").strip() or None,
             ))
             producao_id = cursor.lastrowid
             safra_auditoria(conn, "PRODUCAO", producao_id, "CRIADO", novos={
                 "empresa_id": empresa_id, "competencia_id": competencia["id"],
-                "produto": produto, "mes_referencia": mes, "tranche": tranche,
-                "unidade": unidade, "quantidade_estimada": estimada,
+                "produto_id": produto["id"], "produto": produto["nome"],
+                "mes_referencia": mes, "tranche": tranche,
+                "unidade_id": unidade["id"], "unidade": unidade["nome"],
+                "quantidade_estimada": estimada,
                 "quantidade_realizada": realizada,
             })
             conn.commit()
@@ -3540,12 +3707,17 @@ def lista_producoes():
     order_sql = f"{sort_sql_term(sort_fields[sort], direction)}, p.id DESC" if sort else "p.mes_referencia DESC, p.id DESC"
     producoes = conn.execute("""
         SELECT p.*, e.razao_social, e.apelido, c.descricao AS competencia_descricao,
-               c.data_inicial, c.data_final
+               c.data_inicial, c.data_final, pr.nome AS produto_nome,
+               un.nome AS unidade_nome
         FROM producoes p
         JOIN empresas e ON e.id=p.empresa_id
         JOIN competencias c ON c.id=p.competencia_id
+        LEFT JOIN produtos pr ON pr.id=p.produto_id
+        LEFT JOIN unidades un ON un.id=p.unidade_id
     """ + where_sql + " ORDER BY " + order_sql + " LIMIT ? OFFSET ?", params + [pagination["per_page"], pagination["offset"]]).fetchall()
     empresas, competencias = safra_empresas_competencias(conn)
+    produtos = produtos_ativos_for_form(conn)
+    unidades = unidades_ativas_for_form(conn)
     selected_empresa_id = form_record_id(form.get("empresa_id")) if request.method == "POST" else filters["empresa_id"]
     selected_competencia_id = form_record_id(form.get("competencia_id")) if request.method == "POST" else filters["competencia_id"]
     if not selected_empresa_id and g.global_context.get("empresa_id"):
@@ -3553,7 +3725,8 @@ def lista_producoes():
     conn.close()
     return render_template(
         "safra_producoes.html", producao=producao, producoes=producoes,
-        empresas=empresas, competencias=competencias,
+        empresas=empresas, competencias=competencias, produtos=produtos,
+        unidades=unidades,
         empresa_id=selected_empresa_id, competencia_id=selected_competencia_id,
         filters=filters, pagination=pagination, sort=sort, direction=direction,
         sort_links=sort_links,
@@ -3579,20 +3752,24 @@ def editar_producao(producao_id):
             empresa_id = form_record_id(request.form.get("empresa_id"))
             competencia = safra_competencia_empresa(conn, empresa_id, request.form.get("competencia_id"))
             mes = safra_month_in_competencia(request.form.get("mes_referencia"), competencia)
-            produto = (request.form.get("produto") or SAFRA_PRODUTO_PADRAO).strip() or SAFRA_PRODUTO_PADRAO
-            unidade = (request.form.get("unidade") or SAFRA_UNIDADE_PADRAO).strip().upper()
+            produto = produto_ativo_da_selecao(
+                conn, request.form.get("produto_id"), empresa_id
+            )
+            unidade = unidade_ativa_da_selecao(conn, request.form.get("unidade_id"))
             estimada = safra_non_negative(request.form.get("quantidade_estimada"), "A produção estimada")
             realizada = safra_non_negative(request.form.get("quantidade_realizada"), "A produção realizada", allow_blank=True)
             tranche = (request.form.get("tranche") or "").strip()
             novos = {
-                "empresa_id": empresa_id, "competencia_id": competencia["id"], "produto": produto,
-                "mes_referencia": mes, "tranche": tranche, "unidade": unidade,
+                "empresa_id": empresa_id, "competencia_id": competencia["id"],
+                "produto_id": produto["id"], "produto": produto["nome"],
+                "mes_referencia": mes, "tranche": tranche,
+                "unidade_id": unidade["id"], "unidade": unidade["nome"],
                 "quantidade_estimada": estimada, "quantidade_realizada": realizada,
                 "observacao": (request.form.get("observacao") or "").strip() or None,
             }
             conn.execute("""
-                UPDATE producoes SET empresa_id=?, competencia_id=?, produto=?, mes_referencia=?,
-                    tranche=?, unidade=?, quantidade_estimada=?, quantidade_realizada=?,
+                UPDATE producoes SET empresa_id=?, competencia_id=?, produto_id=?, produto=?, mes_referencia=?,
+                    tranche=?, unidade_id=?, unidade=?, quantidade_estimada=?, quantidade_realizada=?,
                     observacao=?, updated_at=CURRENT_TIMESTAMP WHERE id=?
             """, (*novos.values(), producao_id))
             safra_auditoria(conn, "PRODUCAO", producao_id, "ALTERADO", safra_row_dict(current), novos)
@@ -3607,10 +3784,13 @@ def editar_producao(producao_id):
             conn.rollback()
             flash(str(exc), "danger")
     empresas, competencias = safra_empresas_competencias(conn)
+    produtos = produtos_ativos_for_form(conn)
+    unidades = unidades_ativas_for_form(conn)
     conn.close()
     return render_template(
         "safra_producoes.html", producao=current if request.method == "GET" else dict(request.form),
-        producoes=[], empresas=empresas, competencias=competencias,
+        producoes=[], empresas=empresas, competencias=competencias, produtos=produtos,
+        unidades=unidades,
         empresa_id=form_record_id(request.form.get("empresa_id")) if request.method == "POST" else current["empresa_id"],
         competencia_id=form_record_id(request.form.get("competencia_id")) if request.method == "POST" else current["competencia_id"],
         filters={}, pagination=build_pagination({}, 0, endpoint="lista_producoes"),
@@ -3907,9 +4087,11 @@ def detalhe_contrato_comercial(contrato_id):
         conn.close()
         return "Contrato comercial não encontrado", 404
     itens = conn.execute("""
-        SELECT i.*, COALESCE(SUM(CASE WHEN f.status=? THEN f.volume_fixado ELSE 0 END),0) AS volume_fixado
+        SELECT i.*, u.nome AS unidade_nome,
+               COALESCE(SUM(CASE WHEN f.status=? THEN f.volume_fixado ELSE 0 END),0) AS volume_fixado
         FROM contrato_comercial_itens i
         LEFT JOIN fixacoes f ON f.contrato_item_id=i.id
+        LEFT JOIN unidades u ON u.id=i.unidade_id
         WHERE i.contrato_id=?
         GROUP BY i.id
         ORDER BY i.mes_referencia, i.tranche, i.id
@@ -3925,15 +4107,14 @@ def safra_item_form_data(conn, contrato, source):
         "data_final": contrato["competencia_data_final"],
     })
     produto = (source.get("produto") or SAFRA_PRODUTO_PADRAO).strip() or SAFRA_PRODUTO_PADRAO
-    unidade = (source.get("unidade") or SAFRA_UNIDADE_PADRAO).strip().upper()
-    if not unidade:
-        raise ValueError("A unidade é obrigatória.")
+    unidade = unidade_ativa_da_selecao(conn, source.get("unidade_id"))
     return {
         "contrato_id": contrato["id"],
         "mes_referencia": mes,
         "tranche": (source.get("tranche") or "").strip(),
         "produto": produto,
-        "unidade": unidade,
+        "unidade_id": unidade["id"],
+        "unidade": unidade["nome"],
         "volume_contratado": safra_non_negative(source.get("volume_contratado"), "O volume contratado"),
         "qualidade": (source.get("qualidade") or "").strip() or None,
         "moeda": comercial_currency(source.get("moeda"), default="USD"),
@@ -3957,9 +4138,10 @@ def novo_item_contrato_comercial(contrato_id):
             data = safra_item_form_data(conn, contrato, request.form)
             cursor = conn.execute("""
                 INSERT INTO contrato_comercial_itens
-                    (contrato_id, mes_referencia, tranche, produto, unidade, volume_contratado,
+                    (contrato_id, mes_referencia, tranche, produto, unidade_id, unidade,
+                     volume_contratado,
                      qualidade, moeda, incoterm, preco_contratado, observacao)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """, tuple(data.values()))
             item_id = cursor.lastrowid
             safra_auditoria(conn, "CONTRATO_COMERCIAL_ITEM", item_id, "CRIADO", novos=data)
@@ -3973,8 +4155,12 @@ def novo_item_contrato_comercial(contrato_id):
         except ValueError as exc:
             conn.rollback()
             flash(str(exc), "danger")
+    unidades = unidades_ativas_for_form(conn)
     conn.close()
-    return render_template("safra_item_form.html", contrato=contrato, item=dict(request.form), edit_mode=False)
+    return render_template(
+        "safra_item_form.html", contrato=contrato, item=dict(request.form),
+        unidades=unidades, edit_mode=False,
+    )
 
 
 @app.route("/safra/contratos/<int:contrato_id>/itens/<int:item_id>/editar", methods=["GET", "POST"])
@@ -3994,11 +4180,13 @@ def editar_item_contrato_comercial(contrato_id, item_id):
             if totals and data["volume_contratado"] + float(SALDO_TOLERANCE) < totals["volume_fixado"]:
                 raise ValueError("O volume contratado não pode ser menor que o volume já fixado.")
             conn.execute("""
-                UPDATE contrato_comercial_itens SET mes_referencia=?, tranche=?, produto=?, unidade=?,
+                UPDATE contrato_comercial_itens SET mes_referencia=?, tranche=?, produto=?,
+                    unidade_id=?, unidade=?,
                     volume_contratado=?, qualidade=?, moeda=?, incoterm=?, preco_contratado=?,
                     observacao=?, updated_at=CURRENT_TIMESTAMP WHERE id=?
             """, (
-                data["mes_referencia"], data["tranche"], data["produto"], data["unidade"],
+                data["mes_referencia"], data["tranche"], data["produto"],
+                data["unidade_id"], data["unidade"],
                 data["volume_contratado"], data["qualidade"], data["moeda"], data["incoterm"],
                 data["preco_contratado"], data["observacao"], item_id,
             ))
@@ -4015,8 +4203,12 @@ def editar_item_contrato_comercial(contrato_id, item_id):
             flash(str(exc), "danger")
         item = dict(request.form)
         item["id"] = item_id
+    unidades = unidades_ativas_for_form(conn)
     conn.close()
-    return render_template("safra_item_form.html", contrato=contrato, item=item, edit_mode=True)
+    return render_template(
+        "safra_item_form.html", contrato=contrato, item=item,
+        unidades=unidades, edit_mode=True,
+    )
 
 
 def safra_load_item(conn, contrato_id, item_id):
@@ -6647,6 +6839,255 @@ def importar_ptax():
 @app.route("/configuracoes")
 def configuracoes():
     return render_template("configuracoes.html")
+
+
+@app.route("/configuracoes/produtos", methods=["GET", "POST"])
+def cadastro_produtos():
+    conn = db()
+    selected_empresa_id = (
+        form_record_id(request.form.get("empresa_id"))
+        if request.method == "POST"
+        else form_record_id(request.args.get("empresa_id"))
+    )
+    nome = request.form.get("nome", "") if request.method == "POST" else ""
+    if request.method == "POST":
+        try:
+            data = produto_form_data(request.form, conn)
+            conn.execute(
+                "INSERT INTO produtos (empresa_id, nome) VALUES (?, ?)",
+                (data["empresa_id"], data["nome"]),
+            )
+            conn.commit()
+            conn.close()
+            flash("Produto cadastrado com sucesso.", "success")
+            return redirect(url_for("cadastro_produtos"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe um produto com esse nome para a empresa selecionada.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+
+    empresas = conn.execute(
+        "SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY "
+        + empresa_order_sql()
+    ).fetchall()
+    produtos_total = conn.execute("SELECT COUNT(*) FROM produtos").fetchone()[0]
+    pagination = build_pagination(request.args, produtos_total, endpoint="cadastro_produtos")
+    produtos = conn.execute(
+        f"""
+        SELECT p.id, p.empresa_id, p.nome, p.ativo, p.created_at, p.updated_at,
+               e.razao_social, e.apelido
+        FROM produtos p
+        JOIN empresas e ON e.id=p.empresa_id
+        ORDER BY {empresa_order_sql('e')}, p.nome, p.id
+        LIMIT ? OFFSET ?
+        """,
+        (pagination["per_page"], pagination["offset"]),
+    ).fetchall()
+    conn.close()
+    return render_template(
+        "produtos.html", produtos=produtos, empresas=empresas,
+        produto_em_edicao=None, nome=nome,
+        empresa_id=selected_empresa_id, pagination=pagination,
+    )
+
+
+@app.route("/configuracoes/produtos/<int:produto_id>/editar", methods=["GET", "POST"])
+def editar_produto(produto_id):
+    conn = db()
+    produto = conn.execute(
+        "SELECT id, empresa_id, nome, ativo FROM produtos WHERE id=?", (produto_id,)
+    ).fetchone()
+    if not produto:
+        conn.close()
+        return "Produto não encontrado", 404
+
+    nome = produto["nome"]
+    selected_empresa_id = produto["empresa_id"]
+    if request.method == "POST":
+        nome = request.form.get("nome", "")
+        selected_empresa_id = form_record_id(request.form.get("empresa_id"))
+        try:
+            data = produto_form_data(request.form, conn, current=produto)
+            conn.execute(
+                "UPDATE produtos SET empresa_id=?, nome=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (data["empresa_id"], data["nome"], produto_id),
+            )
+            conn.commit()
+            conn.close()
+            flash("Produto atualizado com sucesso.", "success")
+            return redirect(url_for("cadastro_produtos"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe um produto com esse nome para a empresa selecionada.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+        produto = dict(produto)
+        produto.update(request.form)
+        produto["id"] = produto_id
+
+    empresas = conn.execute(
+        "SELECT id, razao_social, apelido, cnpj, prioridade FROM empresas ORDER BY "
+        + empresa_order_sql()
+    ).fetchall()
+    produtos_total = conn.execute("SELECT COUNT(*) FROM produtos").fetchone()[0]
+    pagination = build_pagination(request.args, produtos_total, endpoint="cadastro_produtos")
+    produtos = conn.execute(
+        f"""
+        SELECT p.id, p.empresa_id, p.nome, p.ativo, p.created_at, p.updated_at,
+               e.razao_social, e.apelido
+        FROM produtos p
+        JOIN empresas e ON e.id=p.empresa_id
+        ORDER BY {empresa_order_sql('e')}, p.nome, p.id
+        LIMIT ? OFFSET ?
+        """,
+        (pagination["per_page"], pagination["offset"]),
+    ).fetchall()
+    conn.close()
+    return render_template(
+        "produtos.html", produtos=produtos, empresas=empresas,
+        produto_em_edicao=produto, nome=nome,
+        empresa_id=selected_empresa_id, pagination=pagination,
+    )
+
+
+@app.route("/configuracoes/produtos/<int:produto_id>/alternar", methods=["POST"])
+def alternar_produto(produto_id):
+    conn = db()
+    produto = conn.execute(
+        "SELECT id, nome, ativo FROM produtos WHERE id=?", (produto_id,)
+    ).fetchone()
+    if not produto:
+        conn.close()
+        return "Produto não encontrado", 404
+    ativo = 0 if produto["ativo"] else 1
+    conn.execute(
+        "UPDATE produtos SET ativo=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (ativo, produto_id),
+    )
+    conn.commit()
+    conn.close()
+    flash(
+        f"Produto {produto['nome']} {'ativado' if ativo else 'inativado'} com sucesso.",
+        "success",
+    )
+    return redirect(url_for("cadastro_produtos"))
+
+
+@app.route("/configuracoes/unidades", methods=["GET", "POST"])
+def cadastro_unidades():
+    conn = db()
+    nome = request.form.get("nome", "") if request.method == "POST" else ""
+    if request.method == "POST":
+        try:
+            data = unidade_form_data(request.form)
+            conn.execute(
+                "INSERT INTO unidades (nome) VALUES (?)", (data["nome"],)
+            )
+            conn.commit()
+            conn.close()
+            flash("Unidade cadastrada com sucesso.", "success")
+            return redirect(url_for("cadastro_unidades"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe uma unidade com esse nome.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+
+    unidades_total = conn.execute("SELECT COUNT(*) FROM unidades").fetchone()[0]
+    pagination = build_pagination(request.args, unidades_total, endpoint="cadastro_unidades")
+    unidades = conn.execute(
+        """
+        SELECT id, nome, ativo, created_at, updated_at
+        FROM unidades
+        ORDER BY nome, id
+        LIMIT ? OFFSET ?
+        """,
+        (pagination["per_page"], pagination["offset"]),
+    ).fetchall()
+    conn.close()
+    return render_template(
+        "unidades.html", unidades=unidades, unidade_em_edicao=None,
+        nome=nome, pagination=pagination,
+    )
+
+
+@app.route("/configuracoes/unidades/<int:unidade_id>/editar", methods=["GET", "POST"])
+def editar_unidade(unidade_id):
+    conn = db()
+    unidade = conn.execute(
+        "SELECT id, nome, ativo FROM unidades WHERE id=?", (unidade_id,)
+    ).fetchone()
+    if not unidade:
+        conn.close()
+        return "Unidade não encontrada", 404
+
+    nome = unidade["nome"]
+    if request.method == "POST":
+        nome = request.form.get("nome", "")
+        try:
+            data = unidade_form_data(request.form)
+            conn.execute(
+                "UPDATE unidades SET nome=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (data["nome"], unidade_id),
+            )
+            conn.commit()
+            conn.close()
+            flash("Unidade atualizada com sucesso.", "success")
+            return redirect(url_for("cadastro_unidades"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe uma unidade com esse nome.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+        unidade = dict(unidade)
+        unidade.update(request.form)
+        unidade["id"] = unidade_id
+
+    unidades_total = conn.execute("SELECT COUNT(*) FROM unidades").fetchone()[0]
+    pagination = build_pagination(request.args, unidades_total, endpoint="cadastro_unidades")
+    unidades = conn.execute(
+        """
+        SELECT id, nome, ativo, created_at, updated_at
+        FROM unidades
+        ORDER BY nome, id
+        LIMIT ? OFFSET ?
+        """,
+        (pagination["per_page"], pagination["offset"]),
+    ).fetchall()
+    conn.close()
+    return render_template(
+        "unidades.html", unidades=unidades, unidade_em_edicao=unidade,
+        nome=nome, pagination=pagination,
+    )
+
+
+@app.route("/configuracoes/unidades/<int:unidade_id>/alternar", methods=["POST"])
+def alternar_unidade(unidade_id):
+    conn = db()
+    unidade = conn.execute(
+        "SELECT id, nome, ativo FROM unidades WHERE id=?", (unidade_id,)
+    ).fetchone()
+    if not unidade:
+        conn.close()
+        return "Unidade não encontrada", 404
+    ativo = 0 if unidade["ativo"] else 1
+    conn.execute(
+        "UPDATE unidades SET ativo=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (ativo, unidade_id),
+    )
+    conn.commit()
+    conn.close()
+    flash(
+        f"Unidade {unidade['nome']} {'ativada' if ativo else 'inativada'} com sucesso.",
+        "success",
+    )
+    return redirect(url_for("cadastro_unidades"))
+
 
 @app.route("/configuracoes/padroes", methods=["GET", "POST"])
 def configuracoes_padroes():

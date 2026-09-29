@@ -121,6 +121,8 @@
               <a href="{{ url_for('cadastro_clientes') }}"{% if request.path.startswith('/configuracoes/clientes') %} class="is-active" aria-current="page"{% endif %}>Clientes</a>
               <a href="{{ url_for('cadastro_contrapartes') }}"{% if request.path.startswith('/configuracoes/contrapartes') %} class="is-active" aria-current="page"{% endif %}>Bancos e contrapartes</a>
               <a href="{{ url_for('cadastro_competencias') }}"{% if request.path.startswith('/configuracoes/competencias') %} class="is-active" aria-current="page"{% endif %}>Competências e safras</a>
+              <a href="{{ url_for('cadastro_produtos') }}"{% if request.path.startswith('/configuracoes/produtos') %} class="is-active" aria-current="page"{% endif %}>Produtos</a>
+              <a href="{{ url_for('cadastro_unidades') }}"{% if request.path.startswith('/configuracoes/unidades') %} class="is-active" aria-current="page"{% endif %}>Unidades</a>
               <a href="{{ url_for('configuracoes_padroes') }}"{% if request.path.startswith('/configuracoes/padroes') %} class="is-active" aria-current="page"{% endif %}>Padrões por empresa</a>
             </div>
           </div>

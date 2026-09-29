@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
+{% block content %}
+{% set editando = produto_em_edicao is not none %}
+<div class="page-heading"><div><h1>{{ 'Editar produto' if editando else 'Cadastrar produtos' }}</h1><p class="muted">Cadastre os produtos oficiais usados na produção por empresa.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
+<form method="post" action="{{ url_for('editar_produto', produto_id=produto_em_edicao.id) if editando else url_for('cadastro_produtos') }}" class="form" id="produto-form">
+  <h2>{{ 'Editar produto' if editando else 'Novo produto' }}</h2>
+  <label>Empresa*<select name="empresa_id" required><option value="">Selecione uma empresa</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if empresa_id and (empresa_id|string) == (empresa.id|string) else '' }}>{{ empresa.apelido or empresa.razao_social }}{% if empresa.cnpj %} — {{ empresa.cnpj|cnpj }}{% endif %}</option>{% endfor %}</select></label>
+  <label>Nome*<input name="nome" value="{{ nome }}" required autocomplete="off"><small class="muted">O nome será salvo automaticamente em UPPER CASE.</small></label>
+  <div class="form-actions"><button type="submit">{{ 'Salvar alterações' if editando else 'Cadastrar produto' }}</button><a class="btn secondary" href="{{ url_for('cadastro_produtos') }}">Cancelar</a></div>
+</form>
+<h2>Produtos cadastrados</h2>
+<div class="table-wrap"><table class="compact-table"><thead><tr><th>Produto</th><th>Empresa</th><th>Status</th><th>Ações</th></tr></thead><tbody>
+{% for produto in produtos %}<tr><td>{{ produto.nome }}</td><td>{{ produto.apelido or produto.razao_social }}</td><td><span class="status {{ 'status-concluido' if produto.ativo else 'status-pendente' }}">{{ 'Ativo' if produto.ativo else 'Inativo' }}</span></td><td class="row-actions"><a href="{{ url_for('editar_produto', produto_id=produto.id) }}">Editar</a><form method="post" action="{{ url_for('alternar_produto', produto_id=produto.id) }}"><button class="link-danger" type="submit">{{ 'Inativar' if produto.ativo else 'Ativar' }}</button></form></td></tr>{% else %}<tr><td colspan="4" class="empty">Nenhum produto cadastrado.</td></tr>{% endfor %}
+</tbody></table></div>
+{{ render_pagination(pagination, 'Paginação de produtos') }}
+{% endblock %}

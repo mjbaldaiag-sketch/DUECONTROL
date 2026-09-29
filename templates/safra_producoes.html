@@ -7,16 +7,46 @@
   <h2>{{ 'Editar produção' if edit_mode|default(false) else 'Nova produção' }}</h2>
   <label>Empresa*<select name="empresa_id" required><option value="">Selecione uma empresa</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if (empresa_id|string) == (empresa.id|string) else '' }}>{{ empresa.apelido or empresa.razao_social }}{% if empresa.cnpj %} — {{ empresa.cnpj|cnpj }}{% endif %}</option>{% endfor %}</select></label>
   <label>Competência / Safra*<select name="competencia_id" required><option value="">Selecione uma Competência</option>{% for competencia in competencias %}<option value="{{ competencia.id }}" data-empresa-id="{{ competencia.empresa_id }}" {{ 'selected' if (competencia_id|string) == (competencia.id|string) else '' }}>{{ competencia.descricao }} — {{ competencia.data_inicial|date_br }} a {{ competencia.data_final|date_br }}</option>{% endfor %}</select></label>
-  <label>Produto<input name="produto" value="{{ producao.produto if producao else 'AÇÚCAR' }}" required></label>
+  <label>Produto*
+    <select name="produto_id" id="produto-select" required>
+      <option value="">Selecione um produto ativo</option>
+      {% for produto in produtos %}<option value="{{ produto.id }}" data-empresa-id="{{ produto.empresa_id }}" {{ 'selected' if producao and (producao.produto_id|string) == (produto.id|string) else '' }}>{{ produto.nome }} — {{ produto.apelido or produto.razao_social }}</option>{% endfor %}
+    </select>
+    <small class="muted">O produto deve estar cadastrado e ativo em Configurações &gt; Produtos.</small>
+  </label>
   <label>Mês de referência*<input type="month" name="mes_referencia" value="{{ producao.mes_referencia if producao else '' }}" required></label>
   <label>Tranche<input name="tranche" value="{{ producao.tranche or '' if producao else '' }}" placeholder="Ex.: T1"></label>
-  <label>Unidade*<input name="unidade" value="{{ producao.unidade if producao else 'MT' }}" required></label>
+  <label>Unidade*
+    <select name="unidade_id" required>
+      <option value="">Selecione uma unidade ativa</option>
+      {% for unidade in unidades %}<option value="{{ unidade.id }}" {{ 'selected' if producao and (producao.unidade_id|string) == (unidade.id|string) else '' }}>{{ unidade.nome }}</option>{% endfor %}
+    </select>
+    <small class="muted">A unidade deve estar cadastrada e ativa em Configurações &gt; Unidades.</small>
+  </label>
   <label>Produção estimada*<input name="quantidade_estimada" inputmode="decimal" value="{{ producao.quantidade_estimada if producao and producao.quantidade_estimada is not none else '' }}" required></label>
   <label>Produção realizada<input name="quantidade_realizada" inputmode="decimal" value="{{ producao.quantidade_realizada if producao and producao.quantidade_realizada is not none else '' }}"></label>
   <label>Observação<textarea name="observacao">{{ producao.observacao if producao else '' }}</textarea></label>
   <div class="form-actions"><button>{{ 'Salvar alterações' if edit_mode|default(false) else 'Cadastrar produção' }}</button>{% if edit_mode|default(false) %}<a class="btn secondary" href="{{ url_for('lista_producoes') }}">Cancelar</a>{% endif %}</div>
 </form>
 <form method="get" class="filters"><label>Empresa<select name="empresa_id"><option value="">Todas as empresas</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if filters.empresa_id == empresa.id else '' }}>{{ empresa.apelido or empresa.razao_social }}</option>{% endfor %}</select></label><label>Competência<select name="competencia_id"><option value="">Todas</option>{% for competencia in competencias %}<option value="{{ competencia.id }}" {{ 'selected' if filters.competencia_id == competencia.id else '' }}>{{ competencia.descricao }} — {{ competencia.apelido or competencia.razao_social }}</option>{% endfor %}</select></label><label>Mês<input type="month" name="mes_referencia" value="{{ filters.mes_referencia }}"></label><label>Tranche<input name="tranche" value="{{ filters.tranche }}"></label><div class="filter-actions"><button type="submit">Filtrar</button><a class="btn secondary" href="{{ url_for('lista_producoes') }}">Limpar filtros</a></div></form>
-<h2>Registros de produção</h2><div class="table-wrap"><table class="compact-table" data-sortable-server><thead><tr>{{ sortable_header('Empresa','empresa',sort,direction,sort_links) }}{{ sortable_header('Competência','competencia',sort,direction,sort_links) }}{{ sortable_header('Mês','mes_referencia',sort,direction,sort_links) }}{{ sortable_header('Tranche','tranche',sort,direction,sort_links) }}<th>Produto</th><th>Unidade</th>{{ sortable_header('Estimada','quantidade_estimada',sort,direction,sort_links,'number') }}{{ sortable_header('Realizada','quantidade_realizada',sort,direction,sort_links,'number') }}<th>Ações</th></tr></thead><tbody>{% for item in producoes %}<tr><td>{{ item.apelido or item.razao_social }}</td><td>{{ item.competencia_descricao }}</td><td>{{ item.mes_referencia|month_br }}</td><td>{{ item.tranche or '-' }}</td><td>{{ item.produto }}</td><td>{{ item.unidade }}</td><td>{{ item.quantidade_estimada|money }}</td><td>{{ item.quantidade_realizada|money if item.quantidade_realizada is not none else '-' }}</td><td class="row-actions"><a href="{{ url_for('editar_producao', producao_id=item.id) }}">Editar</a></td></tr>{% else %}<tr><td colspan="9" class="empty">Nenhuma produção cadastrada.</td></tr>{% endfor %}</tbody></table></div>
+<h2>Registros de produção</h2><div class="table-wrap"><table class="compact-table" data-sortable-server><thead><tr>{{ sortable_header('Empresa','empresa',sort,direction,sort_links) }}{{ sortable_header('Competência','competencia',sort,direction,sort_links) }}{{ sortable_header('Mês','mes_referencia',sort,direction,sort_links) }}{{ sortable_header('Tranche','tranche',sort,direction,sort_links) }}<th>Produto</th><th>Unidade</th>{{ sortable_header('Estimada','quantidade_estimada',sort,direction,sort_links,'number') }}{{ sortable_header('Realizada','quantidade_realizada',sort,direction,sort_links,'number') }}<th>Ações</th></tr></thead><tbody>{% for item in producoes %}<tr><td>{{ item.apelido or item.razao_social }}</td><td>{{ item.competencia_descricao }}</td><td>{{ item.mes_referencia|month_br }}</td><td>{{ item.tranche or '-' }}</td><td>{{ item.produto_nome or item.produto or '-' }}</td><td>{{ item.unidade_nome or item.unidade or '-' }}</td><td>{{ item.quantidade_estimada|money }}</td><td>{{ item.quantidade_realizada|money if item.quantidade_realizada is not none else '-' }}</td><td class="row-actions"><a href="{{ url_for('editar_producao', producao_id=item.id) }}">Editar</a></td></tr>{% else %}<tr><td colspan="9" class="empty">Nenhuma produção cadastrada.</td></tr>{% endfor %}</tbody></table></div>
 {{ render_pagination(pagination, 'Paginação de produção') }}
+<script>
+(() => {
+  const empresa = document.querySelector('#producao-form select[name="empresa_id"]');
+  const produto = document.getElementById('produto-select');
+  if (!empresa || !produto) return;
+  const atualizarProdutos = () => {
+    const empresaId = empresa.value;
+    Array.from(produto.options).forEach(opcao => {
+      if (!opcao.value) return;
+      const visivel = Boolean(empresaId) && opcao.dataset.empresaId === empresaId;
+      opcao.hidden = !visivel;
+      if (!visivel && opcao.selected) opcao.selected = false;
+    });
+  };
+  empresa.addEventListener('change', atualizarProdutos);
+  atualizarProdutos();
+})();
+</script>
 {% endblock %}

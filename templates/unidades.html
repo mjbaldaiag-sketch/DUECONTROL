@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
+{% block content %}
+{% set editando = unidade_em_edicao is not none %}
+<div class="page-heading"><div><h1>{{ 'Editar unidade' if editando else 'Cadastrar unidades' }}</h1><p class="muted">Cadastre as unidades oficiais usadas na produção e nos contratos comerciais.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
+<form method="post" action="{{ url_for('editar_unidade', unidade_id=unidade_em_edicao.id) if editando else url_for('cadastro_unidades') }}" class="form" id="unidade-form">
+  <h2>{{ 'Editar unidade' if editando else 'Nova unidade' }}</h2>
+  <label>Nome*<input name="nome" value="{{ nome }}" required autocomplete="off"><small class="muted">O nome será salvo automaticamente em UPPER CASE.</small></label>
+  <div class="form-actions"><button type="submit">{{ 'Salvar alterações' if editando else 'Cadastrar unidade' }}</button><a class="btn secondary" href="{{ url_for('cadastro_unidades') }}">Cancelar</a></div>
+</form>
+<h2>Unidades cadastradas</h2>
+<div class="table-wrap"><table class="compact-table"><thead><tr><th>Unidade</th><th>Status</th><th>Ações</th></tr></thead><tbody>
+{% for unidade in unidades %}<tr><td>{{ unidade.nome }}</td><td><span class="status {{ 'status-concluido' if unidade.ativo else 'status-pendente' }}">{{ 'Ativa' if unidade.ativo else 'Inativa' }}</span></td><td class="row-actions"><a href="{{ url_for('editar_unidade', unidade_id=unidade.id) }}">Editar</a><form method="post" action="{{ url_for('alternar_unidade', unidade_id=unidade.id) }}"><button class="link-danger" type="submit">{{ 'Inativar' if unidade.ativo else 'Ativar' }}</button></form></td></tr>{% else %}<tr><td colspan="3" class="empty">Nenhuma unidade cadastrada.</td></tr>{% endfor %}
+</tbody></table></div>
+{{ render_pagination(pagination, 'Paginação de unidades') }}
+{% endblock %}

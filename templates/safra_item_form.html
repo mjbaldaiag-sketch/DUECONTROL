@@ -5,7 +5,13 @@
   <label>Mês de referência*<input type="month" name="mes_referencia" value="{{ item.mes_referencia or '' }}" required></label>
   <label>Tranche<input name="tranche" value="{{ item.tranche or '' }}" placeholder="Ex.: T1"></label>
   <label>Produto*<input name="produto" value="{{ item.produto or 'AÇÚCAR' }}" required></label>
-  <label>Unidade*<input name="unidade" value="{{ item.unidade or 'MT' }}" required></label>
+  <label>Unidade*
+    <select name="unidade_id" required>
+      <option value="">Selecione uma unidade ativa</option>
+      {% for unidade in unidades %}<option value="{{ unidade.id }}" {{ 'selected' if item.unidade_id and (item.unidade_id|string) == (unidade.id|string) else '' }}>{{ unidade.nome }}</option>{% endfor %}
+    </select>
+    <small class="muted">A unidade deve estar cadastrada e ativa em Configurações &gt; Unidades.</small>
+  </label>
   <label>Volume contratado*<input name="volume_contratado" inputmode="decimal" value="{{ item.volume_contratado or '' }}" required></label>
   <label>Qualidade<input name="qualidade" value="{{ item.qualidade or '' }}" placeholder="Ex.: ESALQ - 3,5% desc"></label>
   <label>Moeda*<input name="moeda" maxlength="3" value="{{ item.moeda or 'USD' }}" required></label>
