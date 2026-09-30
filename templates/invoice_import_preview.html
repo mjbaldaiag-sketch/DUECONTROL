@@ -4,6 +4,7 @@
 {% if error %}<div class="flash danger">{{ error }}</div>{% endif %}
 <form method="post" action="{{ url_for('confirmar_importacao_invoices') }}" class="import-preview-form">
   <input type="hidden" name="stage_token" value="{{ stage_token }}">
+  <section class="import-preview-section"><h2>Contratos comerciais</h2><p class="muted">Para uma Invoice nova, informe na coluna <code>contrato_comercial</code> um contrato previamente cadastrado para o Cliente. O valor é normalizado em UPPER CASE; a importação não cria contratos automaticamente. Em atualizações históricas, deixe a coluna ausente para preservar o vínculo legado.</p></section>
   <section class="import-preview-section"><h2>Status</h2><p class="muted">O status informado no Excel será atribuído à Invoice. Quando a coluna estiver vazia, será usado AGUARDANDO RECEBIMENTO. Para RECEBIDO AGUARDANDO CAMBIO, a coluna data_credito é obrigatória.</p>{% for group in groups %}<p><strong>{{ group.key[1] }}</strong>: {{ group.rows[0].status|invoice_status_label if group.rows[0].status else 'AGUARDANDO RECEBIMENTO' }} · Data do crédito: {{ group.rows[0].data_credito|date_br or '-' }}</p>{% endfor %}</section>
 {% if bank_suggestions %}
 <section class="import-client-suggestions import-bank-suggestions">

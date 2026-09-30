@@ -318,6 +318,60 @@
   document.querySelectorAll('[data-uppercase]').forEach((input) => input.addEventListener('input', () => {
     input.value = input.value.toLocaleUpperCase('pt-BR');
   }));
+  document.querySelectorAll('[data-invoice-commercial-contract-select]').forEach((select) => {
+    const form = select.closest('form');
+    const clientSelect = form ? form.querySelector('[data-invoice-client-select]') : null;
+    const optionsUrl = select.dataset.optionsUrl;
+    if (!clientSelect || !optionsUrl) return;
+    const legacyText = select.querySelector('[data-legacy-contract]')?.textContent || '';
+    const initialValue = select.value;
+    const option = (value, label) => {
+      const item = document.createElement('option');
+      item.value = value;
+      item.textContent = label;
+      return item;
+    };
+    const loadContracts = async (preserveCurrent = false) => {
+      const clientId = clientSelect.value;
+      const selectedValue = preserveCurrent ? initialValue : '';
+      select.disabled = !clientId;
+      select.innerHTML = '';
+      select.append(option('', clientId ? 'Selecione um contrato' : 'Selecione primeiro um cliente'));
+      if (!clientId) {
+        if (legacyText) {
+          const legacy = option('', legacyText);
+          legacy.disabled = true;
+          legacy.selected = true;
+          legacy.dataset.legacyContract = '1';
+          select.append(legacy);
+        }
+        return;
+      }
+      try {
+        const response = await fetch(optionsUrl + '?cliente_id=' + encodeURIComponent(clientId), {
+          headers: { Accept: 'application/json' },
+        });
+        if (!response.ok) throw new Error('Não foi possível carregar os contratos.');
+        const contracts = await response.json();
+        contracts.forEach((contract) => select.append(option(String(contract.id), contract.nome)));
+        if (selectedValue && [...select.options].some((item) => item.value === String(selectedValue))) {
+          select.value = String(selectedValue);
+        } else if (legacyText && preserveCurrent) {
+          const legacy = option('', legacyText);
+          legacy.disabled = true;
+          legacy.selected = true;
+          legacy.dataset.legacyContract = '1';
+          select.append(legacy);
+        }
+      } catch (error) {
+        select.innerHTML = '';
+        select.append(option('', 'Não foi possível carregar os contratos'));
+        select.disabled = true;
+      }
+    };
+    clientSelect.addEventListener('change', () => loadContracts(false));
+    loadContracts(true);
+  });
   document.querySelectorAll('[data-chave-acesso]').forEach((input) => input.addEventListener('input', () => {
     input.value = input.value.replace(/[^a-zA-Z0-9]/g, '').slice(0, 14).toUpperCase();
   }));
@@ -934,19 +988,39 @@
   const sidebarBody = document.body;
   const sidebarStorageKey = 'duecontrol.sidebar.state';
   const sidebarIsMobile = () => window.matchMedia('(max-width: 720px)').matches;
+  const sidebarCollapseButton = document.querySelector('[data-sidebar-collapse]');
+  const sidebarMenuButton = document.querySelector('[data-sidebar-toggle]');
 
   const persistSidebarState = () => {
     try {
       window.localStorage.setItem(sidebarStorageKey, JSON.stringify({
         collapsed: sidebarBody.classList.contains('sidebar-collapsed'),
-        hidden: sidebarBody.classList.contains('sidebar-is-hidden'),
       }));
     } catch (_) {
       // A navegação continua funcionando mesmo quando o navegador bloqueia o storage.
     }
   };
 
-  const closeMobileSidebar = () => sidebarBody.classList.remove('sidebar-mobile-open');
+  const syncSidebarCollapseButton = () => {
+    if (!sidebarCollapseButton) return;
+    const collapsed = sidebarBody.classList.contains('sidebar-collapsed');
+    sidebarCollapseButton.setAttribute('aria-expanded', String(!collapsed));
+    sidebarCollapseButton.setAttribute('aria-label', collapsed ? 'Expandir menu' : 'Recolher menu');
+    sidebarCollapseButton.setAttribute('title', collapsed ? 'Expandir menu' : 'Recolher menu');
+  };
+
+  const syncMobileMenuButton = () => {
+    if (!sidebarMenuButton) return;
+    const open = sidebarBody.classList.contains('sidebar-mobile-open');
+    sidebarMenuButton.setAttribute('aria-expanded', String(open));
+    sidebarMenuButton.setAttribute('aria-label', open ? 'Fechar menu' : 'Abrir menu');
+    sidebarMenuButton.setAttribute('title', open ? 'Fechar menu' : 'Abrir menu');
+  };
+
+  const closeMobileSidebar = () => {
+    sidebarBody.classList.remove('sidebar-mobile-open');
+    syncMobileMenuButton();
+  };
 
   document.querySelectorAll('[data-submenu-toggle]').forEach((toggle) => {
     const submenu = document.getElementById(toggle.getAttribute('aria-controls'));
@@ -958,49 +1032,25 @@
     });
   });
 
-  document.querySelectorAll('[data-sidebar-collapse]').forEach((button) => {
-    button.addEventListener('click', () => {
+  if (sidebarCollapseButton) {
+    sidebarCollapseButton.addEventListener('click', () => {
       if (sidebarIsMobile()) {
         closeMobileSidebar();
         return;
       }
       sidebarBody.classList.toggle('sidebar-collapsed');
-      sidebarBody.classList.remove('sidebar-is-hidden');
-      const collapsed = sidebarBody.classList.contains('sidebar-collapsed');
-      button.setAttribute('aria-expanded', String(!collapsed));
-      button.setAttribute('aria-label', collapsed ? 'Expandir menu' : 'Recolher menu');
-      button.setAttribute('title', collapsed ? 'Expandir menu' : 'Recolher menu');
+      syncSidebarCollapseButton();
       persistSidebarState();
     });
-  });
+  }
 
-  document.querySelectorAll('[data-sidebar-toggle]').forEach((button) => {
-    button.addEventListener('click', () => {
-      if (sidebarIsMobile()) {
-        sidebarBody.classList.toggle('sidebar-mobile-open');
-        sidebarBody.classList.remove('sidebar-is-hidden');
-        return;
-      }
-      sidebarBody.classList.remove('sidebar-is-hidden');
-      persistSidebarState();
+  if (sidebarMenuButton) {
+    sidebarMenuButton.addEventListener('click', () => {
+      if (!sidebarIsMobile()) return;
+      sidebarBody.classList.toggle('sidebar-mobile-open');
+      syncMobileMenuButton();
     });
-  });
-
-  document.querySelectorAll('[data-sidebar-hide]').forEach((button) => {
-    button.addEventListener('click', () => {
-      sidebarBody.classList.add('sidebar-is-hidden');
-      sidebarBody.classList.remove('sidebar-mobile-open');
-      persistSidebarState();
-    });
-  });
-
-  document.querySelectorAll('[data-sidebar-show]').forEach((button) => {
-    button.addEventListener('click', () => {
-      sidebarBody.classList.remove('sidebar-is-hidden');
-      if (sidebarIsMobile()) sidebarBody.classList.add('sidebar-mobile-open');
-      persistSidebarState();
-    });
-  });
+  }
 
   document.querySelectorAll('[data-sidebar-close]').forEach((button) => {
     button.addEventListener('click', closeMobileSidebar);
@@ -1012,16 +1062,28 @@
     });
   });
 
+  document.querySelectorAll('.sidebar-nav-group').forEach((group) => {
+    const tooltipLink = group.querySelector('.sidebar-link[data-sidebar-tooltip]');
+    if (!tooltipLink) return;
+    group.addEventListener('click', () => {
+      tooltipLink.classList.add('sidebar-tooltip-dismissed');
+      group.classList.add('sidebar-submenu-dismissed');
+    });
+    group.addEventListener('pointerenter', () => {
+      tooltipLink.classList.remove('sidebar-tooltip-dismissed');
+      group.classList.remove('sidebar-submenu-dismissed');
+    });
+    group.addEventListener('focusin', () => {
+      tooltipLink.classList.remove('sidebar-tooltip-dismissed');
+      group.classList.remove('sidebar-submenu-dismissed');
+    });
+  });
+
   try {
     const savedSidebarState = JSON.parse(window.localStorage.getItem(sidebarStorageKey) || '{}');
-    if (!sidebarIsMobile() && savedSidebarState.hidden) sidebarBody.classList.add('sidebar-is-hidden');
-    if (!sidebarIsMobile() && savedSidebarState.collapsed && !savedSidebarState.hidden) sidebarBody.classList.add('sidebar-collapsed');
-    const collapsed = sidebarBody.classList.contains('sidebar-collapsed');
-    document.querySelectorAll('[data-sidebar-collapse]').forEach((button) => {
-      button.setAttribute('aria-expanded', String(!collapsed));
-      button.setAttribute('aria-label', collapsed ? 'Expandir menu' : 'Recolher menu');
-      button.setAttribute('title', collapsed ? 'Expandir menu' : 'Recolher menu');
-    });
+    if (!sidebarIsMobile() && savedSidebarState.collapsed) sidebarBody.classList.add('sidebar-collapsed');
+    syncSidebarCollapseButton();
+    syncMobileMenuButton();
   } catch (_) {
     // Estado inicial padrão quando localStorage não está disponível.
   }

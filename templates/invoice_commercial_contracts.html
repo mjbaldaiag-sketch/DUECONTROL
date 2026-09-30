@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
+{% block content %}
+{% set editando = contrato_em_edicao is not none %}
+<div class="page-heading"><div><h1>{{ 'Editar contrato comercial' if editando else 'Contratos comerciais' }}</h1><p class="muted">Cadastre as referências comerciais por Cliente para reutilizá-las nas novas Invoices.</p></div><a class="btn secondary" href="{{ url_for('configuracoes') }}">Voltar para Configurações</a></div>
+
+<form method="post" action="{{ url_for('editar_contrato_comercial_invoice', contrato_id=contrato_em_edicao.id) if editando else url_for('cadastro_contratos_comerciais') }}" class="form" id="invoice-commercial-contract-form">
+  <label>Cliente / Contraparte*<select name="cliente_id" required {{ 'disabled' if editando and contrato_em_edicao.total_invoices else '' }}><option value="">Selecione um cliente</option>{% for cliente in clientes %}<option value="{{ cliente.id }}" {{ 'selected' if selected_cliente_id == cliente.id else '' }}>{{ cliente.nome }} — {{ cliente.pais|pais_nome }}</option>{% endfor %}</select></label>
+  {% if editando and contrato_em_edicao.total_invoices %}<input type="hidden" name="cliente_id" value="{{ selected_cliente_id }}">{% endif %}
+  <label>Contrato comercial*<input name="nome" maxlength="120" value="{{ nome|default('') }}" data-uppercase required autocomplete="off" placeholder="Nome ou número do contrato"><small class="muted">A referência será gravada em UPPER CASE, com espaços normalizados.</small></label>
+  <div class="form-actions"><button>{{ 'Salvar alterações' if editando else 'Cadastrar contrato' }}</button><a class="btn secondary" href="{{ url_for('cadastro_contratos_comerciais') }}">Cancelar</a></div>
+</form>
+
+{% if not editando %}
+<h2>Contratos cadastrados</h2>
+<div class="table-wrap"><table><thead><tr><th>Cliente / Contraparte</th><th>Contrato</th><th>Invoices vinculadas</th><th>Ações</th></tr></thead><tbody>
+{% for contrato in contratos %}<tr><td>{{ contrato.cliente_nome }} — {{ contrato.cliente_pais|pais_nome }}</td><td>{{ contrato.nome }}</td><td>{{ contrato.total_invoices }}</td><td class="row-actions"><a href="{{ url_for('editar_contrato_comercial_invoice', contrato_id=contrato.id) }}">Editar</a>{% if contrato.total_invoices == 0 %}<form method="post" action="{{ url_for('excluir_contrato_comercial_invoice', contrato_id=contrato.id) }}" onsubmit="return confirm('Excluir este contrato comercial?');"><button class="link-danger" type="submit">Excluir</button></form>{% else %}<span class="muted" title="Remova os vínculos antes de excluir">Exclusão bloqueada</span>{% endif %}</td></tr>
+{% else %}<tr><td colspan="4" class="empty">Nenhum contrato comercial cadastrado.</td></tr>{% endfor %}
+</tbody></table></div>
+{{ render_pagination(pagination, 'Paginação de contratos comerciais') }}
+{% endif %}
+{% endblock %}

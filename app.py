@@ -25,9 +25,9 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 18
+INVOICE_SCHEMA_VERSION = 19
 INVOICE_LEGACY_SCHEMA_VERSION = 15
-SAFRA_SCHEMA_VERSION = 18
+SAFRA_SCHEMA_VERSION = 19
 
 SALDO_TOLERANCE = Decimal("0.005")
 CONVERSION_RULE_HALF_DOWN = "HALF_DOWN"
@@ -64,6 +64,31 @@ INVOICE_STATUS_RECEBIDOS = frozenset({
     INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO,
     INVOICE_STATUS_AGUARDANDO_CONTRATO,
 })
+
+
+def normalize_invoice_commercial_contract_name(value, required=False):
+    """Normaliza o nome do contrato comercial usado pelas Invoices.
+
+    O campo textual legado continua sendo preservado durante o saneamento. A
+    normalização é aplicada ao cadastro mestre e a todos os novos vínculos.
+    ``None`` é um marcador legado de ausência de contrato, não um nome válido.
+    """
+    raw = "" if value is None else str(value)
+    text_value = raw.strip()
+    if text_value.casefold() in {"", "none", "nan", "nat"}:
+        if required:
+            raise ValueError("O Contrato comercial é obrigatório.")
+        return None
+    if any(unicodedata.category(character) == "Cc" for character in text_value):
+        raise ValueError("O Contrato comercial não pode conter caracteres de controle.")
+    text_value = " ".join(text_value.split()).upper()
+    if len(text_value) > 120:
+        raise ValueError("O Contrato comercial deve ter no máximo 120 caracteres.")
+    if not text_value:
+        if required:
+            raise ValueError("O Contrato comercial é obrigatório.")
+        return None
+    return text_value
 
 def normalize_invoice_status(value, default=None):
     """Normaliza o status da Invoice e aceita valores das versões anteriores."""
@@ -341,9 +366,11 @@ def migrate_invoice_status_constraint(conn):
                 observacao TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 contrato_comercial TEXT,
+                contrato_comercial_id INTEGER,
                 FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE RESTRICT,
                 FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE SET NULL,
                 FOREIGN KEY (banco_referenciado_id) REFERENCES contrapartes(id) ON DELETE SET NULL,
+                FOREIGN KEY (contrato_comercial_id) REFERENCES invoice_contratos_comerciais(id) ON DELETE RESTRICT,
                 UNIQUE(empresa_id, numero_invoice, tipo_documento)
             )
         """)
@@ -352,16 +379,22 @@ def migrate_invoice_status_constraint(conn):
             "desdobramento_habilitado" if "desdobramento_habilitado" in old_columns
             else "0 AS desdobramento_habilitado"
         )
+        contrato_comercial_id_column = (
+            "contrato_comercial_id" if "contrato_comercial_id" in old_columns
+            else "NULL AS contrato_comercial_id"
+        )
         columns = (
             "id,empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,"
             "banco_referenciado_id,data_emissao,data_credito,moeda,valor_moeda,status,"
-            "status_manual,desdobramento_habilitado,observacao,created_at,contrato_comercial"
+            "status_manual,desdobramento_habilitado,observacao,created_at,"
+            "contrato_comercial,contrato_comercial_id"
         )
         conn.execute(
             f"INSERT INTO invoices_status_migration ({columns}) "
             "SELECT id,empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,"
             "banco_referenciado_id,data_emissao,data_credito,moeda,valor_moeda,status,"
-            f"status_manual,{desdobramento_column},observacao,COALESCE(created_at,CURRENT_TIMESTAMP),contrato_comercial "
+            f"status_manual,{desdobramento_column},observacao,COALESCE(created_at,CURRENT_TIMESTAMP),"
+            f"contrato_comercial,{contrato_comercial_id_column} "
             "FROM invoices"
         )
         conn.execute("DROP TABLE invoices")
@@ -449,6 +482,81 @@ def migrate_unidades_schema(conn):
     )
 
 
+def migrate_invoice_commercial_contracts_schema(conn):
+    """Creates the Invoice commercial-contract master and safe legacy links."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS invoice_contratos_comerciais (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cliente_id INTEGER NOT NULL,
+            nome TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT,
+            UNIQUE(cliente_id, nome)
+        )
+    """)
+    invoice_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(invoices)")
+    }
+    if "contrato_comercial_id" not in invoice_columns:
+        conn.execute(
+            "ALTER TABLE invoices ADD COLUMN contrato_comercial_id INTEGER "
+            "REFERENCES invoice_contratos_comerciais(id) ON DELETE RESTRICT"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invoice_commercial_contracts_cliente "
+        "ON invoice_contratos_comerciais(cliente_id, nome)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_invoice_commercial_contracts_cliente_nome "
+        "ON invoice_contratos_comerciais(cliente_id, nome COLLATE NOCASE)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invoices_contrato_comercial_id "
+        "ON invoices(contrato_comercial_id)"
+    )
+
+    # Backfill only the relational link. The original text is intentionally
+    # left untouched so historical exports and audit trails remain intact.
+    rows = conn.execute("""
+        SELECT id, cliente_id, contrato_comercial
+        FROM invoices
+        WHERE contrato_comercial_id IS NULL
+          AND cliente_id IS NOT NULL
+          AND contrato_comercial IS NOT NULL
+          AND TRIM(contrato_comercial) <> ''
+        ORDER BY id
+    """).fetchall()
+    for invoice in rows:
+        nome = normalize_invoice_commercial_contract_name(invoice["contrato_comercial"])
+        if not nome:
+            continue
+        master = conn.execute("""
+            SELECT id
+            FROM invoice_contratos_comerciais
+            WHERE cliente_id=? AND nome=?
+        """, (invoice["cliente_id"], nome)).fetchone()
+        if not master:
+            try:
+                cursor = conn.execute("""
+                    INSERT INTO invoice_contratos_comerciais (cliente_id, nome)
+                    VALUES (?, ?)
+                """, (invoice["cliente_id"], nome))
+                master_id = cursor.lastrowid
+            except sqlite3.IntegrityError:
+                master_id = conn.execute("""
+                    SELECT id
+                    FROM invoice_contratos_comerciais
+                    WHERE cliente_id=? AND nome=?
+                """, (invoice["cliente_id"], nome)).fetchone()["id"]
+        else:
+            master_id = master["id"]
+        conn.execute(
+            "UPDATE invoices SET contrato_comercial_id=? WHERE id=?",
+            (master_id, invoice["id"]),
+        )
+
+
 def init_db():
     conn = db()
     try:
@@ -481,6 +589,16 @@ def init_db():
         pais TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(nome, pais)
+    );
+
+    CREATE TABLE IF NOT EXISTS invoice_contratos_comerciais (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cliente_id INTEGER NOT NULL,
+        nome TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT,
+        UNIQUE(cliente_id, nome)
     );
 
     CREATE TABLE IF NOT EXISTS contrapartes (
@@ -997,6 +1115,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_competencia ON invoices(competencia_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_banco_referenciado ON invoices(banco_referenciado_id)")
         status_schema_migrated = migrate_invoice_status_constraint(conn)
+        migrate_invoice_commercial_contracts_schema(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_empresa ON invoices(empresa_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_emissao ON invoices(data_emissao)")
@@ -2156,6 +2275,46 @@ def clientes_for_form(conn):
         ORDER BY nome, pais, id
     """).fetchall()
 
+
+def invoice_commercial_contracts_for_form(conn, cliente_id=None):
+    """Returns the Invoice contract masters, optionally scoped to a client."""
+    if cliente_id is not None:
+        return conn.execute("""
+            SELECT cc.id, cc.cliente_id, cc.nome, cl.nome AS cliente_nome, cl.pais AS cliente_pais
+            FROM invoice_contratos_comerciais cc
+            JOIN clientes cl ON cl.id=cc.cliente_id
+            WHERE cc.cliente_id=?
+            ORDER BY cc.nome, cc.id
+        """, (cliente_id,)).fetchall()
+    return conn.execute("""
+        SELECT cc.id, cc.cliente_id, cc.nome, cl.nome AS cliente_nome, cl.pais AS cliente_pais
+        FROM invoice_contratos_comerciais cc
+        JOIN clientes cl ON cl.id=cc.cliente_id
+        ORDER BY cl.nome, cl.pais, cc.nome, cc.id
+    """).fetchall()
+
+
+def invoice_commercial_contract_form_data(form, conn, current=None):
+    cliente_id = form_record_id(
+        form.get("cliente_id"), current["cliente_id"] if current else None
+    )
+    if not cliente_id or not conn.execute(
+        "SELECT id FROM clientes WHERE id=?", (cliente_id,)
+    ).fetchone():
+        raise ValueError("Selecione um Cliente / Contraparte cadastrado.")
+    nome = normalize_invoice_commercial_contract_name(
+        form.get("nome"), required=True
+    )
+    current_id = current["id"] if current else None
+    duplicate = conn.execute("""
+        SELECT id
+        FROM invoice_contratos_comerciais
+        WHERE cliente_id=? AND nome=? AND id<>COALESCE(?, 0)
+    """, (cliente_id, nome, current_id)).fetchone()
+    if duplicate:
+        raise ValueError("Já existe esse Contrato comercial para o Cliente selecionado.")
+    return {"cliente_id": cliente_id, "nome": nome}
+
 def cliente_id_for_due_form(conn, due=None, selected_id=None):
     """Seleciona o cliente centralizado usado pelo formulário de DU-E."""
     if selected_id not in (None, ""):
@@ -2193,6 +2352,12 @@ def cliente_vinculos(conn, cliente_id):
         WHERE cliente_id=?
         ORDER BY numero_invoice, id
     """, (cliente_id,)).fetchall()
+    contratos_comerciais = conn.execute("""
+        SELECT id, nome
+        FROM invoice_contratos_comerciais
+        WHERE cliente_id=?
+        ORDER BY nome, id
+    """, (cliente_id,)).fetchall()
     contratos = conn.execute("""
         SELECT DISTINCT c.id, c.numero_contrato
         FROM contratos c
@@ -2219,7 +2384,13 @@ def cliente_vinculos(conn, cliente_id):
         WHERE cliente_id=?
         ORDER BY numero_due, id
     """, (cliente_id,)).fetchall()
-    return {"invoices": invoices, "contratos": contratos, "ndfs": ndfs, "dues": dues}
+    return {
+        "invoices": invoices,
+        "contratos_comerciais": contratos_comerciais,
+        "contratos": contratos,
+        "ndfs": ndfs,
+        "dues": dues,
+    }
 
 def clientes_com_vinculos(conn, pagination=None):
     query = """
@@ -7383,7 +7554,8 @@ def excluir_cliente(cliente_id):
             conn.rollback()
             flash(
                 "Não é possível excluir este cliente porque existem "
-                f"{total_vinculos} vínculo(s) com Invoice, Contrato ou NDF.",
+                f"{total_vinculos} vínculo(s) com Invoice, Contrato comercial, "
+                "Contrato Câmbio ou NDF.",
                 "danger",
             )
             return redirect(url_for("cadastro_clientes") + f"#cliente-{cliente_id}")
@@ -7397,6 +7569,175 @@ def excluir_cliente(cliente_id):
     finally:
         conn.close()
     return redirect(url_for("cadastro_clientes"))
+
+
+@app.route("/configuracoes/contratos-comerciais/opcoes")
+def opcoes_contratos_comerciais_invoice():
+    cliente_id = form_record_id(request.args.get("cliente_id"))
+    if not cliente_id:
+        return jsonify([])
+    conn = db()
+    rows = invoice_commercial_contracts_for_form(conn, cliente_id)
+    conn.close()
+    return jsonify([{"id": row["id"], "nome": row["nome"]} for row in rows])
+
+
+@app.route("/configuracoes/contratos-comerciais", methods=["GET", "POST"])
+def cadastro_contratos_comerciais():
+    conn = db()
+    nome = request.form.get("nome", "") if request.method == "POST" else ""
+    selected_cliente_id = (
+        form_record_id(request.form.get("cliente_id"))
+        if request.method == "POST"
+        else form_record_id(request.args.get("cliente_id"))
+    )
+    if request.method == "POST":
+        try:
+            data = invoice_commercial_contract_form_data(request.form, conn)
+            conn.execute("""
+                INSERT INTO invoice_contratos_comerciais (cliente_id, nome)
+                VALUES (?, ?)
+            """, (data["cliente_id"], data["nome"]))
+            conn.commit()
+            conn.close()
+            flash("Contrato comercial cadastrado com sucesso.", "success")
+            return redirect(url_for("cadastro_contratos_comerciais"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe esse Contrato comercial para o Cliente selecionado.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+
+    clientes = clientes_for_form(conn)
+    total = conn.execute("SELECT COUNT(*) FROM invoice_contratos_comerciais").fetchone()[0]
+    pagination = build_pagination(
+        request.args, total, endpoint="cadastro_contratos_comerciais"
+    )
+    contratos = conn.execute("""
+        SELECT cc.id, cc.cliente_id, cc.nome,
+               cl.nome AS cliente_nome, cl.pais AS cliente_pais,
+               COUNT(i.id) AS total_invoices
+        FROM invoice_contratos_comerciais cc
+        JOIN clientes cl ON cl.id=cc.cliente_id
+        LEFT JOIN invoices i ON i.contrato_comercial_id=cc.id
+        GROUP BY cc.id
+        ORDER BY cl.nome, cl.pais, cc.nome, cc.id
+        LIMIT ? OFFSET ?
+    """, (pagination["per_page"], pagination["offset"])).fetchall()
+    conn.close()
+    return render_template(
+        "invoice_commercial_contracts.html",
+        contratos=contratos,
+        clientes=clientes,
+        nome=nome,
+        selected_cliente_id=selected_cliente_id,
+        contrato_em_edicao=None,
+        pagination=pagination,
+    )
+
+
+@app.route("/configuracoes/contratos-comerciais/<int:contrato_id>/editar", methods=["GET", "POST"])
+def editar_contrato_comercial_invoice(contrato_id):
+    conn = db()
+    current = conn.execute("""
+        SELECT id, cliente_id, nome
+        FROM invoice_contratos_comerciais
+        WHERE id=?
+    """, (contrato_id,)).fetchone()
+    if not current:
+        conn.close()
+        return "Contrato comercial não encontrado", 404
+
+    linked_invoice_count = conn.execute(
+        "SELECT COUNT(*) FROM invoices WHERE contrato_comercial_id=?",
+        (contrato_id,),
+    ).fetchone()[0]
+    form_data = {
+        "cliente_id": current["cliente_id"],
+        "nome": current["nome"],
+    }
+    if request.method == "POST":
+        try:
+            data = invoice_commercial_contract_form_data(request.form, conn, current=current)
+            linked = linked_invoice_count
+            if linked and data["cliente_id"] != current["cliente_id"]:
+                raise ValueError(
+                    "Não é possível alterar o Cliente de um Contrato comercial já vinculado a Invoices."
+                )
+            conn.execute("""
+                UPDATE invoice_contratos_comerciais
+                SET cliente_id=?, nome=?, updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+            """, (data["cliente_id"], data["nome"], contrato_id))
+            if data["nome"] != current["nome"]:
+                conn.execute(
+                    "UPDATE invoices SET contrato_comercial=? WHERE contrato_comercial_id=?",
+                    (data["nome"], contrato_id),
+                )
+            conn.commit()
+            conn.close()
+            flash("Contrato comercial atualizado com sucesso.", "success")
+            return redirect(url_for("cadastro_contratos_comerciais"))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            flash("Já existe esse Contrato comercial para o Cliente selecionado.", "danger")
+        except ValueError as exc:
+            conn.rollback()
+            flash(str(exc), "danger")
+        form_data = {
+            "cliente_id": form_record_id(request.form.get("cliente_id")),
+            "nome": request.form.get("nome", ""),
+        }
+
+    clientes = clientes_for_form(conn)
+    conn.close()
+    return render_template(
+        "invoice_commercial_contracts.html",
+        contratos=[], clientes=clientes,
+        nome=form_data["nome"],
+        selected_cliente_id=form_data["cliente_id"],
+        contrato_em_edicao={
+            "id": contrato_id, "total_invoices": linked_invoice_count, **form_data
+        },
+        pagination=None,
+    )
+
+
+@app.route("/configuracoes/contratos-comerciais/<int:contrato_id>/excluir", methods=["POST"])
+def excluir_contrato_comercial_invoice(contrato_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        contrato = conn.execute(
+            "SELECT id FROM invoice_contratos_comerciais WHERE id=?", (contrato_id,)
+        ).fetchone()
+        if not contrato:
+            conn.rollback()
+            return "Contrato comercial não encontrado", 404
+        linked = conn.execute(
+            "SELECT COUNT(*) FROM invoices WHERE contrato_comercial_id=?",
+            (contrato_id,),
+        ).fetchone()[0]
+        if linked:
+            conn.rollback()
+            flash(
+                "Não é possível excluir este Contrato comercial porque existem "
+                f"{linked} Invoice(s) vinculada(s).",
+                "danger",
+            )
+            return redirect(url_for("cadastro_contratos_comerciais"))
+        conn.execute(
+            "DELETE FROM invoice_contratos_comerciais WHERE id=?", (contrato_id,)
+        )
+        conn.commit()
+        flash("Contrato comercial excluído com sucesso.", "success")
+    except sqlite3.Error:
+        conn.rollback()
+        flash("Não foi possível excluir o Contrato comercial.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("cadastro_contratos_comerciais"))
 
 @app.route("/configuracoes/contrapartes", methods=["GET", "POST"])
 def cadastro_contrapartes():
@@ -8392,7 +8733,7 @@ def excluir_dues_lote():
         conn.close()
     return redirect_batch_result("consulta_dues")
 
-def write_excel_model_orientations(writer, conn, pandas):
+def write_excel_model_orientations(writer, conn, pandas, include_invoice_contracts=False):
     """Adiciona ao modelo uma lista de referência para preenchimento do Excel."""
     banks = [row["nome"] for row in conn.execute(
         "SELECT nome FROM contrapartes ORDER BY nome, id"
@@ -8407,14 +8748,26 @@ def write_excel_model_orientations(writer, conn, pandas):
         FROM competencias
         ORDER BY data_inicial DESC, descricao
     """).fetchall()]
+    invoice_contracts = [
+        row["nome"]
+        for row in conn.execute("""
+            SELECT cc.nome
+            FROM invoice_contratos_comerciais cc
+            JOIN clientes cl ON cl.id=cc.cliente_id
+            ORDER BY cl.nome, cl.pais, cc.nome, cc.id
+        """).fetchall()
+    ] if include_invoice_contracts else []
 
-    orientations = pandas.DataFrame({
+    orientation_data = {
         "BANCOS": pandas.Series(banks),
         "CLIENTES": pandas.Series(clients),
         "STATUS": pandas.Series(INVOICE_STATUS_OPTIONS),
         "CNPJ": pandas.Series(company_cnpjs),
         "COMPETENCIAS": pandas.Series(competencies),
-    })
+    }
+    if include_invoice_contracts:
+        orientation_data["CONTRATOS_COMERCIAIS"] = pandas.Series(invoice_contracts)
+    orientations = pandas.DataFrame(orientation_data)
     orientations.to_excel(writer, index=False, sheet_name="Orientações")
 
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -10167,15 +10520,15 @@ def split_invoice_for_closing(conn, summary, closing_amount):
         INSERT INTO invoices
             (empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,
              banco_referenciado_id,data_emissao,data_credito,moeda,valor_moeda,
-             status,status_manual,desdobramento_habilitado,observacao,contrato_comercial)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             status,status_manual,desdobramento_habilitado,observacao,contrato_comercial,contrato_comercial_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         summary["empresa_id"], child_number, summary["tipo_documento"],
         summary["competencia_id"], summary["cliente_id"],
         summary["banco_referenciado_id"], summary["data_emissao"],
         summary["data_credito"], summary["moeda"], float(remaining),
         INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO, 0, 1,
-        summary["observacao"], summary["contrato_comercial"],
+        summary["observacao"], summary["contrato_comercial"], summary.get("contrato_comercial_id"),
     ))
     child_id = cursor.lastrowid
     conn.execute("""
@@ -10190,12 +10543,26 @@ def split_invoice_for_closing(conn, summary, closing_amount):
 
 
 def normalize_contract_commercial(value):
-    text_value = str(value or "").strip()
-    if any(unicodedata.category(character) == "Cc" for character in text_value):
-        raise ValueError("O Contrato comercial não pode conter caracteres de controle.")
-    if len(text_value) > 120:
-        raise ValueError("O Contrato comercial deve ter no máximo 120 caracteres.")
-    return text_value or None
+    return normalize_invoice_commercial_contract_name(value)
+
+
+def resolve_invoice_commercial_contract(conn, cliente_id, raw_id):
+    if raw_id in (None, ""):
+        return None
+    contrato_id = form_record_id(raw_id)
+    if not contrato_id:
+        raise ValueError("Selecione um Contrato comercial válido.")
+    contrato = conn.execute("""
+        SELECT id, cliente_id, nome
+        FROM invoice_contratos_comerciais
+        WHERE id=?
+    """, (contrato_id,)).fetchone()
+    if not contrato:
+        raise ValueError("O Contrato comercial selecionado não foi encontrado.")
+    if not cliente_id or contrato["cliente_id"] != cliente_id:
+        raise ValueError("O Contrato comercial selecionado não pertence ao Cliente informado.")
+    return contrato
+
 
 def invoice_form_data(form, conn, current=None):
     try:
@@ -10225,6 +10592,8 @@ def invoice_form_data(form, conn, current=None):
     cliente_id = form_record_id(form.get("cliente_id"), current["cliente_id"] if current else None)
     if cliente_id and not conn.execute("SELECT id FROM clientes WHERE id=?", (cliente_id,)).fetchone():
         raise ValueError("O cliente selecionado não foi encontrado.")
+    if not current and not cliente_id:
+        raise ValueError("Selecione um Cliente / Contraparte para a nova Invoice.")
     if "banco_referenciado_id" in form:
         banco_referenciado = resolve_counterparty(conn, form.get("banco_referenciado_id"))
         banco_referenciado_id = banco_referenciado["id"] if banco_referenciado else None
@@ -10232,7 +10601,28 @@ def invoice_form_data(form, conn, current=None):
         banco_referenciado_id = current["banco_referenciado_id"]
     else:
         banco_referenciado_id = None
-    contrato_comercial = normalize_contract_commercial(form.get("contrato_comercial"))
+    contrato_id = None
+    contrato_comercial = None
+    contrato = resolve_invoice_commercial_contract(
+        conn, cliente_id, form.get("contrato_comercial_id")
+    )
+    if contrato:
+        contrato_id = contrato["id"]
+        contrato_comercial = contrato["nome"]
+    elif current and cliente_id == current["cliente_id"]:
+        # Historical invoices without a master link remain editable without
+        # forcing an invented contract. A selected master replaces the legacy
+        # text explicitly.
+        contrato_id = (
+            current["contrato_comercial_id"]
+            if "contrato_comercial_id" in current.keys()
+            else None
+        )
+        contrato_comercial = current["contrato_comercial"]
+    else:
+        raise ValueError("Selecione um Contrato comercial cadastrado para a Invoice.")
+    if not current and not contrato_id:
+        raise ValueError("Selecione um Contrato comercial cadastrado para a nova Invoice.")
     if "status" in form:
         status = normalize_invoice_status(form.get("status"))
         status_manual = 1
@@ -10258,6 +10648,7 @@ def invoice_form_data(form, conn, current=None):
         "empresa_id": empresa_id, "numero_invoice": numero, "tipo_documento": tipo,
         "competencia_id": competencia_id, "cliente_id": cliente_id, "data_emissao": data_emissao, "moeda": moeda,
         "valor_moeda": valor, "contrato_comercial": contrato_comercial,
+        "contrato_comercial_id": contrato_id,
         "banco_referenciado_id": banco_referenciado_id,
         "status": status, "status_manual": status_manual, "data_credito": data_credito,
         "observacao": (form.get("observacao") or "").strip() or None,
@@ -11933,8 +12324,10 @@ def prepare_invoice_import_rows(df, pandas):
             "row_id": f"r{line_number}", "source_row": line_number, "empresa": empresa, "cnpj": cnpj,
             "numero_invoice": numero, "tipo_documento": tipo, "competencia": competencia,
             "cliente": normalize_client_name_display(raw_values.get("cliente")),
+            "cliente_column_present": "cliente" in df.columns,
             "data_emissao": data_emissao, "moeda": moeda, "valor_invoice": float(valor_invoice),
             "contrato_comercial": contrato_comercial,
+            "contrato_comercial_column_present": "contrato_comercial" in df.columns,
             "status": status, "status_provided": status_provided,
             "data_credito": data_credito, "data_credito_provided": data_credito_provided,
             "banco_credito": banco_credito, "banco_referenciado": banco_referenciado,
@@ -12056,8 +12449,44 @@ def invoice_import_snapshot(row):
     return {key: data.get(key) for key in (
         "id", "empresa_id", "numero_invoice", "tipo_documento", "competencia_id", "cliente_id", "data_emissao",
         "data_credito", "moeda", "valor_moeda", "contrato_comercial", "status", "status_manual",
+        "contrato_comercial_id",
         "total_recebido", "total_baixado", "total_cambio", "banco_referenciado_id"
     )}
+
+
+def resolve_invoice_import_commercial_contract(conn, row, current=None):
+    nome = row.get("contrato_comercial")
+    cliente_id = row.get("cliente_id")
+    if nome:
+        if not cliente_id:
+            raise ValueError(
+                f"Linha {row['source_row']}: Cliente é obrigatório para resolver o Contrato comercial."
+            )
+        contrato = conn.execute("""
+            SELECT id, cliente_id, nome
+            FROM invoice_contratos_comerciais
+            WHERE cliente_id=? AND nome=?
+        """, (cliente_id, nome)).fetchone()
+        if not contrato:
+            raise ValueError(
+                f"Linha {row['source_row']}: o Contrato comercial {nome} "
+                "não está cadastrado para o Cliente informado."
+            )
+        return contrato["id"], contrato["nome"]
+    if current and current["cliente_id"] == cliente_id:
+        return (
+            current["contrato_comercial_id"],
+            current["contrato_comercial"],
+        )
+    if current:
+        raise ValueError(
+            f"Linha {row['source_row']}: informe um Contrato comercial cadastrado "
+            "ao alterar o Cliente da Invoice."
+        )
+    raise ValueError(
+        f"Linha {row['source_row']}: Contrato comercial é obrigatório para uma Invoice nova."
+    )
+
 
 def invoice_import_counterparty(conn, name, field_label):
     name = str(name or "").strip()
@@ -12178,6 +12607,16 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
         current = conn.execute("""
             SELECT * FROM invoices WHERE empresa_id=? AND numero_invoice=? AND tipo_documento=?
         """, (company["id"], first["numero_invoice"], first["tipo_documento"])).fetchone()
+        if current and not first.get("cliente_column_present"):
+            cliente_id = current["cliente_id"]
+            for row in group:
+                row["cliente_id"] = cliente_id
+        contract_id, contract_name = resolve_invoice_import_commercial_contract(
+            conn, first, current=current
+        )
+        for row in group:
+            row["contrato_comercial_id"] = contract_id
+            row["contrato_comercial"] = contract_name
         banco_referenciado_nome = first.get("banco_referenciado")
         if (
             not first.get("banco_referenciado_column_present")
@@ -12231,17 +12670,17 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
             if status_provided:
                 conn.execute("""
                     UPDATE invoices SET cliente_id=?, competencia_id=?, data_emissao=?, moeda=?, valor_moeda=?,
-                        banco_referenciado_id=?, contrato_comercial=?, status=?, status_manual=1,
+                        banco_referenciado_id=?, contrato_comercial=?, contrato_comercial_id=?, status=?, status_manual=1,
                         data_credito=?, observacao=? WHERE id=?
                 """, (cliente_id, first["competencia_id"], first["data_emissao"], first["moeda"], first["valor_invoice"],
-                      banco_referenciado_id, first["contrato_comercial"], imported_status,
+                      banco_referenciado_id, first["contrato_comercial"], first["contrato_comercial_id"], imported_status,
                       imported_data_credito, first["observacao"], invoice_id))
             else:
                 conn.execute("""
                     UPDATE invoices SET cliente_id=?, competencia_id=?, data_emissao=?, moeda=?, valor_moeda=?,
-                        banco_referenciado_id=?, contrato_comercial=?, data_credito=?, observacao=? WHERE id=?
+                        banco_referenciado_id=?, contrato_comercial=?, contrato_comercial_id=?, data_credito=?, observacao=? WHERE id=?
                 """, (cliente_id, first["competencia_id"], first["data_emissao"], first["moeda"], first["valor_invoice"],
-                      banco_referenciado_id, first["contrato_comercial"], imported_data_credito,
+                      banco_referenciado_id, first["contrato_comercial"], first["contrato_comercial_id"], imported_data_credito,
                       first["observacao"], invoice_id))
             old_contracts = [row[0] for row in conn.execute(
                 "SELECT contrato_id FROM invoice_contrato_cambio WHERE invoice_id=?", (invoice_id,)
@@ -12254,12 +12693,13 @@ def apply_invoice_import_rows(conn, rows, replace_existing=True, country_overrid
             cursor = conn.execute("""
                 INSERT INTO invoices
                     (empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,banco_referenciado_id,
-                     data_emissao,moeda,valor_moeda,contrato_comercial,status,status_manual,
+                     data_emissao,moeda,valor_moeda,contrato_comercial,contrato_comercial_id,status,status_manual,
                      desdobramento_habilitado,data_credito,observacao)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (company["id"], first["numero_invoice"], first["tipo_documento"], first["competencia_id"], cliente_id,
                   banco_referenciado_id, first["data_emissao"], first["moeda"], first["valor_invoice"],
-                  first["contrato_comercial"], imported_status or INVOICE_STATUS_AGUARDANDO_RECEBIMENTO,
+                  first["contrato_comercial"], first["contrato_comercial_id"],
+                  imported_status or INVOICE_STATUS_AGUARDANDO_RECEBIMENTO,
                   1 if status_provided else 0, 1, imported_data_credito, first["observacao"]))
             invoice_id = cursor.lastrowid
         apply_invoice_import_receipt(conn, invoice_id, first, status=imported_status)
@@ -13122,7 +13562,8 @@ def exportar_invoices():
         ("id", "ID"), ("empresa_id", "Empresa ID"), ("empresa_cnpj", "Empresa - CNPJ"),
         ("empresa_razao_social", "Empresa - Razao social"), ("empresa_apelido", "Empresa - Apelido"),
         ("numero_invoice", "Numero da Invoice"), ("tipo_documento", "Tipo"),
-        ("contrato_comercial", "Contrato comercial"), ("competencia_id", "Competencia ID"),
+        ("contrato_comercial", "Contrato comercial"),
+        ("contrato_comercial_id", "Contrato comercial ID"), ("competencia_id", "Competencia ID"),
         ("competencia_descricao", "Competencia"), ("competencia_data_inicial", "Competencia - inicio"),
         ("competencia_data_final", "Competencia - fim"), ("cliente_id", "Cliente ID"),
         ("cliente_nome", "Cliente"), ("cliente_pais", "Pais do cliente"),
@@ -13292,12 +13733,12 @@ def nova_invoice():
             conn.execute("""
                 INSERT INTO invoices
                     (empresa_id,numero_invoice,tipo_documento,competencia_id,cliente_id,banco_referenciado_id,
-                     data_emissao,moeda,valor_moeda,contrato_comercial,status,status_manual,
+                     data_emissao,moeda,valor_moeda,contrato_comercial,contrato_comercial_id,status,status_manual,
                      desdobramento_habilitado,data_credito,observacao)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (data["empresa_id"], data["numero_invoice"], data["tipo_documento"], data["competencia_id"], data["cliente_id"],
                   data["banco_referenciado_id"], data["data_emissao"], data["moeda"], data["valor_moeda"],
-                  data["contrato_comercial"], data["status"], data["status_manual"], 1,
+                  data["contrato_comercial"], data["contrato_comercial_id"], data["status"], data["status_manual"], 1,
                   data["data_credito"], data["observacao"]))
             invoice_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.commit(); conn.close()
@@ -13309,6 +13750,14 @@ def nova_invoice():
             conn.rollback(); flash(str(exc), "danger")
     empresas = conn.execute("SELECT id,razao_social,apelido,cnpj,prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     clientes = clientes_for_form(conn)
+    selected_cliente_id = (
+        form_record_id(request.form.get("cliente_id"))
+        if request.method == "POST"
+        else None
+    )
+    contratos_comerciais = invoice_commercial_contracts_for_form(
+        conn, selected_cliente_id
+    )
     competencias = competencias_for_empresa(conn, None)
     contrapartes = contrapartes_for_form(conn)
     padroes_por_empresa = configuracoes_padrao_por_empresa(conn)
@@ -13327,6 +13776,7 @@ def nova_invoice():
     conn.close()
     return render_template("invoice_form.html", invoice=None, empresas=empresas, empresa_id=empresa_id,
                            competencia_id=competencia_id, clientes=clientes,
+                           contratos_comerciais=contratos_comerciais,
                            competencias=competencias,
                            contrapartes=contrapartes,
                            padroes_por_empresa=padroes_por_empresa,
@@ -13396,9 +13846,9 @@ def editar_invoice(invoice_id):
                 raise ValueError("Cliente e moeda não podem ser alterados enquanto a Invoice pertence a um Fechamento centralizado.")
             conn.execute("""
                 UPDATE invoices SET empresa_id=?,numero_invoice=?,tipo_documento=?,competencia_id=?,cliente_id=?,data_emissao=?,
-                    banco_referenciado_id=?,moeda=?,valor_moeda=?,contrato_comercial=?,status=?,status_manual=?,data_credito=?,observacao=? WHERE id=?
+                    banco_referenciado_id=?,moeda=?,valor_moeda=?,contrato_comercial=?,contrato_comercial_id=?,status=?,status_manual=?,data_credito=?,observacao=? WHERE id=?
             """, (data["empresa_id"], data["numero_invoice"], data["tipo_documento"], data["competencia_id"], data["cliente_id"],
-                  data["data_emissao"], data["banco_referenciado_id"], data["moeda"], data["valor_moeda"], data["contrato_comercial"],
+                  data["data_emissao"], data["banco_referenciado_id"], data["moeda"], data["valor_moeda"], data["contrato_comercial"], data["contrato_comercial_id"],
                   data["status"], data["status_manual"], data["data_credito"], data["observacao"], invoice_id))
             sync_contracts_for_invoice(conn, invoice_id)
             refresh_invoice_status(conn, invoice_id)
@@ -13411,6 +13861,14 @@ def editar_invoice(invoice_id):
             conn.rollback(); flash(str(exc), "danger")
     empresas = conn.execute("SELECT id,razao_social,apelido,cnpj,prioridade FROM empresas ORDER BY " + empresa_order_sql()).fetchall()
     clientes = clientes_for_form(conn)
+    selected_cliente_id = (
+        form_record_id(request.form.get("cliente_id"))
+        if request.method == "POST" and "cliente_id" in request.form
+        else current["cliente_id"]
+    )
+    contratos_comerciais = invoice_commercial_contracts_for_form(
+        conn, selected_cliente_id
+    )
     competencias = competencias_for_empresa(conn, None)
     contrapartes = contrapartes_for_form(conn)
     padroes_por_empresa = configuracoes_padrao_por_empresa(conn)
@@ -13425,6 +13883,7 @@ def editar_invoice(invoice_id):
     conn.close()
     return render_template("invoice_form.html", invoice=current, empresas=empresas, empresa_id=empresa_id,
                            competencia_id=competencia_id, clientes=clientes,
+                           contratos_comerciais=contratos_comerciais,
                            competencias=competencias,
                            contrapartes=contrapartes,
                            padroes_por_empresa=padroes_por_empresa,
@@ -14158,7 +14617,7 @@ def modelo_invoices():
     try:
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             pd.DataFrame(columns=columns).to_excel(writer, index=False, sheet_name="Invoices")
-            write_excel_model_orientations(writer, conn, pd)
+            write_excel_model_orientations(writer, conn, pd, include_invoice_contracts=True)
     finally:
         conn.close()
     output.seek(0)
