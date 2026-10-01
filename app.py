@@ -8474,6 +8474,7 @@ def dues_sorting(args):
     sort_fields = {
         "chave_acesso": ("d.chave_acesso", "text"),
         "numero_due": ("d.numero_due", "text"),
+        "empresa_apelido": ("e.apelido", "text"),
         "data_due": ("d.created_at", "date"),
         "cliente": ("d.cliente", "text"),
         "moeda": ("d.moeda", "text"),
@@ -8497,8 +8498,11 @@ def consulta_dues():
     total = conn.execute(f"SELECT COUNT(*) FROM dues d{clause}", params).fetchone()[0]
     pagination = build_pagination(request.args, total, endpoint="consulta_dues")
     dues = [decorate_due(row) for row in conn.execute(f"""
-        SELECT d.*, COALESCE(SUM(CASE WHEN m.tipo IN ('UTILIZACAO','VINCULACAO') THEN m.valor ELSE -m.valor END),0) AS utilizado
-        FROM dues d LEFT JOIN due_movimentacoes m ON m.due_id=d.id
+        SELECT d.*, e.apelido AS empresa_apelido,
+               COALESCE(SUM(CASE WHEN m.tipo IN ('UTILIZACAO','VINCULACAO') THEN m.valor ELSE -m.valor END),0) AS utilizado
+        FROM dues d
+        LEFT JOIN due_movimentacoes m ON m.due_id=d.id
+        LEFT JOIN empresas e ON {_global_normalized_cnpj_sql("d.cnpj")}={_global_normalized_cnpj_sql("e.cnpj")}
         {clause} GROUP BY d.id
         ORDER BY {sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, d.id {direction}
         LIMIT ? OFFSET ?
@@ -9061,7 +9065,14 @@ def editar_due(due_id):
                            competencias=competencias, competencia_id=competencia_id)
 
 def carregar_detalhe_due(conn, due_id):
-    due_row=conn.execute("SELECT * FROM dues WHERE id=?", (due_id,)).fetchone()
+    due_cnpj_sql = _global_normalized_cnpj_sql("d.cnpj")
+    empresa_cnpj_sql = _global_normalized_cnpj_sql("e.cnpj")
+    due_row=conn.execute(f"""
+        SELECT d.*, e.apelido AS empresa_apelido
+        FROM dues d
+        LEFT JOIN empresas e ON {due_cnpj_sql}={empresa_cnpj_sql}
+        WHERE d.id=?
+    """, (due_id,)).fetchone()
     if not due_row:
         return None
     mov=conn.execute("""SELECT m.*,c.numero_contrato,c.moeda AS contrato_moeda
