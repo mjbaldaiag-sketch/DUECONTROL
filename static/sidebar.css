@@ -58,6 +58,8 @@ body.app-body {
   display: block;
   width: 136px;
   height: 58px;
+  transform: scale(1.60);
+  transform-origin: center;
   object-fit: contain;
   object-position: center;
   border-radius: 8px;
@@ -120,6 +122,10 @@ body.app-body {
   stroke-linejoin: round;
   stroke-width: 1.7;
 }
+
+.sidebar-collapse-button { flex-basis: 36px; width: 36px; height: 36px; }
+.sidebar-collapse-button svg { width: 24px; height: 24px; transform: scale(2.5); transform-origin: center; transition: transform .18s ease; }
+.sidebar-collapse-button[aria-expanded="false"] svg { transform: scale(2.5) rotate(180deg); }
 
 .sidebar-nav {
   flex: 1 1 auto;
