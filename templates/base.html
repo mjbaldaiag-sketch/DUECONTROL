@@ -138,13 +138,14 @@
       <header class="app-topbar">
         <div class="topbar-leading">
           <button class="topbar-menu-button" type="button" data-sidebar-toggle aria-expanded="false" aria-label="Abrir menu" title="Abrir menu"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
-          <div class="topbar-context-title"><span>DU-E Control</span><strong>Controle inteligente de exportações</strong></div>
+          <div class="topbar-context-title"><span>DU-E Control</span></div>
         </div>
         {% if global_context_enabled %}
         <form class="global-context" method="post" action="{{ url_for('atualizar_contexto_global') }}" aria-label="Contexto global">
           <input type="hidden" name="next" value="{{ request.full_path }}">
           <label><span>Competência</span><select name="global_competencia" onchange="this.form.submit()"><option value="">Todas</option>{% for competencia in global_context_competencias %}<option value="{{ competencia.key }}" {{ 'selected' if global_context.competencia_key == competencia.key else '' }}>{{ competencia.label }}</option>{% endfor %}</select></label>
           <label><span>Empresa</span><select name="global_empresa_id" onchange="this.form.submit()"><option value="">Todas</option>{% for empresa in global_context_empresas %}<option value="{{ empresa.id }}" {{ 'selected' if global_context.empresa_id == empresa.id else '' }}>{{ empresa.apelido or empresa.razao_social }}</option>{% endfor %}</select></label>
+          <label><span>Cliente/Contraparte</span><select name="global_cliente_contraparte" onchange="this.form.submit()"><option value="">Todos</option>{% for parte in global_context_partes %}<option value="{{ parte.key }}" {{ 'selected' if global_context.party_key == parte.key else '' }}>{{ parte.label }}</option>{% endfor %}</select></label>
           <noscript><button type="submit">Aplicar</button></noscript>
         </form>
         {% endif %}

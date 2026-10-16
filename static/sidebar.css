@@ -136,7 +136,7 @@ body.app-body {
   scrollbar-color: #c8dce8 transparent;
 }
 
-.sidebar-section + .sidebar-section { margin-top: 17px; }
+.sidebar-section + .sidebar-section { margin-top: 22px; }
 
 .sidebar-section-label {
   display: block;
@@ -150,7 +150,7 @@ body.app-body {
   white-space: nowrap;
 }
 
-.sidebar-nav-group { position: relative; margin: 2px 0; }
+.sidebar-nav-group { position: relative; margin: 5px 0; }
 
 .sidebar-nav-row {
   display: flex;
@@ -246,8 +246,8 @@ body.app-body {
 
 .sidebar-submenu {
   display: grid;
-  gap: 2px;
-  margin: 2px 0 5px 37px;
+  gap: 4px;
+  margin: 4px 0 7px 37px;
   padding: 2px 0 2px 10px;
   border-left: 1px solid #d5e5ed;
 }
@@ -436,7 +436,7 @@ body.sidebar-collapsed .sidebar-nav-group.sidebar-submenu-dismissed .sidebar-sub
   body.sidebar-collapsed .sidebar-brand-logo { display: block; }
   body.sidebar-collapsed .sidebar-link { justify-content: flex-start; padding: 0 11px; }
   body.sidebar-collapsed .sidebar-nav-row { display: flex; }
-  body.sidebar-collapsed .sidebar-submenu { position: static; width: auto; margin: 2px 0 5px 37px; padding: 2px 0 2px 10px; border: 0; border-left: 1px solid #d5e5ed; border-radius: 0; background: transparent; box-shadow: none; }
+  body.sidebar-collapsed .sidebar-submenu { position: static; width: auto; margin: 4px 0 7px 37px; padding: 2px 0 2px 10px; border: 0; border-left: 1px solid #d5e5ed; border-radius: 0; background: transparent; box-shadow: none; }
   body.sidebar-collapsed .sidebar-submenu::before { display: none; }
 }
 
@@ -473,6 +473,12 @@ body.sidebar-collapsed .sidebar-nav-group.sidebar-submenu-dismissed .sidebar-sub
 .dashboard-summary-cards { gap: 12px; margin: 4px 0 0; }
 .dashboard-summary-card { min-height: 120px; border: 1px solid #dbe8f0; border-top: 3px solid transparent; border-radius: 14px; box-shadow: 0 5px 16px rgba(27, 67, 96, .06); }
 .dashboard-summary-card:hover { transform: translateY(-3px); box-shadow: 0 12px 22px rgba(27, 67, 96, .1); }
+.dashboard-unlinked-progress { display: grid; width: 72%; max-width: 120px; gap: 4px; margin-top: 2px; color: #68737d; font-size: 11px; font-weight: 700; }
+.dashboard-unlinked-progress > span { color: inherit; font-size: inherit; font-weight: inherit; line-height: 1; }
+.dashboard-unlinked-progress__track { width: 100%; height: 8px; overflow: hidden; border-radius: 999px; background: rgba(104, 115, 125, .18); }
+.dashboard-unlinked-progress__fill { height: 100%; border-radius: inherit; background: currentColor; }
+.dashboard-summary-card--due-unlinked .dashboard-unlinked-progress { color: #a27a05; }
+.dashboard-summary-card--contract-unlinked .dashboard-unlinked-progress { color: #b15e5e; }
 .dashboard-data-section { display: grid; gap: 12px; }
 .dashboard-data-section > h2 { display: none; }
 .dashboard-data-section .dashboard-section-heading { margin-bottom: 0; }

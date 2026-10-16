@@ -3266,6 +3266,7 @@ GLOBAL_CONTEXT_ENDPOINTS = frozenset({
 })
 GLOBAL_CONTEXT_EMPRESA_KEY = "global_context_empresa_id"
 GLOBAL_CONTEXT_COMPETENCIA_KEY = "global_context_competencia"
+GLOBAL_CONTEXT_PARTY_KEY = "global_context_cliente_contraparte"
 
 
 def _global_normalized_cnpj_sql(expression):
@@ -3314,11 +3315,52 @@ def global_context_options(conn):
     return empresas, competencia_options
 
 
+def global_context_party_options(conn):
+    """Retorna somente clientes/contrapartes cadastrados e com vínculos válidos."""
+    options = []
+    for cliente in conn.execute(
+        "SELECT id, nome, pais FROM clientes ORDER BY nome, pais, id"
+    ).fetchall():
+        vinculos = cliente_vinculos(conn, cliente["id"])
+        if not any(vinculos.values()):
+            continue
+        options.append({
+            "key": f"cliente:{cliente['id']}",
+            "tipo": "cliente",
+            "id": cliente["id"],
+            "label": f"Cliente — {cliente['nome']} ({cliente['pais']})",
+        })
+
+    for contraparte in conn.execute(
+        "SELECT id, nome FROM contrapartes ORDER BY nome, id"
+    ).fetchall():
+        vinculos = contraparte_vinculos(conn, contraparte["id"])
+        if not any(vinculos.values()):
+            continue
+        options.append({
+            "key": f"contraparte:{contraparte['id']}",
+            "tipo": "contraparte",
+            "id": contraparte["id"],
+            "label": f"Contraparte — {contraparte['nome']}",
+        })
+
+    return sorted(options, key=lambda item: (item["label"].casefold(), item["key"]))
+
+
+def _global_context_party_selection(raw_value, options):
+    """Resolve a seleção somente entre as opções carregadas da base oficial."""
+    selected = next((item for item in options if item["key"] == raw_value), None)
+    if not selected:
+        return None
+    return selected
+
+
 def _global_context_from_session(conn=None):
     owns_connection = conn is None
     conn = conn or db()
     try:
         empresas, competencias = global_context_options(conn)
+        partes = global_context_party_options(conn)
         empresa_ids = {int(row["id"]) for row in empresas}
         empresa_id = session.get(GLOBAL_CONTEXT_EMPRESA_KEY)
         try:
@@ -3338,14 +3380,24 @@ def _global_context_from_session(conn=None):
             competencia_key = None
             session.pop(GLOBAL_CONTEXT_COMPETENCIA_KEY, None)
 
+        party_key = session.get(GLOBAL_CONTEXT_PARTY_KEY)
+        party = _global_context_party_selection(party_key, partes)
+        if party is None:
+            party_key = None
+            session.pop(GLOBAL_CONTEXT_PARTY_KEY, None)
+
         return {
             "empresa_id": empresa_id,
             "competencia_key": competencia_key,
             "competencia": competencia,
+            "party_key": party_key,
+            "party_type": party["tipo"] if party else None,
+            "party_id": party["id"] if party else None,
             "competencia_data_inicial": competencia["data_inicial"] if competencia else None,
             "competencia_data_final": competencia["data_final"] if competencia else None,
             "empresas": empresas,
             "competencias": competencias,
+            "partes": partes,
         }
     finally:
         if owns_connection:
@@ -3362,13 +3414,14 @@ def carregar_contexto_global():
 def injetar_contexto_global():
     contexto = getattr(g, "global_context", None) or {
         "empresa_id": None, "competencia_key": None,
-        "competencia": None, "empresas": [], "competencias": [],
+        "competencia": None, "empresas": [], "competencias": [], "partes": [],
     }
     return {
         "global_context": contexto,
         "global_context_enabled": getattr(g, "global_context_enabled", False),
         "global_context_empresas": contexto.get("empresas", []),
         "global_context_competencias": contexto.get("competencias", []),
+        "global_context_partes": contexto.get("partes", []),
     }
 
 
@@ -3461,6 +3514,201 @@ def _global_context_contract_period_sql(context, alias="c"):
     return f"({direct} OR {linked_invoice} OR {linked_due})", [inicio, fim, inicio, fim, inicio, fim]
 
 
+def _global_context_counterparty_record_sql(alias, counterpart_alias="gl_cp"):
+    """Relaciona um contrato legado ou atual à contraparte oficial selecionada."""
+    text_fields = " OR ".join(
+        "(',' || REPLACE(LOWER(COALESCE(" + f"{alias}.{field}" + ",'')), ' ', '') || ',') "
+        "LIKE '%,' || REPLACE(LOWER(" + counterpart_alias + ".nome), ' ', '') || ',%'"
+        for field in ("banco", "banco_credito", "banco_liquidacao")
+    )
+    return f"({alias}.banco_id={counterpart_alias}.id " \
+           f"OR {alias}.banco_liquidacao_id={counterpart_alias}.id " \
+           f"OR {text_fields})"
+
+
+def _global_context_invoice_counterparty_sql(alias="i", counterpart_alias="gl_cp"):
+    """Relaciona uma Invoice e seus vínculos à contraparte oficial."""
+    contract_relation = _global_context_counterparty_record_sql("gl_contract", counterpart_alias)
+    closing_relation = (
+        f"gl_closing.banco_credito_id={counterpart_alias}.id "
+        f"OR gl_closing.banco_liquidacao_id={counterpart_alias}.id"
+    )
+    return f"""(
+        {alias}.banco_referenciado_id={counterpart_alias}.id
+        OR EXISTS (
+            SELECT 1 FROM recebimentos_invoice gl_receipt
+            WHERE gl_receipt.invoice_id={alias}.id
+              AND gl_receipt.banco_credito_id={counterpart_alias}.id
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM invoice_contrato_cambio gl_invoice_contract
+            JOIN contratos gl_contract ON gl_contract.id=gl_invoice_contract.contrato_id
+            WHERE gl_invoice_contract.invoice_id={alias}.id
+              AND {contract_relation}
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM fechamentos_cambio gl_closing_invoice
+            LEFT JOIN fechamentos gl_closing
+              ON gl_closing.id=gl_closing_invoice.fechamento_id
+            LEFT JOIN contratos gl_contract
+              ON gl_contract.id=gl_closing_invoice.contrato_id
+            WHERE gl_closing_invoice.invoice_id={alias}.id
+              AND (
+                  ({closing_relation})
+                  OR gl_contract.id IS NOT NULL AND {contract_relation}
+              )
+        )
+    )"""
+
+
+def _global_context_contract_client_sql(alias="c"):
+    """Relaciona um contrato à cliente por vínculo direto ou operacional."""
+    return f"""EXISTS (
+        SELECT 1 FROM clientes gl_client
+        WHERE gl_client.id=?
+          AND (
+              {alias}.cliente_id=gl_client.id
+              OR EXISTS (
+                  SELECT 1
+                  FROM invoice_contrato_cambio gl_invoice_contract
+                  JOIN invoices gl_invoice ON gl_invoice.id=gl_invoice_contract.invoice_id
+                  WHERE gl_invoice_contract.contrato_id={alias}.id
+                    AND gl_invoice.cliente_id=gl_client.id
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM due_contratos gl_due_contract
+                  JOIN dues gl_due ON gl_due.id=gl_due_contract.due_id
+                  WHERE gl_due_contract.contrato_id={alias}.id
+                    AND gl_due.cliente_id=gl_client.id
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM due_movimentacoes gl_due_movement
+                  JOIN dues gl_due ON gl_due.id=gl_due_movement.due_id
+                  WHERE gl_due_movement.contrato_id={alias}.id
+                    AND gl_due.cliente_id=gl_client.id
+              )
+              OR EXISTS (
+                  SELECT 1 FROM fechamentos gl_closing
+                  WHERE gl_closing.contrato_id={alias}.id
+                    AND gl_closing.cliente_id=gl_client.id
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM fechamentos_cambio gl_closing_invoice
+                  JOIN invoices gl_invoice ON gl_invoice.id=gl_closing_invoice.invoice_id
+                  WHERE gl_invoice.cliente_id=gl_client.id
+                    AND (
+                        gl_closing_invoice.contrato_id={alias}.id
+                        OR EXISTS (
+                            SELECT 1 FROM fechamentos gl_closing
+                            WHERE gl_closing.id=gl_closing_invoice.fechamento_id
+                              AND gl_closing.contrato_id={alias}.id
+                        )
+                    )
+              )
+          )
+    )"""
+
+
+def _global_context_contract_counterparty_sql(alias="c"):
+    """Relaciona um contrato e seus vínculos à contraparte oficial."""
+    direct_relation = _global_context_counterparty_record_sql(alias)
+    invoice_relation = _global_context_invoice_counterparty_sql("gl_invoice")
+    return f"""EXISTS (
+        SELECT 1 FROM contrapartes gl_cp
+        WHERE gl_cp.id=?
+          AND (
+              {direct_relation}
+              OR EXISTS (
+                  SELECT 1
+                  FROM invoice_contrato_cambio gl_invoice_contract
+                  JOIN invoices gl_invoice ON gl_invoice.id=gl_invoice_contract.invoice_id
+                  WHERE gl_invoice_contract.contrato_id={alias}.id
+                    AND {invoice_relation}
+              )
+              OR EXISTS (
+                  SELECT 1 FROM fechamentos gl_closing
+                  WHERE gl_closing.contrato_id={alias}.id
+                    AND (
+                        gl_closing.banco_credito_id=gl_cp.id
+                        OR gl_closing.banco_liquidacao_id=gl_cp.id
+                    )
+              )
+          )
+    )"""
+
+
+def _global_context_due_counterparty_sql(alias="d"):
+    """Relaciona uma DU-E a contrapartes por Invoice ou Contrato vinculado."""
+    invoice_relation = _global_context_invoice_counterparty_sql("gl_invoice")
+    contract_relation = _global_context_counterparty_record_sql("gl_contract")
+    return f"""EXISTS (
+        SELECT 1 FROM contrapartes gl_cp
+        WHERE gl_cp.id=?
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM due_invoice gl_due_invoice
+                  JOIN invoices gl_invoice ON gl_invoice.id=gl_due_invoice.invoice_id
+                  WHERE gl_due_invoice.due_id={alias}.id
+                    AND {invoice_relation}
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM due_contratos gl_due_contract
+                  JOIN contratos gl_contract ON gl_contract.id=gl_due_contract.contrato_id
+                  WHERE gl_due_contract.due_id={alias}.id
+                    AND {contract_relation}
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM due_movimentacoes gl_due_movement
+                  JOIN contratos gl_contract ON gl_contract.id=gl_due_movement.contrato_id
+                  WHERE gl_due_movement.due_id={alias}.id
+                    AND {contract_relation}
+              )
+          )
+    )"""
+
+
+def _global_context_party_sql(scope, context, alias):
+    party_type = context.get("party_type") if context else None
+    party_id = context.get("party_id") if context else None
+    if party_type not in {"cliente", "contraparte"} or not party_id:
+        return None, []
+
+    if party_type == "cliente":
+        if scope in {"invoice", "due", "commercial", "closing"}:
+            return f"{alias}.cliente_id=?", [party_id]
+        if scope == "contract":
+            return _global_context_contract_client_sql(alias), [party_id]
+        # Produções não têm relacionamento com Cliente/Contraparte.
+        return "1=0", []
+
+    if scope == "invoice":
+        return (
+            f"EXISTS (SELECT 1 FROM contrapartes gl_cp WHERE gl_cp.id=? "
+            f"AND {_global_context_invoice_counterparty_sql(alias)})",
+            [party_id],
+        )
+    if scope == "due":
+        return _global_context_due_counterparty_sql(alias), [party_id]
+    if scope == "contract":
+        return _global_context_contract_counterparty_sql(alias), [party_id]
+    if scope == "closing":
+        return (
+            f"EXISTS (SELECT 1 FROM contrapartes gl_cp WHERE gl_cp.id=? AND "
+            f"({alias}.banco_credito_id=gl_cp.id OR {alias}.banco_liquidacao_id=gl_cp.id))",
+            [party_id],
+        )
+    # Produções e contratos comerciais não têm relacionamento com contraparte.
+    return "1=0", []
+
+
 def global_context_sql(scope, context=None, alias=None):
     """Retorna predicados globais e parâmetros sem alterar filtros locais."""
     context = context or {}
@@ -3548,6 +3796,11 @@ def global_context_sql(scope, context=None, alias=None):
             params.extend([inicio, fim])
     else:
         raise ValueError(f"Escopo de contexto global desconhecido: {scope}")
+
+    party_sql, party_params = _global_context_party_sql(scope, context, alias)
+    if party_sql:
+        clauses.append(party_sql)
+        params.extend(party_params)
 
     return (" AND ".join(clauses) if clauses else ""), params
 
@@ -4585,8 +4838,10 @@ def atualizar_contexto_global():
     conn = db()
     try:
         empresas, competencias = global_context_options(conn)
+        partes = global_context_party_options(conn)
         empresa_raw = (request.form.get("global_empresa_id") or "").strip()
         periodo_raw = (request.form.get("global_competencia") or "").strip()
+        party_raw = (request.form.get("global_cliente_contraparte") or "").strip()
         if empresa_raw:
             empresa_id = form_record_id(empresa_raw)
             if not empresa_id or empresa_id not in {row["id"] for row in empresas}:
@@ -4600,6 +4855,13 @@ def atualizar_contexto_global():
             session[GLOBAL_CONTEXT_COMPETENCIA_KEY] = periodo_raw
         else:
             session.pop(GLOBAL_CONTEXT_COMPETENCIA_KEY, None)
+        if party_raw:
+            party = _global_context_party_selection(party_raw, partes)
+            if not party:
+                raise ValueError("O Cliente/Contraparte selecionado não é válido ou não possui vínculos válidos.")
+            session[GLOBAL_CONTEXT_PARTY_KEY] = party["key"]
+        else:
+            session.pop(GLOBAL_CONTEXT_PARTY_KEY, None)
         session.modified = True
     except ValueError as exc:
         flash(str(exc), "danger")
@@ -4665,6 +4927,50 @@ def dashboard_contract_sorting(args):
         page_param="contratos_page", default_sort=None, default_direction="DESC",
     )
 
+
+def dashboard_currency_totals(rows, value_key="valor", count_key="quantidade"):
+    """Consolida quantidades e valores por moeda para os indicadores do dashboard."""
+    grouped = {}
+    for row in rows:
+        moeda = str(row["moeda"] or "-").strip().upper() or "-"
+        item = grouped.setdefault(moeda, {
+            "moeda": moeda,
+            "quantidade": 0,
+            "valor": Decimal("0"),
+        })
+        item["quantidade"] += int(row[count_key]) if count_key else 1
+        item["valor"] += decimal_value(row[value_key])
+    return [grouped[moeda] for moeda in sorted(grouped)]
+
+
+def dashboard_contract_currency_totals(rows):
+    """Consolida contratos pelo valor já calculado e pelo equivalente em BRL."""
+    grouped = {}
+    brl_total = Decimal("0")
+    for row in rows:
+        moeda = str(row["moeda"] or "-").strip().upper() or "-"
+        item = grouped.setdefault(moeda, {
+            "moeda": moeda,
+            "quantidade": 0,
+            "valor": Decimal("0"),
+            "brl": Decimal("0"),
+        })
+        valor = decimal_value(row["valor_moeda"])
+        item["quantidade"] += 1
+        item["valor"] += valor
+        valor_brl = report_brl_value({
+            "valor_moeda": valor,
+            "valor_reais": row["valor_reais"],
+            "taxa_cambio": row["taxa_cambio"],
+            "regra_conversao_brl": row["regra_conversao_brl"],
+        })
+        if valor_brl is not None:
+            valor_brl = decimal_value(valor_brl)
+            item["brl"] += valor_brl
+            brl_total += valor_brl
+    return [grouped[moeda] for moeda in sorted(grouped)], brl_total
+
+
 @app.route("/")
 def index():
     conn = db()
@@ -4724,6 +5030,66 @@ def index():
     contract_unlinked_where = (
         f"{contract_global} AND " if contract_global else ""
     ) + "NOT EXISTS (SELECT 1 FROM due_contratos v WHERE v.contrato_id=c.id)"
+    invoice_currency_rows = conn.execute("""
+        SELECT i.moeda, COUNT(*) AS quantidade,
+               COALESCE(SUM(i.valor_moeda), 0) AS valor
+        FROM invoices i
+        """ + (f"WHERE {invoice_global}" if invoice_global else "") + """
+        GROUP BY i.moeda
+        ORDER BY i.moeda
+    """, invoice_global_params).fetchall()
+    due_currency_rows = conn.execute("""
+        SELECT d.moeda, COUNT(*) AS quantidade,
+               COALESCE(SUM(d.valor_original), 0) AS valor
+        FROM dues d
+        """ + due_scope_where + """
+        GROUP BY d.moeda
+        ORDER BY d.moeda
+    """, due_global_params).fetchall()
+    due_unlinked_currency_rows = conn.execute("""
+        SELECT d.moeda, COUNT(*) AS quantidade,
+               COALESCE(SUM(d.valor_original), 0) AS valor
+        FROM dues d
+        """ + due_unlinked_where + """
+        GROUP BY d.moeda
+        ORDER BY d.moeda
+    """, due_global_params).fetchall()
+    dues_valor_total = sum(
+        (decimal_value(row["valor"]) for row in due_currency_rows),
+        Decimal("0"),
+    )
+    dues_sem_vinculo_valor_total = sum(
+        (decimal_value(row["valor"]) for row in due_unlinked_currency_rows),
+        Decimal("0"),
+    )
+    contract_currency_rows = conn.execute(f"""
+        SELECT c.moeda, {contract_total_sql("c")} AS valor_moeda,
+               c.taxa_cambio, c.valor_reais, bl.regra_conversao_brl
+        FROM contratos c
+        LEFT JOIN contrapartes bl ON bl.id=c.banco_liquidacao_id
+        {contract_scope_where}
+    """, contract_global_params).fetchall()
+    contract_unlinked_currency_rows = conn.execute(f"""
+        SELECT c.moeda, {contract_total_sql("c")} AS valor_moeda,
+               c.taxa_cambio, c.valor_reais, bl.regra_conversao_brl
+        FROM contratos c
+        LEFT JOIN contrapartes bl ON bl.id=c.banco_liquidacao_id
+        WHERE {contract_unlinked_where}
+          AND COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), ?)<>?
+    """, contract_global_params + [CATEGORIA_CAMBIO_EXPORTACAO, CATEGORIA_CAMBIO_FINANCEIRO]).fetchall()
+    contratos_valores, contratos_brl = dashboard_contract_currency_totals(contract_currency_rows)
+    contratos_sem_vinculo_valores, contratos_sem_vinculo_brl = dashboard_contract_currency_totals(
+        contract_unlinked_currency_rows
+    )
+    dues_sem_vinculo_total = conn.execute(
+        "SELECT COUNT(*) FROM dues d " + due_unlinked_where,
+        due_global_params,
+    ).fetchone()[0]
+    contratos_sem_vinculo_total = conn.execute(f"""
+        SELECT COUNT(*) FROM contratos c
+        WHERE {contract_unlinked_where}
+          AND COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), ?)<>?
+    """, contract_global_params + [CATEGORIA_CAMBIO_EXPORTACAO, CATEGORIA_CAMBIO_FINANCEIRO]).fetchone()[0]
     resumo = {
         "invoices": conn.execute(
             "SELECT COUNT(*) FROM invoices i "
@@ -4732,15 +5098,21 @@ def index():
         ).fetchone()[0],
         "dues": dues_total,
         "contratos": contratos_total,
-        "dues_sem_vinculo": conn.execute(
-            "SELECT COUNT(*) FROM dues d " + due_unlinked_where,
-            due_global_params,
-        ).fetchone()[0],
-        "contratos_sem_vinculo": conn.execute(f"""
-            SELECT COUNT(*) FROM contratos c
-            WHERE {contract_unlinked_where}
-              AND COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), 'Câmbio Exportação')<>?
-        """, contract_global_params + [CATEGORIA_CAMBIO_FINANCEIRO]).fetchone()[0],
+        "dues_sem_vinculo": dues_sem_vinculo_total,
+        "contratos_sem_vinculo": contratos_sem_vinculo_total,
+        "dues_sem_vinculo_percent": round(
+            dues_sem_vinculo_valor_total * 100 / dues_valor_total, 1
+        ) if dues_valor_total else 0,
+        "contratos_sem_vinculo_percent": round(
+            contratos_sem_vinculo_brl * 100 / contratos_brl, 1
+        ) if contratos_brl else 0,
+        "invoices_valores": dashboard_currency_totals(invoice_currency_rows),
+        "dues_valores": dashboard_currency_totals(due_currency_rows),
+        "contratos_valores": contratos_valores,
+        "dues_sem_vinculo_valores": dashboard_currency_totals(due_unlinked_currency_rows),
+        "contratos_sem_vinculo_valores": contratos_sem_vinculo_valores,
+        "contratos_brl": contratos_brl,
+        "contratos_sem_vinculo_brl": contratos_sem_vinculo_brl,
     }
     producao_global, producao_global_params = global_context_sql("production", g.global_context, "p")
     comercial_global, comercial_global_params = global_context_sql("commercial", g.global_context, "cc")

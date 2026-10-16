@@ -7,7 +7,6 @@
   <div>
     <span class="dashboard-eyebrow">Visão geral operacional</span>
     <h1 id="dashboard-title">Dashboard</h1>
-    <p class="muted">Acompanhe os principais fluxos de exportação em um só lugar.</p>
   </div>
   <div class="dashboard-hero-status"><span class="dashboard-status-dot" aria-hidden="true"></span><span>Visão consolidada</span></div>
 </section>
@@ -16,18 +15,27 @@
 <div class="dashboard-summary-cards" aria-label="Resumo do sistema">
   <a class="dashboard-summary-card dashboard-summary-card--invoice" href="{{ url_for('lista_invoices') }}" aria-label="Total Invoices: {{ resumo.invoices }}">
     <span>Total Invoices</span><strong>{{ resumo.invoices }}</strong>
+    {% for total in resumo.invoices_valores %}<small class="muted">{{ total.moeda }} {{ total.valor|money }}</small>{% else %}<small class="muted">-</small>{% endfor %}
   </a>
   <a class="dashboard-summary-card dashboard-summary-card--due" href="{{ url_for('consulta_dues') }}" aria-label="Total DU-Es: {{ resumo.dues }}">
     <span>Total DU-Es</span><strong>{{ resumo.dues }}</strong>
+    {% for total in resumo.dues_valores %}<small class="muted">{{ total.moeda }} {{ total.valor|money }}</small>{% else %}<small class="muted">-</small>{% endfor %}
   </a>
   <a class="dashboard-summary-card dashboard-summary-card--contract" href="{{ url_for('lista_contratos') }}" aria-label="Total Contratos de Câmbio: {{ resumo.contratos }}">
     <span>Total Contratos de Câmbio</span><strong>{{ resumo.contratos }}</strong>
+    {% for total in resumo.contratos_valores %}<small class="muted">{{ total.moeda }} {{ total.valor|money }}</small>{% else %}<small class="muted">-</small>{% endfor %}
+    <small class="muted">BRL {{ resumo.contratos_brl|money }}</small>
   </a>
   <a class="dashboard-summary-card dashboard-summary-card--due-unlinked" href="{{ url_for('consulta_dues') }}" aria-label="Total DU-Es sem vínculo: {{ resumo.dues_sem_vinculo }}">
     <span>Total DU-Es sem vínculo</span><strong>{{ resumo.dues_sem_vinculo }}</strong>
+    {% for total in resumo.dues_sem_vinculo_valores %}<small class="muted">{{ total.moeda }} {{ total.valor|money }}</small>{% else %}<small class="muted">-</small>{% endfor %}
+    <div class="dashboard-unlinked-progress" aria-label="{{ resumo.dues_sem_vinculo_percent|percent }} do total de DU-Es"><span>{{ resumo.dues_sem_vinculo_percent|percent }}</span><div class="dashboard-unlinked-progress__track"><div class="dashboard-unlinked-progress__fill" style="width: {{ resumo.dues_sem_vinculo_percent }}%;"></div></div></div>
   </a>
   <a class="dashboard-summary-card dashboard-summary-card--contract-unlinked" href="{{ url_for('lista_contratos') }}" aria-label="Total Contratos sem vínculo: {{ resumo.contratos_sem_vinculo }}">
     <span>Total Contratos sem vínculo</span><strong>{{ resumo.contratos_sem_vinculo }}</strong>
+    {% for total in resumo.contratos_sem_vinculo_valores %}<small class="muted">{{ total.moeda }} {{ total.valor|money }}</small>{% else %}<small class="muted">-</small>{% endfor %}
+    <small class="muted">BRL {{ resumo.contratos_sem_vinculo_brl|money }}</small>
+    <div class="dashboard-unlinked-progress" aria-label="{{ resumo.contratos_sem_vinculo_percent|percent }} do total de contratos"><span>{{ resumo.contratos_sem_vinculo_percent|percent }}</span><div class="dashboard-unlinked-progress__track"><div class="dashboard-unlinked-progress__fill" style="width: {{ resumo.contratos_sem_vinculo_percent }}%;"></div></div></div>
   </a>
 </div>
 </section>
