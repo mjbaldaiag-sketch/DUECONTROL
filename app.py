@@ -326,6 +326,21 @@ def db():
     return conn
 
 
+def invoice_mother_id_sql(invoice_alias="i", lineage_alias="d"):
+    """Retorna a expressão SQL que identifica a Invoice mãe da linhagem."""
+    return f"COALESCE({lineage_alias}.invoice_raiz_id, {invoice_alias}.id)"
+
+
+def invoice_mother_count(conn, where_clause="", params=()):
+    """Conta Invoices mães sem ocultar os registros operacionais das parcelas."""
+    return conn.execute(f"""
+        SELECT COUNT(DISTINCT {invoice_mother_id_sql()})
+        FROM invoices i
+        LEFT JOIN invoice_desdobramentos d ON d.invoice_id=i.id
+        {where_clause}
+    """, params).fetchone()[0]
+
+
 def migrate_invoice_status_constraint(conn):
     """Rebuilds the Invoice table when its status CHECK predates new states."""
     table = conn.execute(
@@ -2407,6 +2422,9 @@ def clientes_com_vinculos(conn, pagination=None):
     for cliente in clientes:
         item = dict(cliente)
         item["vinculos"] = cliente_vinculos(conn, cliente["id"])
+        item["invoice_mothers_count"] = invoice_mother_count(
+            conn, "WHERE i.cliente_id=?", (cliente["id"],)
+        )
         item["total_vinculos"] = sum(len(registros) for registros in item["vinculos"].values())
         result.append(item)
     return result
@@ -2532,6 +2550,9 @@ def contrapartes_com_vinculos(conn, pagination=None):
     for contraparte in contrapartes:
         item = dict(contraparte)
         item["vinculos"] = contraparte_vinculos(conn, contraparte["id"])
+        item["invoice_mothers_count"] = invoice_mother_count(
+            conn, "WHERE i.banco_referenciado_id=?", (contraparte["id"],)
+        )
         item["total_vinculos"] = sum(
             len(registros) for registros in item["vinculos"].values()
         )
@@ -4977,6 +4998,7 @@ def index():
     due_global, due_global_params = global_context_sql("due", g.global_context)
     contract_global, contract_global_params = global_context_sql("contract", g.global_context)
     invoice_global, invoice_global_params = global_context_sql("invoice", g.global_context)
+    invoice_mother_key = invoice_mother_id_sql("i", "d")
     due_scope_where = f"WHERE {due_global}" if due_global else ""
     contract_scope_where = f"WHERE {contract_global}" if contract_global else ""
     dues_total = conn.execute(
@@ -5030,10 +5052,11 @@ def index():
     contract_unlinked_where = (
         f"{contract_global} AND " if contract_global else ""
     ) + "NOT EXISTS (SELECT 1 FROM due_contratos v WHERE v.contrato_id=c.id)"
-    invoice_currency_rows = conn.execute("""
-        SELECT i.moeda, COUNT(*) AS quantidade,
+    invoice_currency_rows = conn.execute(f"""
+        SELECT i.moeda, COUNT(DISTINCT {invoice_mother_key}) AS quantidade,
                COALESCE(SUM(i.valor_moeda), 0) AS valor
         FROM invoices i
+        LEFT JOIN invoice_desdobramentos d ON d.invoice_id=i.id
         """ + (f"WHERE {invoice_global}" if invoice_global else "") + """
         GROUP BY i.moeda
         ORDER BY i.moeda
@@ -5091,11 +5114,11 @@ def index():
           AND COALESCE(NULLIF(TRIM(c.categoria_cambio), ''), ?)<>?
     """, contract_global_params + [CATEGORIA_CAMBIO_EXPORTACAO, CATEGORIA_CAMBIO_FINANCEIRO]).fetchone()[0]
     resumo = {
-        "invoices": conn.execute(
-            "SELECT COUNT(*) FROM invoices i "
-            + (f"WHERE {invoice_global}" if invoice_global else ""),
+        "invoices": invoice_mother_count(
+            conn,
+            f"WHERE {invoice_global}" if invoice_global else "",
             invoice_global_params,
-        ).fetchone()[0],
+        ),
         "dues": dues_total,
         "contratos": contratos_total,
         "dues_sem_vinculo": dues_sem_vinculo_total,
@@ -7986,13 +8009,15 @@ def cadastro_contratos_comerciais():
     pagination = build_pagination(
         request.args, total, endpoint="cadastro_contratos_comerciais"
     )
-    contratos = conn.execute("""
+    contratos = conn.execute(f"""
         SELECT cc.id, cc.cliente_id, cc.nome,
                cl.nome AS cliente_nome, cl.pais AS cliente_pais,
-               COUNT(i.id) AS total_invoices
+               COUNT(DISTINCT {invoice_mother_id_sql("i", "d")}) AS total_invoices,
+               COUNT(i.id) AS linked_invoice_records
         FROM invoice_contratos_comerciais cc
         JOIN clientes cl ON cl.id=cc.cliente_id
         LEFT JOIN invoices i ON i.contrato_comercial_id=cc.id
+        LEFT JOIN invoice_desdobramentos d ON d.invoice_id=i.id
         GROUP BY cc.id
         ORDER BY cl.nome, cl.pais, cc.nome, cc.id
         LIMIT ? OFFSET ?
@@ -8025,6 +8050,9 @@ def editar_contrato_comercial_invoice(contrato_id):
         "SELECT COUNT(*) FROM invoices WHERE contrato_comercial_id=?",
         (contrato_id,),
     ).fetchone()[0]
+    linked_invoice_mother_count = invoice_mother_count(
+        conn, "WHERE i.contrato_comercial_id=?", (contrato_id,)
+    )
     form_data = {
         "cliente_id": current["cliente_id"],
         "nome": current["nome"],
@@ -8070,7 +8098,10 @@ def editar_contrato_comercial_invoice(contrato_id):
         nome=form_data["nome"],
         selected_cliente_id=form_data["cliente_id"],
         contrato_em_edicao={
-            "id": contrato_id, "total_invoices": linked_invoice_count, **form_data
+            "id": contrato_id,
+            "total_invoices": linked_invoice_mother_count,
+            "linked_invoice_records": linked_invoice_count,
+            **form_data,
         },
         pagination=None,
     )
@@ -13195,8 +13226,9 @@ def lista_invoices():
     for row in conn.execute("SELECT id FROM invoices").fetchall():
         refresh_invoice_status(conn, row["id"])
     conn.commit()
-    total = conn.execute(f"SELECT COUNT(*) FROM invoices i{clause}", params).fetchone()[0]
-    pagination = build_pagination(request.args, total, endpoint="lista_invoices")
+    total_records = conn.execute(f"SELECT COUNT(*) FROM invoices i{clause}", params).fetchone()[0]
+    total = invoice_mother_count(conn, clause, params)
+    pagination = build_pagination(request.args, total_records, endpoint="lista_invoices")
     order_sql = (
         f"{sort_sql_term(sort_fields[sort][0], direction, sort_fields[sort][1])}, "
         f"{empresa_order_sql('e')}, i.id {direction}"
