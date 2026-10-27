@@ -27,7 +27,7 @@ INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
 INVOICE_SCHEMA_VERSION = 19
 INVOICE_LEGACY_SCHEMA_VERSION = 15
-SAFRA_SCHEMA_VERSION = 19
+SAFRA_SCHEMA_VERSION = 20
 
 SALDO_TOLERANCE = Decimal("0.005")
 CONVERSION_RULE_HALF_DOWN = "HALF_DOWN"
@@ -570,6 +570,109 @@ def migrate_invoice_commercial_contracts_schema(conn):
             "UPDATE invoices SET contrato_comercial_id=? WHERE id=?",
             (master_id, invoice["id"]),
         )
+
+
+def migrate_legacy_invoice_contracts_to_safra(conn):
+    """Loads legacy Invoice contract references into the Safra contract table.
+
+    Invoice contract masters are scoped only by client, so the same master
+    can legitimately be used by more than one company. Safra contracts are
+    scoped by company and number; group by that complete business identity
+    and keep the first Invoice's date and competence for each group.
+    """
+    rows = conn.execute("""
+        SELECT i.id, i.empresa_id, i.cliente_id, i.competencia_id,
+               i.data_emissao, i.contrato_comercial,
+               cc.id AS invoice_contract_id,
+               cc.cliente_id AS invoice_contract_cliente_id,
+               cc.nome AS invoice_contract_name,
+               e.id AS empresa_exists,
+               cl.id AS cliente_exists,
+               comp.empresa_id AS competencia_empresa_id
+        FROM invoices i
+        LEFT JOIN invoice_contratos_comerciais cc
+               ON cc.id=i.contrato_comercial_id
+        LEFT JOIN empresas e ON e.id=i.empresa_id
+        LEFT JOIN clientes cl ON cl.id=i.cliente_id
+        LEFT JOIN competencias comp ON comp.id=i.competencia_id
+        WHERE i.contrato_comercial_id IS NOT NULL
+           OR (i.contrato_comercial IS NOT NULL
+               AND TRIM(i.contrato_comercial) <> '')
+        ORDER BY i.empresa_id, i.cliente_id,
+                 COALESCE(cc.nome, i.contrato_comercial),
+                 CASE WHEN i.data_emissao IS NULL OR TRIM(i.data_emissao)='' THEN 1 ELSE 0 END,
+                 i.data_emissao, i.id
+    """).fetchall()
+
+    groups = {}
+    ignored = 0
+
+    def invoice_order(row):
+        data_emissao = str(row["data_emissao"] or "").strip()
+        return (not data_emissao, data_emissao, row["id"])
+
+    for row in rows:
+        try:
+            identifier = normalize_invoice_commercial_contract_name(
+                row["invoice_contract_name"] or row["contrato_comercial"]
+            )
+        except ValueError:
+            ignored += 1
+            continue
+        if not identifier:
+            ignored += 1
+            continue
+        key = (row["empresa_id"], row["cliente_id"], identifier)
+        if key not in groups or invoice_order(row) < invoice_order(groups[key]):
+            groups[key] = row
+
+    inserted = 0
+    skipped_existing = 0
+    for (empresa_id, cliente_id, identifier), row in groups.items():
+        data_contrato = str(row["data_emissao"] or "").strip()
+        valid_competencia = (
+            row["competencia_id"] is not None
+            and row["competencia_empresa_id"] == empresa_id
+        )
+        valid_relationships = (
+            row["empresa_exists"] is not None
+            and row["cliente_exists"] is not None
+            and (
+                row["invoice_contract_id"] is None
+                or row["invoice_contract_cliente_id"] == cliente_id
+            )
+        )
+        if not data_contrato or not valid_competencia or not valid_relationships:
+            ignored += 1
+            continue
+
+        cursor = conn.execute("""
+            INSERT INTO contratos_comerciais
+                (numero_contrato, empresa_id, competencia_id, cliente_id,
+                 mercado, data_contrato, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(empresa_id, numero_contrato) DO NOTHING
+        """, (
+            identifier,
+            empresa_id,
+            row["competencia_id"],
+            cliente_id,
+            "EXTERNO",
+            data_contrato,
+            STATUS_CONTRATO_COMERCIAL_ABERTO,
+        ))
+        if cursor.rowcount:
+            inserted += 1
+        else:
+            skipped_existing += 1
+
+    return {
+        "scanned": len(rows),
+        "eligible": len(groups),
+        "inserted": inserted,
+        "skipped_existing": skipped_existing,
+        "ignored": ignored,
+    }
 
 
 def init_db():
@@ -1131,6 +1234,8 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_banco_referenciado ON invoices(banco_referenciado_id)")
         status_schema_migrated = migrate_invoice_status_constraint(conn)
         migrate_invoice_commercial_contracts_schema(conn)
+        if schema_version < SAFRA_SCHEMA_VERSION:
+            migrate_legacy_invoice_contracts_to_safra(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_empresa ON invoices(empresa_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invoices_emissao ON invoices(data_emissao)")
@@ -6080,6 +6185,12 @@ def exportar_contratos():
 
 REPORT_GRANULARITIES = ("diario", "semanal", "mensal")
 REPORT_GRANULARITY_LABELS = {"diario": "diário", "semanal": "semanal", "mensal": "mensal"}
+REPORT_COMPANY_BAR_PALETTE = (
+    ("#B8D8EA", "#18324F"),  # azul-claro
+    ("#E7D7B3", "#18324F"),  # bege
+    ("#4F7255", "#FFFFFF"),  # verde-escuro
+    ("#294C6B", "#FFFFFF"),  # azul-escuro
+)
 
 def report_date(value):
     try:
@@ -6141,13 +6252,13 @@ def report_summary():
     }
 
 def report_brl_value(item):
+    if item.get("taxa_cambio") is not None:
+        # Relatórios agregam o BRL bruto e arredondam somente na exibição.
+        # ``valor_reais`` é um cache persistido e pode ter sido calculado com
+        # uma precisão/versão diferente da base consolidada do contrato.
+        return closing_brl_unrounded_value(item["valor_moeda"], item["taxa_cambio"])
     if item.get("valor_reais") is not None:
         return item["valor_reais"]
-    if item.get("taxa_cambio") is not None:
-        return closing_brl_value(
-            item["valor_moeda"], item["taxa_cambio"],
-            item.get("regra_conversao_brl", CONVERSION_RULE_DEFAULT),
-        )
     return None
 
 def add_report_item(summary, item):
@@ -6328,12 +6439,55 @@ def report_dimension_rows(items, name_getter, total_brl, group_key_getter=None,
         participation = summary["brl_total"] / total_brl * Decimal("100") if total_brl else Decimal("0")
         result.append({"nome": name, "total_usd": summary["usd_volume"],
                        "total_brl": summary["brl_total"], "participacao": participation,
+                       "participacao_label": report_percent_label(participation),
                        "_sort_key": (sort_key_getter(item) if sort_key_getter
                                      else str(name).casefold())})
     result.sort(key=lambda item: item["_sort_key"])
     for item in result:
         item.pop("_sort_key", None)
     return result
+
+def report_dimension_rows_by_total(rows):
+    """Ordena uma dimensão agregada sem recalcular seus valores."""
+    return sorted(
+        rows,
+        key=lambda item: (-item["total_brl"], str(item["nome"]).casefold()),
+    )
+
+def report_millions_label(value):
+    """Formata um valor BRL em milhões para os elementos visuais do relatório."""
+    amount = decimal_value(value)
+    millions = amount / Decimal("1000000")
+    formatted = f"{millions:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {formatted} mi"
+
+def report_percent_label(value):
+    amount = decimal_value(value)
+    formatted = f"{amount:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{formatted}%"
+
+def report_company_chart_rows(rows):
+    """Prepara as barras por empresa usando os totais já agregados."""
+    ordered = report_dimension_rows_by_total(rows)
+    maximum = max((item["total_brl"] for item in ordered), default=Decimal("0"))
+    chart_rows = []
+    for index, item in enumerate(ordered):
+        total_brl = item["total_brl"]
+        width = (
+            (total_brl / maximum * Decimal("100")).quantize(Decimal("0.01"))
+            if maximum > 0 else Decimal("0")
+        )
+        fill_color, label_color = REPORT_COMPANY_BAR_PALETTE[index % len(REPORT_COMPANY_BAR_PALETTE)]
+        chart_rows.append({
+            "nome": item["nome"],
+            "total_brl": total_brl,
+            "total_milhoes": total_brl / Decimal("1000000"),
+            "total_label": report_millions_label(total_brl),
+            "bar_width": width,
+            "bar_color": fill_color,
+            "label_color": label_color,
+        })
+    return chart_rows
 
 def report_period_range_label(inicio, fim, periodo):
     if inicio and fim:
@@ -6498,6 +6652,8 @@ def build_contract_report_context(args, forced_granularity=None):
     )
     por_cliente = report_dimension_rows(contratos, lambda item: item.get("cliente_nome"), total_brl)
     por_banco = report_dimension_rows(contratos, lambda item: item.get("banco_recebedor"), total_brl)
+    por_empresa_grafico = report_company_chart_rows(por_empresa)
+    por_trading = report_dimension_rows_by_total(por_cliente)
     selected_empresa = next((item for item in empresas if item["id"] == filters["empresa_id"]), None)
     selected_competencia = next((item for item in competencias if item["id"] == filters["competencia_id"]), None)
     empresa_label = ((selected_empresa["apelido"] or selected_empresa["razao_social"])
@@ -6516,9 +6672,204 @@ def build_contract_report_context(args, forced_granularity=None):
         "empresas": empresas, "competencias": competencias,
         "empresa_label": empresa_label, "safra_label": safra_label,
         "kpis": kpis, "stats": stats,
-        "por_empresa": por_empresa, "por_cliente": por_cliente, "por_banco": por_banco,
+        "por_empresa": por_empresa, "por_empresa_grafico": por_empresa_grafico,
+        "por_cliente": por_cliente, "por_trading": por_trading, "por_banco": por_banco,
         "data_emissao": datetime.now().strftime("%d/%m/%Y %H:%M"),
     }
+
+
+CONTRACT_REPORT_EXCEL_DEFINITIONS = {
+    "resumo": {
+        "filename": "relatorio_contratos_resumo.xlsx",
+        "sheet_name": "Resumo do período",
+        "columns": (
+            "Período", "Moeda", "Contratos Câmbio", "Volume em moeda",
+            "Total BRL", "Taxa média ponderada", "Resultado (R$)",
+            "Resultado acumulado",
+        ),
+        "number_formats": {
+            "Contratos Câmbio": "0",
+            "Volume em moeda": "#,##0.00",
+            "Total BRL": "#,##0.00",
+            "Taxa média ponderada": "0.0000",
+            "Resultado (R$)": "#,##0.00",
+            "Resultado acumulado": "#,##0.00",
+        },
+    },
+    "mensal": {
+        "filename": "relatorio_contratos_mensal.xlsx",
+        "sheet_name": "Resumo Mensal",
+        "columns": (
+            "Mês", "Moeda", "Contratos Câmbio", "Volume em moeda",
+            "Total BRL", "Taxa média ponderada", "Resultado (R$)",
+            "Resultado acumulado",
+        ),
+        "number_formats": {
+            "Contratos Câmbio": "0",
+            "Volume em moeda": "#,##0.00",
+            "Total BRL": "#,##0.00",
+            "Taxa média ponderada": "0.0000",
+            "Resultado (R$)": "#,##0.00",
+            "Resultado acumulado": "#,##0.00",
+        },
+    },
+    "diario": {
+        "filename": "relatorio_contratos_diario.xlsx",
+        "sheet_name": "Detalhamento Diário",
+        "columns": (
+            "Data", "Moeda", "Contratos Câmbio", "Volume em moeda",
+            "Total BRL", "Taxa média ponderada", "PTAX BACEN do dia",
+            "Resultado (R$)", "Resultado acumulado",
+        ),
+        "number_formats": {
+            "Contratos Câmbio": "0",
+            "Volume em moeda": "#,##0.00",
+            "Total BRL": "#,##0.00",
+            "Taxa média ponderada": "0.0000",
+            "PTAX BACEN do dia": "0.0000",
+            "Resultado (R$)": "#,##0.00",
+            "Resultado acumulado": "#,##0.00",
+        },
+    },
+    "contratos": {
+        "filename": "relatorio_contratos_detalhamento.xlsx",
+        "sheet_name": "Por Contrato",
+        "columns": (
+            "Contrato Câmbio", "Categoria Câmbio", "Data", "Moeda", "Volume",
+            "Valor BRL", "Fechamento", "PTAX BACEN", "Resultado (R$)",
+        ),
+        "number_formats": {
+            "Volume": "#,##0.00",
+            "Valor BRL": "#,##0.00",
+            "Fechamento": "0.0000",
+            "PTAX BACEN": "0.0000",
+            "Resultado (R$)": "#,##0.00",
+        },
+    },
+}
+
+
+def contract_report_excel_value(value):
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
+def contract_report_excel_date(value):
+    return report_date(value) or value
+
+
+def contract_report_excel_rows(context, table):
+    if table == "resumo":
+        return [
+            {
+                "Período": item["rotulo"],
+                "Moeda": item["moeda"],
+                "Contratos Câmbio": item["resumo"]["contratos"],
+                "Volume em moeda": contract_report_excel_value(item["resumo"]["volume"]),
+                "Total BRL": contract_report_excel_value(item["resumo"]["brl_total"]),
+                "Taxa média ponderada": contract_report_excel_value(item["resumo"]["taxa_ponderada"]),
+                "Resultado (R$)": contract_report_excel_value(item["resumo"]["resultado"]),
+                "Resultado acumulado": contract_report_excel_value(item["resumo"]["resultado_acumulado"]),
+            }
+            for item in context["agrupados"]
+        ]
+
+    if table == "mensal":
+        rows = []
+        for (periodo, moeda), resumo in context["mensais"]:
+            current = report_date(periodo)
+            rows.append({
+                "Mês": current.strftime("%m/%Y") if current else periodo,
+                "Moeda": moeda,
+                "Contratos Câmbio": resumo["contratos"],
+                "Volume em moeda": contract_report_excel_value(resumo["volume"]),
+                "Total BRL": contract_report_excel_value(resumo["brl_total"]),
+                "Taxa média ponderada": contract_report_excel_value(resumo["taxa_ponderada"]),
+                "Resultado (R$)": contract_report_excel_value(resumo["resultado"]),
+                "Resultado acumulado": contract_report_excel_value(resumo["resultado_acumulado"]),
+            })
+        return rows
+
+    if table == "diario":
+        return [
+            {
+                "Data": contract_report_excel_date(periodo),
+                "Moeda": moeda,
+                "Contratos Câmbio": resumo["contratos"],
+                "Volume em moeda": contract_report_excel_value(resumo["volume"]),
+                "Total BRL": contract_report_excel_value(resumo["brl_total"]),
+                "Taxa média ponderada": contract_report_excel_value(resumo["taxa_ponderada"]),
+                "PTAX BACEN do dia": contract_report_excel_value(resumo["ptax_dia"]),
+                "Resultado (R$)": contract_report_excel_value(resumo["resultado"]),
+                "Resultado acumulado": contract_report_excel_value(resumo["resultado_acumulado"]),
+            }
+            for (periodo, moeda), resumo in context["diarios"]
+        ]
+
+    if table == "contratos":
+        return [
+            {
+                "Contrato Câmbio": item["numero_contrato"],
+                "Categoria Câmbio": item["categoria_cambio"],
+                "Data": contract_report_excel_date(item.get("data_contrato")),
+                "Moeda": item["moeda"],
+                "Volume": contract_report_excel_value(item["valor_moeda"]),
+                "Valor BRL": contract_report_excel_value(item["valor_brl"]),
+                "Fechamento": contract_report_excel_value(item["taxa_cambio"]),
+                "PTAX BACEN": contract_report_excel_value(item["ptax_venda"]),
+                "Resultado (R$)": contract_report_excel_value(item["resultado"]),
+            }
+            for item in context["contratos"]
+        ]
+
+    raise ValueError("Tabela de relatório inválida.")
+
+
+def exportar_relatorio_contratos_excel(table, args):
+    import pandas as pd
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    definition = CONTRACT_REPORT_EXCEL_DEFINITIONS.get(table)
+    if definition is None:
+        raise ValueError("Tabela de relatório inválida.")
+
+    context = build_contract_report_context(args)
+    data = contract_report_excel_rows(context, table)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        dataframe = pd.DataFrame(data, columns=definition["columns"])
+        dataframe.to_excel(writer, index=False, sheet_name=definition["sheet_name"])
+        worksheet = writer.book[definition["sheet_name"]]
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1769AA")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        headers = {cell.value: cell.column for cell in worksheet[1]}
+        for label, number_format in definition["number_formats"].items():
+            column = headers[label]
+            for row in worksheet.iter_rows(min_row=2, min_col=column, max_col=column):
+                row[0].number_format = number_format
+        if "Data" in headers:
+            column = headers["Data"]
+            for row in worksheet.iter_rows(min_row=2, min_col=column, max_col=column):
+                row[0].number_format = "dd/mm/yyyy"
+        for column in worksheet.columns:
+            letter = get_column_letter(column[0].column)
+            width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 12), 42)
+            worksheet.column_dimensions[letter].width = width
+    output.seek(0)
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name=definition["filename"],
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 CONTRACT_LINK_REPORT_COLUMNS = (
@@ -6815,6 +7166,17 @@ def relatorios_contratos():
         return redirect(url_for("relatorios_contratos"))
     return render_template("contratos_relatorios.html", **context)
 
+
+@app.route("/contratos/relatorios/exportar/<tabela>")
+def exportar_relatorio_contratos(tabela):
+    if tabela not in CONTRACT_REPORT_EXCEL_DEFINITIONS:
+        return "Tabela de relatório inválida.", 404
+    try:
+        return exportar_relatorio_contratos_excel(tabela, request.args)
+    except ValueError as exc:
+        return str(exc), 400
+
+
 def report_pdf_fonts():
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
@@ -6908,53 +7270,91 @@ def report_pdf_kpis(story, kpis, styles, available_width):
     from reportlab.lib import colors
     from reportlab.platypus import Table, TableStyle
 
-    rates = "<br/>".join(
-        f"{item['moeda']}: {report_pdf_paragraph(item['valor'], styles['DuePdfKpiValue']).getPlainText() if item['valor'] is not None else '-'}"
+    rates = "\n".join(
+        f"{item['moeda']}: {rate(item['valor']) if item['valor'] is not None else '-'}"
         for item in kpis["taxas"]
     ) or "-"
-    values = [
-        ("Total USD fechado", money(kpis["total_usd"]), "#EAF3FA"),
-        ("Total BRL", money(kpis["total_brl"]), "#FFF5D6"),
-        ("Taxa ponderada", rates, "#E5F4E8"),
-        ("Resultado financeiro vs PTAX", money(kpis["resultado"]) if kpis["resultado"] is not None else "-", "#EAF3FA"),
-        ("Quantidade de operações", str(kpis["operacoes"]), "#FFF5D6"),
-        ("Dias com operação", str(kpis["dias"]), "#E5F4E8"),
-        ("Volume médio/operação USD", money(kpis["media_usd_operacao"]), "#EAF3FA"),
-        ("Volume médio/operação BRL", money(kpis["media_brl_operacao"]), "#FFF5D6"),
-        ("Volume médio/dia USD", money(kpis["media_usd_dia"]), "#E5F4E8"),
-        ("Volume médio/dia BRL", money(kpis["media_brl_dia"]), "#EAF3FA"),
-    ]
-    cards = []
-    card_width = available_width / 5
-    for label, value, background in values:
-        value_html = value if label == "Taxa ponderada" else report_pdf_paragraph(value, styles["DuePdfKpiValue"]).getPlainText()
-        card = Table([[report_pdf_paragraph(label, styles["DuePdfKpiLabel"]),
-                       report_pdf_paragraph(value_html, styles["DuePdfKpiValue"])]] ,
-                     colWidths=[card_width * .65, card_width * .35])
+    pair_width = (available_width - 8) / 2
+
+    def kpi_card(label, value, background, width, centered=False):
+        card = Table([
+            [report_pdf_paragraph(label, styles["DuePdfKpiLabel"])],
+            [report_pdf_paragraph(value, styles["DuePdfKpiValue"])],
+        ], colWidths=[width])
         card.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(background)),
             ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#D8E1E8")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER" if centered else "LEFT"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 7),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 7),
             ("TOPPADDING", (0, 0), (-1, -1), 5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ]))
-        cards.append(card)
-    rows = []
-    for index in range(0, len(cards), 5):
-        row = cards[index:index + 5]
-        while len(row) < 5:
-            row.append("")
-        rows.append(row)
-    table = Table(rows, colWidths=[card_width] * 5, hAlign="LEFT")
-    table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
-                               ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                               ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-                               ("TOPPADDING", (0, 0), (-1, -1), 0),
-                               ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+        return card
+
+    def kpi_pair(left, right):
+        table = Table([[left, right]], colWidths=[pair_width, pair_width], hAlign="LEFT")
+        table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (0, -1), 4),
+            ("LEFTPADDING", (1, 0), (1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        return table
+
     story.append(report_pdf_paragraph("Indicadores do período", styles["DuePdfSection"], bold=True))
-    story.append(table)
+    story.append(kpi_pair(
+        kpi_card("Total USD fechado", money(kpis["total_usd"]), "#EAF3FA", pair_width),
+        kpi_card("Total BRL", money(kpis["total_brl"]), "#FFF5D6", pair_width),
+    ))
+    story.append(kpi_pair(
+        kpi_card("TAXA PONDERADA", rates, "#E5F4E8", pair_width, centered=True),
+        kpi_card("Resultado acumulado x PTAX", money(kpis["resultado_acumulado"]) if kpis["resultado_acumulado"] is not None else "-", "#EAF3FA", pair_width),
+    ))
+    story.append(kpi_pair(
+        kpi_card("Quantidade de operações", str(kpis["operacoes"]), "#E5F4E8", pair_width),
+        kpi_card("Dias com operação", str(kpis["dias"]), "#EAF3FA", pair_width),
+    ))
+    story.append(kpi_pair(
+        kpi_card("Volume médio/operação USD", money(kpis["media_usd_operacao"]), "#EAF3FA", pair_width),
+        kpi_card("Volume médio/operação BRL", money(kpis["media_brl_operacao"]), "#FFF5D6", pair_width),
+    ))
+    story.append(kpi_pair(
+        kpi_card("Volume médio/dia USD", money(kpis["media_usd_dia"]), "#E5F4E8", pair_width),
+        kpi_card("Volume médio/dia BRL", money(kpis["media_brl_dia"]), "#EAF3FA", pair_width),
+    ))
+
+def report_pdf_company_bar_drawing(rows, styles, width=790):
+    from reportlab.graphics.shapes import Drawing, Line, Rect, String
+    from reportlab.lib import colors
+
+    if not rows:
+        return None
+    row_height = 24
+    height = max(48, len(rows) * row_height + 10)
+    left, right = 132, width - 10
+    track_width = right - left
+    drawing = Drawing(width, height)
+    for index, row in enumerate(rows):
+        y = height - (index + 1) * row_height + 5
+        drawing.add(String(0, y + 5, str(row["nome"]),
+                          fontName=styles["DuePdfChartLabel"].fontName,
+                          fontSize=6.5, fillColor=colors.HexColor("#557084")))
+        drawing.add(Rect(left, y, track_width, 14,
+                         fillColor=colors.HexColor("#F4F7F9"),
+                         strokeColor=colors.HexColor("#D8E1E8"), strokeWidth=0.4))
+        fill_width = max(2.0, track_width * float(row["bar_width"]) / 100) if row["total_brl"] else 2.0
+        drawing.add(Rect(left, y, fill_width, 14,
+                         fillColor=colors.HexColor(row["bar_color"]), strokeColor=None))
+        drawing.add(String(left + fill_width / 2, y + 4, row["total_label"],
+                          fontName=styles["DuePdfKpiValue"].fontName,
+                          fontSize=6.5, textAnchor="middle",
+                          fillColor=colors.HexColor(row["label_color"])))
+    drawing.add(Line(left, 2, right, 2, strokeColor=colors.HexColor("#CBD7E2"), strokeWidth=0.5))
+    return drawing
 
 def report_pdf_chart_drawing(grafico, styles, width=790, height=175):
     from reportlab.graphics.shapes import Drawing, Line, PolyLine, String
@@ -7055,16 +7455,28 @@ def render_contract_report_pdf(rendered_html, context):
     report_pdf_kpis(story, context["kpis"], styles, available_width)
     story.append(Spacer(1, 2))
 
-    report_pdf_table(story, "Fechamentos por Empresa",
-                     ["Empresa", "Total USD", "Total BRL", "Participação %"],
-                     [[item["nome"], money(item["total_usd"]), money(item["total_brl"]), report_pdf_percent(item["participacao"])]
-                      for item in context["por_empresa"]],
-                     [available_width * .43, available_width * .18, available_width * .21, available_width * .18], styles,
-                     accent="#EAF3FA")
-    report_pdf_table(story, "Fechamentos por Cliente",
-                     ["Cliente", "Total USD", "Total BRL", "Participação %"],
-                     [[item["nome"], money(item["total_usd"]), money(item["total_brl"]), report_pdf_percent(item["participacao"])]
-                      for item in context["por_cliente"]],
+    story.append(report_pdf_paragraph("Fechamentos por Empresa — total BRL em milhões",
+                                      styles["DuePdfSection"], bold=True))
+    company_chart = report_pdf_company_bar_drawing(context["por_empresa_grafico"], styles, available_width)
+    if company_chart:
+        story.append(company_chart)
+    else:
+        story.append(report_pdf_paragraph("Nenhum registro encontrado para os filtros informados.", styles["DuePdfSmall"]))
+
+    trading_rows = [
+        [item["nome"], money(item["total_usd"]), money(item["total_brl"]), report_pdf_percent(item["participacao"])]
+        for item in context["por_trading"]
+    ]
+    if trading_rows:
+        trading_rows.append([
+            "TOTAL GERAL",
+            money(context["kpis"]["total_usd"]),
+            money(context["kpis"]["total_brl"]),
+            report_pdf_percent(100 if context["kpis"]["total_brl"] else 0),
+        ])
+    report_pdf_table(story, "Fechamentos por trading/cliente",
+                     ["TRADING/CLIENTE", "TOTAL USD", "TOTAL BRL", "%"],
+                     trading_rows,
                      [available_width * .43, available_width * .18, available_width * .21, available_width * .18], styles,
                      accent="#FFF5D6")
     report_pdf_table(story, "Fechamentos por Banco Recebedor",
@@ -7082,14 +7494,15 @@ def render_contract_report_pdf(rendered_html, context):
                       ["Resultado acumulado", money(context["stats"]["resultado_acumulado"]) if context["stats"]["resultado_acumulado"] is not None else "-"]],
                      [available_width * .68, available_width * .32], styles, accent="#FFF5D6")
     report_pdf_table(story, f"Fechamentos por período — {context['agrupamento_label']}",
-                     ["Período", "Moeda", "Operações", "Volume", "Taxa ponderada", "Resultado acumulado", "Resultado (R$)"],
+                     ["Período", "Moeda", "Operações", "Volume", "Total BRL", "Taxa ponderada", "Resultado acumulado", "Resultado (R$)"],
                      [[item["rotulo"], item["moeda"], item["resumo"]["contratos"], money(item["resumo"]["volume"]),
+                       money(item["resumo"]["brl_total"]),
                        rate(item["resumo"]["taxa_ponderada"]) if item["resumo"]["taxa_ponderada"] is not None else "-",
                        money(item["resumo"]["resultado_acumulado"]) if item["resumo"].get("resultado_acumulado") is not None else "-",
                        money(item["resumo"]["resultado"]) if item["resumo"]["resultado"] is not None else "-"]
                       for item in context["periodos"]],
-                     [available_width * .19, available_width * .09, available_width * .10, available_width * .16,
-                      available_width * .14, available_width * .17, available_width * .15], styles,
+                     [available_width * .17, available_width * .08, available_width * .09, available_width * .13,
+                      available_width * .14, available_width * .12, available_width * .15, available_width * .12], styles,
                      accent="#EAF3FA")
 
     story.append(report_pdf_paragraph("Evolução por período — Taxa ponderada × PTAX BACEN", styles["DuePdfSection"], bold=True))
@@ -9300,7 +9713,7 @@ def importar_dues():
                             f"o cliente '{cliente_input}' corresponde a mais de um cliente cadastrado"
                         )
                     raise ValueError(
-                        f"o cliente '{cliente_input}' nÃ£o estÃ¡ cadastrado; "
+                        f"o cliente '{cliente_input}' não está cadastrado; "
                         "use o nome de um cliente cadastrado"
                     )
                 cliente_id = cliente_registro["id"]

@@ -11,31 +11,24 @@
     <section class="pdf-kpis" data-report-section="kpis">
       <h2>Indicadores do período</h2>
       <div class="pdf-kpi-grid">
-        <div class="pdf-kpi"><span>Total USD fechado</span><strong>{{ kpis.total_usd|money }}</strong></div>
-        <div class="pdf-kpi"><span>Total BRL</span><strong>{{ kpis.total_brl|money }}</strong></div>
-        <div class="pdf-kpi"><span>Taxa ponderada</span><strong>{% for taxa in kpis.taxas %}{{ taxa.moeda }}: {{ taxa.valor|rate if taxa.valor is not none else '-' }}{% if not loop.last %}<br>{% endif %}{% else %}-{% endfor %}</strong></div>
-        <div class="pdf-kpi"><span>Resultado financeiro vs PTAX</span><strong>{{ kpis.resultado|money if kpis.resultado is not none else '-' }}</strong></div>
-        <div class="pdf-kpi"><span>Resultado acumulado</span><strong>{{ kpis.resultado_acumulado|money if kpis.resultado_acumulado is not none else '-' }}</strong></div>
-        <div class="pdf-kpi"><span>Quantidade de operações</span><strong>{{ kpis.operacoes }}</strong></div>
-        <div class="pdf-kpi"><span>Dias com operação</span><strong>{{ kpis.dias }}</strong></div>
-        <div class="pdf-kpi"><span>Volume médio/operação USD</span><strong>{{ kpis.media_usd_operacao|money }}</strong></div>
-        <div class="pdf-kpi"><span>Volume médio/operação BRL</span><strong>{{ kpis.media_brl_operacao|money }}</strong></div>
-        <div class="pdf-kpi"><span>Volume médio/dia USD</span><strong>{{ kpis.media_usd_dia|money }}</strong></div>
-        <div class="pdf-kpi"><span>Volume médio/dia BRL</span><strong>{{ kpis.media_brl_dia|money }}</strong></div>
+        <div class="pdf-kpi-pair"><div class="pdf-kpi"><span>Total USD fechado</span><strong>{{ kpis.total_usd|money }}</strong></div><div class="pdf-kpi"><span>Total BRL</span><strong>{{ kpis.total_brl|money }}</strong></div></div>
+        <div class="pdf-kpi-featured-pair"><div class="pdf-kpi pdf-kpi-rate"><span>TAXA PONDERADA</span><strong>{% for taxa in kpis.taxas %}{{ taxa.moeda }}: {{ taxa.valor|rate if taxa.valor is not none else '-' }}{% if not loop.last %}<br>{% endif %}{% else %}-{% endfor %}</strong></div><div class="pdf-kpi pdf-kpi-result"><span>Resultado acumulado x PTAX</span><strong>{{ kpis.resultado_acumulado|money if kpis.resultado_acumulado is not none else '-' }}</strong></div></div>
+        <div class="pdf-kpi-pair"><div class="pdf-kpi"><span>Quantidade de operações</span><strong>{{ kpis.operacoes }}</strong></div><div class="pdf-kpi"><span>Dias com operação</span><strong>{{ kpis.dias }}</strong></div></div>
+        <div class="pdf-kpi-pair"><div class="pdf-kpi"><span>Volume médio/operação USD</span><strong>{{ kpis.media_usd_operacao|money }}</strong></div><div class="pdf-kpi"><span>Volume médio/operação BRL</span><strong>{{ kpis.media_brl_operacao|money }}</strong></div></div>
+        <div class="pdf-kpi-pair"><div class="pdf-kpi"><span>Volume médio/dia USD</span><strong>{{ kpis.media_usd_dia|money }}</strong></div><div class="pdf-kpi"><span>Volume médio/dia BRL</span><strong>{{ kpis.media_brl_dia|money }}</strong></div></div>
       </div>
     </section>
 
     <section data-report-section="empresa" data-title="Fechamentos por Empresa">
-      <h2>Fechamentos por Empresa</h2>
-      <table><thead><tr><th>Empresa</th><th>Total USD</th><th>Total BRL</th><th>Participação %</th></tr></thead><tbody>
-        {% for item in por_empresa %}<tr><td>{{ item.nome }}</td><td>{{ item.total_usd|money }}</td><td>{{ item.total_brl|money }}</td><td>{{ '%.1f'|format(item.participacao|float) }}%</td></tr>{% else %}<tr><td colspan="4">Nenhum registro encontrado.</td></tr>{% endfor %}
-      </tbody></table>
+      <h2>Fechamentos por Empresa — total BRL em milhões</h2>
+      <div class="pdf-company-bars">{% for item in por_empresa_grafico %}<div><span>{{ item.nome }}</span><strong>{{ item.total_label }}</strong></div>{% else %}<p>Nenhum registro encontrado.</p>{% endfor %}</div>
     </section>
 
-    <section data-report-section="cliente" data-title="Fechamentos por Cliente">
-      <h2>Fechamentos por Cliente</h2>
-      <table><thead><tr><th>Cliente</th><th>Total USD</th><th>Total BRL</th><th>Participação %</th></tr></thead><tbody>
-        {% for item in por_cliente %}<tr><td>{{ item.nome }}</td><td>{{ item.total_usd|money }}</td><td>{{ item.total_brl|money }}</td><td>{{ '%.1f'|format(item.participacao|float) }}%</td></tr>{% else %}<tr><td colspan="4">Nenhum registro encontrado.</td></tr>{% endfor %}
+    <section data-report-section="trading" data-title="Fechamentos por trading/cliente">
+      <h2>Fechamentos por trading/cliente</h2>
+      <table><thead><tr><th>TRADING/CLIENTE</th><th>TOTAL USD</th><th>TOTAL BRL</th><th>%</th></tr></thead><tbody>
+        {% for item in por_trading %}<tr><td>{{ item.nome }}</td><td>{{ item.total_usd|money }}</td><td>{{ item.total_brl|money }}</td><td>{{ item.participacao_label }}</td></tr>{% else %}<tr><td colspan="4">Nenhum registro encontrado.</td></tr>{% endfor %}
+        {% if por_trading %}<tr><th>TOTAL GERAL</th><th>{{ kpis.total_usd|money }}</th><th>{{ kpis.total_brl|money }}</th><th>{{ '100,0%' if kpis.total_brl else '0,0%' }}</th></tr>{% endif %}
       </tbody></table>
     </section>
 
@@ -58,8 +51,8 @@
 
     <section data-report-section="periodos" data-title="Fechamentos por período">
       <h2>Fechamentos por período — {{ agrupamento_label }}</h2>
-      <table><thead><tr><th>Período</th><th>Moeda</th><th>Operações</th><th>Volume</th><th>Taxa ponderada</th><th>Resultado (R$)</th><th>Resultado acumulado</th></tr></thead><tbody>
-        {% for item in periodos %}<tr><td>{{ item.rotulo }}</td><td>{{ item.moeda }}</td><td>{{ item.resumo.contratos }}</td><td>{{ item.resumo.volume|money }}</td><td>{{ item.resumo.taxa_ponderada|rate if item.resumo.taxa_ponderada is not none else '-' }}</td><td>{{ item.resumo.resultado|money if item.resumo.resultado is not none else '-' }}</td><td>{{ item.resumo.resultado_acumulado|money if item.resumo.resultado_acumulado is not none else '-' }}</td></tr>{% else %}<tr><td colspan="7">Nenhum registro de Contrato Câmbio encontrado.</td></tr>{% endfor %}
+      <table><thead><tr><th>Período</th><th>Moeda</th><th>Operações</th><th>Volume</th><th>Total BRL</th><th>Taxa ponderada</th><th>Resultado (R$)</th><th>Resultado acumulado</th></tr></thead><tbody>
+        {% for item in periodos %}<tr><td>{{ item.rotulo }}</td><td>{{ item.moeda }}</td><td>{{ item.resumo.contratos }}</td><td>{{ item.resumo.volume|money }}</td><td>{{ item.resumo.brl_total|money }}</td><td>{{ item.resumo.taxa_ponderada|rate if item.resumo.taxa_ponderada is not none else '-' }}</td><td>{{ item.resumo.resultado|money if item.resumo.resultado is not none else '-' }}</td><td>{{ item.resumo.resultado_acumulado|money if item.resumo.resultado_acumulado is not none else '-' }}</td></tr>{% else %}<tr><td colspan="8">Nenhum registro de Contrato Câmbio encontrado.</td></tr>{% endfor %}
       </tbody></table>
     </section>
 
