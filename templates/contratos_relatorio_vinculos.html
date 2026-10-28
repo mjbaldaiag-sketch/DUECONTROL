@@ -20,7 +20,7 @@
     <label>Período inicial<input name="data_de" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ data_de }}"></label>
     <label>Período final<input name="data_ate" data-date-br placeholder="dd/mm/aaaa" inputmode="numeric" value="{{ data_ate }}"></label>
     <label>Contrato Câmbio<input name="numero_contrato" value="{{ numero_contrato }}" placeholder="Pesquisar número"></label>
-    <label>Moeda<select name="moeda"><option value="">Todas</option>{% for item in moedas %}<option value="{{ item }}" {{ 'selected' if moeda == item else '' }}>{{ item }}</option>{% endfor %}</select></label>
+    <label>Moeda<select name="moeda" class="currency-filter {{ moeda|currency_class }}" data-currency-filter><option value="">Todas</option>{% for item in moedas %}<option value="{{ item }}" {{ 'selected' if moeda == item else '' }}>{{ item }}</option>{% endfor %}</select></label>
     <div class="filter-actions"><button type="submit">Aplicar filtros</button><button class="secondary" type="submit" formaction="{{ url_for('exportar_relatorio_vinculos_contratos') }}">Exportar Excel</button><a class="btn secondary" href="{{ url_for('relatorio_vinculos_contratos') }}">Limpar filtros</a></div>
   </form>
 
@@ -36,10 +36,10 @@
   <section class="report-section">
     <div class="table-wrap">
       <table class="compact-table contract-link-report-table" data-sortable-server>
-        <thead><tr>{{ sortable_header('EMPRESA', 'empresa', sort, direction, sort_links) }}{{ sortable_header('DATA LANÇAMENTO', 'data_lancamento', sort, direction, sort_links, 'date') }}{{ sortable_header('CNPJ', 'cnpj', sort, direction, sort_links) }}{{ sortable_header('BANCO', 'banco', sort, direction, sort_links) }}{{ sortable_header('CONTRATO', 'contrato', sort, direction, sort_links) }}{{ sortable_header('VALOR EM USD', 'valor_usd', sort, direction, sort_links, 'number') }}{{ sortable_header('TRADING', 'trading', sort, direction, sort_links) }}{{ sortable_header('DUE', 'due', sort, direction, sort_links) }}{{ sortable_header('CHAVE DE ACESSO', 'chave_acesso', sort, direction, sort_links) }}{{ sortable_header('VALOR UTILIZADO', 'valor_utilizado', sort, direction, sort_links, 'number') }}</tr></thead>
+        <thead><tr>{{ sortable_header('EMPRESA', 'empresa', sort, direction, sort_links) }}{{ sortable_header('DATA LANÇAMENTO', 'data_lancamento', sort, direction, sort_links, 'date') }}{{ sortable_header('CNPJ', 'cnpj', sort, direction, sort_links) }}{{ sortable_header('BANCO', 'banco', sort, direction, sort_links) }}{{ sortable_header('CONTRATO', 'contrato', sort, direction, sort_links) }}{{ sortable_header('VALOR EM', 'valor_usd', sort, direction, sort_links, 'number', 'USD') }}{{ sortable_header('TRADING', 'trading', sort, direction, sort_links) }}{{ sortable_header('DUE', 'due', sort, direction, sort_links) }}{{ sortable_header('CHAVE DE ACESSO', 'chave_acesso', sort, direction, sort_links) }}{{ sortable_header('VALOR UTILIZADO', 'valor_utilizado', sort, direction, sort_links, 'number') }}</tr></thead>
         <tbody>
         {% for vinculo in vinculos %}
-          <tr><td>{{ vinculo.empresa }}</td><td data-sort-value="{{ vinculo.data_lancamento or '' }}">{{ vinculo.data_lancamento|date_br or '-' }}</td><td>{{ vinculo.cnpj }}</td><td>{{ vinculo.banco }}</td><td>{{ vinculo.contrato }}</td><td data-sort-value="{{ vinculo.valor_usd }}">{{ vinculo.valor_usd|money }}</td><td>{{ vinculo.trading }}</td><td>{{ vinculo.due }}</td><td>{{ vinculo.chave_acesso }}</td><td data-sort-value="{{ vinculo.valor_utilizado }}">{{ vinculo.valor_utilizado|money }}</td></tr>
+          <tr><td>{{ vinculo.empresa }}</td><td data-sort-value="{{ vinculo.data_lancamento or '' }}">{{ vinculo.data_lancamento|date_br or '-' }}</td><td>{{ vinculo.cnpj }}</td><td>{{ vinculo.banco }}</td><td>{{ vinculo.contrato }}</td><td data-sort-value="{{ vinculo.valor_usd }}">{{ vinculo.valor_usd|currency_amount('USD') }}</td><td>{{ vinculo.trading }}</td><td>{{ vinculo.due }}</td><td>{{ vinculo.chave_acesso }}</td><td data-sort-value="{{ vinculo.valor_utilizado }}">{{ vinculo.valor_utilizado|currency_amount('USD') }}</td></tr>
         {% else %}
           <tr><td class="empty" colspan="10">Nenhum vínculo encontrado para os filtros informados.</td></tr>
         {% endfor %}

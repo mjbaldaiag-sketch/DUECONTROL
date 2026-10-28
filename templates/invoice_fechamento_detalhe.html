@@ -5,17 +5,17 @@
   <div><span>Empresa</span><strong>{{ fechamento.empresa_apelido or fechamento.empresa_razao_social or '-' }}</strong></div>
   <div><span>Cliente</span><strong>{{ fechamento.cliente_nome }}</strong></div>
   <div><span>Banco de Crédito</span><strong>{{ fechamento.banco_credito_nome }}</strong></div>
-  <div><span>Moeda / Total</span><strong>{{ fechamento.moeda }} {{ fechamento.valor_moeda|money }}</strong> <button type="button" class="copy-data-btn" data-copy-value="{{ fechamento.moeda }} {{ fechamento.valor_moeda|money }}" aria-label="Copiar moeda e total" title="Copiar moeda e total"><span class="copy-icon" aria-hidden="true"><svg viewBox="0 0 20 20" focusable="false"><rect x="6" y="6" width="10" height="10" rx="1"></rect><path d="M4 14H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path></svg></span></button></div>
+  <div><span>Moeda / Total</span><strong>{{ fechamento.valor_moeda|currency_amount(fechamento.moeda) }}</strong> <button type="button" class="copy-data-btn" data-copy-value="{{ fechamento.moeda }} {{ fechamento.valor_moeda|money }}" aria-label="Copiar moeda e total" title="Copiar moeda e total"><span class="copy-icon" aria-hidden="true"><svg viewBox="0 0 20 20" focusable="false"><rect x="6" y="6" width="10" height="10" rx="1"></rect><path d="M4 14H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"></path></svg></span></button></div>
   <div><span>Categoria Câmbio</span><strong>{{ fechamento.categoria_cambio }}</strong></div>
   {% if fechamento.categoria_cambio == 'Câmbio Exportação' %}<div><span>PREVISÃO EMBARQUE</span><strong>{{ fechamento.previsao_embarque_dias ~ ' dias' if fechamento.previsao_embarque_dias is not none else '-' }}</strong></div>{% endif %}
   <div><span>Taxa</span><strong>{{ fechamento.taxa_cambio|rate if fechamento.taxa_cambio is not none else '-' }}</strong></div>
-  <div><span>Valor em BRL</span><strong>{{ fechamento.valor_brl|money if fechamento.valor_brl is not none else '-' }}</strong></div>
+  <div><span>Valor em <span class="currency-badge currency--brl">BRL</span></span><strong>{{ fechamento.valor_brl|currency_amount('BRL') if fechamento.valor_brl is not none else '-' }}</strong></div>
   <div><span>Data de Fechamento</span><strong>{{ fechamento.data_fechamento|date_br }}</strong></div>
   <div><span>Data de Liquidação</span><strong>{{ fechamento.data_liquidacao|date_br }}</strong></div>
   <div><span>Banco de Liquidação</span><strong>{{ fechamento.banco_liquidacao_nome }}</strong></div>
 </div>
 <h2>Invoices participantes</h2>
-<div class="table-wrap"><table class="compact-table"><thead><tr><th>Invoice</th><th>Empresa</th><th>Moeda</th><th>Valor</th></tr></thead><tbody>{% for item in fechamento['items'] %}<tr><td><a href="{{ url_for('detalhe_invoice', invoice_id=item.invoice_id) }}">{{ item.numero_invoice }}</a></td><td>{{ item.empresa_apelido or item.empresa_razao_social }}</td><td>{{ item.invoice_moeda }}</td><td>{{ item.valor_moeda|money }}</td></tr>{% else %}<tr><td class="empty" colspan="4">Nenhuma Invoice vinculada.</td></tr>{% endfor %}</tbody></table></div>
+<div class="table-wrap"><table class="compact-table"><thead><tr><th>Invoice</th><th>Empresa</th><th>Moeda</th><th>Valor</th></tr></thead><tbody>{% for item in fechamento['items'] %}<tr><td><a href="{{ url_for('detalhe_invoice', invoice_id=item.invoice_id) }}">{{ item.numero_invoice }}</a></td><td>{{ item.empresa_apelido or item.empresa_razao_social }}</td><td><span class="currency-badge {{ item.invoice_moeda|currency_class }}">{{ item.invoice_moeda }}</span></td><td>{{ item.valor_moeda|currency_amount(item.invoice_moeda) }}</td></tr>{% else %}<tr><td class="empty" colspan="4">Nenhuma Invoice vinculada.</td></tr>{% endfor %}</tbody></table></div>
 {% set auxiliary = namespace(parts=[], invoice_numbers=[]) %}
 {% set cliente_nome = (fechamento.cliente_nome|string|trim) if fechamento.cliente_nome else '' %}
 {% if cliente_nome %}{% set _ = auxiliary.parts.append(cliente_nome) %}{% endif %}

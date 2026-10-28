@@ -19,7 +19,7 @@
       <div><span>Chave de acesso</span><strong>{{ due.chave_acesso or '-' }}</strong></div>
       <div><span>Status</span><strong><span class="status {{ due.status|status_class }}">{{ due.status or '-' }}</span></strong></div>
       <div><span>Cliente</span><strong>{{ due.cliente or '-' }}</strong></div>
-      <div><span>Moeda</span><strong>{{ due.moeda or '-' }}</strong></div>
+      <div><span>Moeda</span><strong><span class="currency-badge {{ due.moeda|currency_class }}">{{ due.moeda or '-' }}</span></strong></div>
       <div><span>Data de lançamento</span><strong>{{ due.created_at|date_br or '-' }}</strong></div>
     </div>
   </section>
@@ -27,9 +27,9 @@
   <section class="report-section">
     <h2>Resumo financeiro</h2>
     <div class="report-data">
-      <div><span>Valor original</span><strong>{{ due.valor_original|money }}</strong></div>
-      <div><span>Total utilizado</span><strong>{{ utilizado|money }}</strong></div>
-      <div><span>Saldo disponível</span><strong>{{ saldo|money }}</strong></div>
+      <div><span>Valor original</span><strong>{{ due.valor_original|currency_amount(due.moeda) }}</strong></div>
+      <div><span>Total utilizado</span><strong>{{ utilizado|currency_amount(due.moeda) }}</strong></div>
+      <div><span>Saldo disponível</span><strong>{{ saldo|currency_amount(due.moeda) }}</strong></div>
     </div>
   </section>
 
@@ -44,8 +44,8 @@
           <td>{{ m.tipo or '-' }}</td>
           <td>{{ m.numero_contrato or '-' }}</td>
           <td>{{ m.documento or '-' }}</td>
-          <td>{{ m.valor|money }}</td>
-          <td>{{ item.saldo|money }}</td>
+          <td>{{ m.valor|currency_amount(due.moeda) }}</td>
+          <td>{{ item.saldo|currency_amount(due.moeda) }}</td>
           <td>{{ m.observacao or '-' }}</td>
         </tr>
         {% else %}
@@ -61,7 +61,7 @@
       <thead><tr><th>Contrato Câmbio</th><th>Moeda</th><th>Valor vinculado</th><th>Observação</th></tr></thead>
       <tbody>
         {% for v in vinc %}
-        <tr><td>{{ v.numero_contrato or '-' }}</td><td>{{ v.moeda or '-' }}</td><td>{{ v.valor_calculado|money }}</td><td>{{ v.observacao or '-' }}</td></tr>
+        <tr><td>{{ v.numero_contrato or '-' }}</td><td><span class="currency-badge {{ v.moeda|currency_class }}">{{ v.moeda or '-' }}</span></td><td>{{ v.valor_calculado|currency_amount(v.moeda) }}</td><td>{{ v.observacao or '-' }}</td></tr>
         {% else %}
         <tr><td colspan="4" class="empty">Nenhum vínculo efetuado com Contrato Câmbio.</td></tr>
         {% endfor %}

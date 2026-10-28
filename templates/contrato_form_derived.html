@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="page-heading"><div><h1>Editar Contrato Câmbio {{ contrato.numero_contrato }}</h1><p class="muted">O valor e a moeda são consolidados pelas Invoices vinculadas.</p></div><a class="btn secondary" href="{{ url_for('detalhe_contrato', contrato_id=contrato.id) }}">Voltar</a></div>
-<div class="detail-grid"><div><span>Valor consolidado</span><strong>{{ resumo.valor_moeda|money }} {{ contrato.moeda }}</strong></div><div><span>Vínculos diretos DU-E</span><strong>{{ resumo.vinculado|money }}</strong></div><div><span>Saldo operacional</span><strong>{{ resumo.saldo|money }}</strong></div></div>
+<div class="detail-grid"><div><span>Valor consolidado</span><strong>{{ resumo.valor_moeda|currency_amount(contrato.moeda) }}</strong></div><div><span>Vínculos diretos DU-E</span><strong>{{ resumo.vinculado|currency_amount(contrato.moeda) }}</strong></div><div><span>Saldo operacional</span><strong>{{ resumo.saldo|currency_amount(contrato.moeda) }}</strong></div></div>
 <form method="post" class="form" data-previsao-embarque-form>
   <input type="hidden" name="derived_contract_form" value="1">
   <label>Número do Contrato Câmbio*<input name="numero_contrato" value="{{ contrato.numero_contrato }}" required></label>

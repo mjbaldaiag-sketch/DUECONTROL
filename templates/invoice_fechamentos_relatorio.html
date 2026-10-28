@@ -34,7 +34,7 @@
           <th class="closing-report-currency">Moeda</th>
           <th>Valor moeda</th>
           <th>Taxa</th>
-          <th>Valor em BRL</th>
+          <th>Valor em <span class="currency-badge currency--brl">BRL</span></th>
         </tr>
       </thead>
       <tbody>
@@ -50,10 +50,10 @@
           <td>{{ fechamento.banco_liquidacao_nome or '-' }}</td>
           <td>{{ fechamento.data_fechamento|date_br or '-' }}</td>
           <td>{{ fechamento.data_liquidacao|date_br or '-' }}</td>
-          <td class="closing-report-currency">{{ fechamento.moeda|upper if fechamento.moeda else '-' }}</td>
-          <td class="report-number">{{ fechamento.valor_moeda|money }}</td>
+          <td class="closing-report-currency"><span class="currency-badge {{ fechamento.moeda|currency_class }}">{{ fechamento.moeda|upper if fechamento.moeda else '-' }}</span></td>
+          <td class="report-number">{{ fechamento.valor_moeda|currency_amount(fechamento.moeda) }}</td>
           <td>{{ fechamento.taxa_cambio|rate if fechamento.taxa_cambio is not none else '-' }}</td>
-          <td class="report-number">{{ fechamento.valor_brl|money if fechamento.valor_brl is not none else '-' }}</td>
+          <td class="report-number">{{ fechamento.valor_brl|currency_amount('BRL') if fechamento.valor_brl is not none else '-' }}</td>
         </tr>
       {% else %}
         <tr><td class="empty" colspan="13">Nenhum Fechamento encontrado para os filtros informados.</td></tr>
@@ -62,9 +62,9 @@
       <tfoot>
         <tr class="closing-report-total-row">
           <td colspan="10"></td>
-          <td class="report-number">{% for total in totais_moeda %}{{ total.valor|money }}{% if not loop.last %} / {% endif %}{% else %}0,00{% endfor %}</td>
+          <td class="report-number">{% for total in totais_moeda %}{{ total.valor|currency_amount(total.moeda) }}{% if not loop.last %} / {% endif %}{% else %}0,00{% endfor %}</td>
           <td></td>
-          <th class="report-number">{{ total_brl|money }}</th>
+          <th class="report-number">{{ total_brl|currency_amount('BRL') }}</th>
         </tr>
       </tfoot>
     </table>
@@ -76,23 +76,23 @@
       <h2>TOTAL POR BANCO / EMPRESA</h2>
       <table class="compact-table closing-report-summary-table">
         <thead>
-          <tr><th>Banco / empresa / contrato</th><th>Total em BRL</th></tr>
+          <tr><th>Banco / empresa / contrato</th><th>Total em <span class="currency-badge currency--brl">BRL</span></th></tr>
         </thead>
         <tbody>
         {% for banco in resumo_banco_empresa %}
           <tr class="closing-report-bank-row">
             <th>TOTAL {{ banco.nome }}</th>
-            <td class="report-number">{{ banco.total_brl|money }}</td>
+            <td class="report-number">{{ banco.total_brl|currency_amount('BRL') }}</td>
           </tr>
           {% for empresa in banco.empresas %}
           <tr class="closing-report-company-row">
             <td class="closing-report-level-company">{{ empresa.nome }}</td>
-            <td class="report-number">{{ empresa.total_brl|money }}</td>
+            <td class="report-number">{{ empresa.total_brl|currency_amount('BRL') }}</td>
           </tr>
             {% for contrato in empresa.contratos %}
           <tr class="closing-report-contract-row">
             <td class="closing-report-level-contract">{{ contrato.nome }}</td>
-            <td class="report-number">{{ contrato.total_brl|money }}</td>
+            <td class="report-number">{{ contrato.total_brl|currency_amount('BRL') }}</td>
           </tr>
             {% endfor %}
           {% endfor %}
@@ -107,13 +107,13 @@
       <h2>TOTAL POR EMPRESA</h2>
       <table class="compact-table closing-report-summary-table closing-report-company-total-table">
         <thead>
-          <tr><th>Empresa</th><th>Total em BRL</th></tr>
+          <tr><th>Empresa</th><th>Total em <span class="currency-badge currency--brl">BRL</span></th></tr>
         </thead>
         <tbody>
         {% for empresa in totais_empresa %}
           <tr>
             <td>{{ empresa.nome }}</td>
-            <td class="report-number">{{ empresa.total_brl|money }}</td>
+            <td class="report-number">{{ empresa.total_brl|currency_amount('BRL') }}</td>
           </tr>
         {% else %}
           <tr><td class="empty" colspan="2">Nenhuma Empresa encontrada.</td></tr>
@@ -126,13 +126,13 @@
       <h2>TOTAL POR CLIENTE</h2>
       <table class="compact-table closing-report-summary-table closing-report-client-table">
         <thead>
-          <tr><th>Cliente</th><th>Total em BRL</th></tr>
+          <tr><th>Cliente</th><th>Total em <span class="currency-badge currency--brl">BRL</span></th></tr>
         </thead>
         <tbody>
         {% for cliente in totais_cliente %}
           <tr>
             <td>{{ cliente.nome }}</td>
-            <td class="report-number">{{ cliente.total_brl|money }}</td>
+            <td class="report-number">{{ cliente.total_brl|currency_amount('BRL') }}</td>
           </tr>
         {% else %}
           <tr><td class="empty" colspan="2">Nenhum Cliente encontrado.</td></tr>

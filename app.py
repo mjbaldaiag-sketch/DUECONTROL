@@ -14,6 +14,7 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from markupsafe import Markup
 
 BASE = Path(__file__).resolve().parent
 DB = BASE / "due.db"
@@ -39,6 +40,12 @@ STATUS_CONCLUIDO = "CONCLUÍDO"
 STATUS_PARCIAL = "PARCIAL"
 CATEGORIA_CAMBIO_EXPORTACAO = "Câmbio Exportação"
 CATEGORIA_CAMBIO_FINANCEIRO = "Câmbio Financeiro"
+CURRENCY_PALETTE = {
+    "BRL": {"class": "currency--brl", "background": "#E6F4EA", "text": "#137333"},
+    "USD": {"class": "currency--usd", "background": "#E8F0FE", "text": "#1A73E8"},
+    "EUR": {"class": "currency--eur", "background": "#F3E8FF", "text": "#6B21A8"},
+    "_fallback": {"class": "currency--neutral", "background": "#F1F3F4", "text": "#3C4043"},
+}
 CATEGORIAS_CAMBIO = (
     CATEGORIA_CAMBIO_EXPORTACAO,
     CATEGORIA_CAMBIO_FINANCEIRO,
@@ -1468,6 +1475,24 @@ def money(v):
         return f"{float(v or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "0,00"
+
+def normalized_currency_code(value):
+    return str(value or "").strip().upper()
+
+@app.template_filter("currency_class")
+def currency_class(value):
+    return CURRENCY_PALETTE.get(normalized_currency_code(value), CURRENCY_PALETTE["_fallback"])["class"]
+
+@app.template_filter("currency_amount")
+def currency_amount(value, currency):
+    code = normalized_currency_code(currency)
+    palette_key = code if code in CURRENCY_PALETTE else "_fallback"
+    palette = CURRENCY_PALETTE[palette_key]
+    return Markup(
+        f'<span class="currency-badge currency-amount {palette["class"]}">'
+        f'<span class="currency-amount__value">{html_escape(money(value))}</span>'
+        "</span>"
+    )
 
 @app.template_filter("percent")
 def percent(v):
@@ -6459,7 +6484,7 @@ def report_millions_label(value):
     amount = decimal_value(value)
     millions = amount / Decimal("1000000")
     formatted = f"{millions:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"R$ {formatted} mi"
+    return f"{formatted} mi"
 
 def report_percent_label(value):
     amount = decimal_value(value)
@@ -7242,7 +7267,44 @@ def report_pdf_percent(value):
         return "-"
     return f"{float(value):,.1f}%".replace(",", "X").replace(".", ",").replace("X", ".")
 
-def report_pdf_table(story, title, headers, rows, widths, styles, accent="#EAF3FA"):
+def report_pdf_currency_badge(value, styles):
+    from html import escape
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph
+
+    code = normalized_currency_code(value) or "-"
+    palette_key = code if code in CURRENCY_PALETTE else "_fallback"
+    palette = CURRENCY_PALETTE[palette_key]
+    badge_style = ParagraphStyle(
+        f"DuePdfCurrency{palette_key}", parent=styles["DuePdfBody"],
+        fontName=styles["DuePdfKpiValue"].fontName, fontSize=7.5, leading=9,
+        textColor=colors.HexColor(palette["text"]),
+        backColor=colors.HexColor(palette["background"]),
+        borderPadding=(2, 4, 2, 4), alignment=1,
+    )
+    return Paragraph(f"<b>{escape(code)}</b>", badge_style)
+
+def report_pdf_currency_amount(value, currency, styles):
+    from html import escape
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph
+
+    code = normalized_currency_code(currency)
+    palette_key = code if code in CURRENCY_PALETTE else "_fallback"
+    palette = CURRENCY_PALETTE[palette_key]
+    badge_style = ParagraphStyle(
+        f"DuePdfCurrencyAmount{palette_key}", parent=styles["DuePdfBody"],
+        fontName=styles["DuePdfKpiValue"].fontName, fontSize=7.5, leading=9,
+        textColor=colors.HexColor(palette["text"]),
+        backColor=colors.HexColor(palette["background"]),
+        borderPadding=(2, 4, 2, 4), alignment=2,
+    )
+    return Paragraph(f"<b>{escape(str(value))}</b>", badge_style)
+
+def report_pdf_table(story, title, headers, rows, widths, styles, accent="#EAF3FA",
+                     currency_columns=(), currency_amount_resolver=None):
     from reportlab.lib import colors
     from reportlab.platypus import Table, TableStyle
 
@@ -7250,9 +7312,19 @@ def report_pdf_table(story, title, headers, rows, widths, styles, accent="#EAF3F
     if not rows:
         story.append(report_pdf_paragraph("Nenhum registro encontrado para os filtros informados.", styles["DuePdfSmall"]))
         return
+    currency_columns = set(currency_columns)
     data = [[report_pdf_paragraph(header, styles["DuePdfTableHeader"]) for header in headers]]
     for row in rows:
-        data.append([report_pdf_paragraph(value, styles["DuePdfBody"]) for value in row])
+        rendered_row = []
+        for index, value in enumerate(row):
+            currency = currency_amount_resolver(row, index, value) if currency_amount_resolver else None
+            if currency:
+                rendered_row.append(report_pdf_currency_amount(value, currency, styles))
+            elif index in currency_columns:
+                rendered_row.append(report_pdf_currency_badge(value, styles))
+            else:
+                rendered_row.append(report_pdf_paragraph(value, styles["DuePdfBody"]))
+        data.append(rendered_row)
     table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(accent)),
@@ -7268,6 +7340,7 @@ def report_pdf_table(story, title, headers, rows, widths, styles, accent="#EAF3F
 
 def report_pdf_kpis(story, kpis, styles, available_width):
     from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.platypus import Table, TableStyle
 
     rates = "\n".join(
@@ -7276,10 +7349,26 @@ def report_pdf_kpis(story, kpis, styles, available_width):
     ) or "-"
     pair_width = (available_width - 8) / 2
 
-    def kpi_card(label, value, background, width, centered=False):
+    def currency_text(value, currency):
+        return money(value)
+
+    def kpi_card(label, value, background, width, centered=False, currency=None):
+        label_style = styles["DuePdfKpiLabel"]
+        value_style = styles["DuePdfKpiValue"]
+        if currency in CURRENCY_PALETTE:
+            palette = CURRENCY_PALETTE[currency]
+            background = palette["background"]
+            label_style = ParagraphStyle(
+                f"DuePdfKpiLabel{currency}", parent=label_style,
+                textColor=colors.HexColor(palette["text"]),
+            )
+            value_style = ParagraphStyle(
+                f"DuePdfKpiValue{currency}", parent=value_style,
+                textColor=colors.HexColor(palette["text"]),
+            )
         card = Table([
-            [report_pdf_paragraph(label, styles["DuePdfKpiLabel"])],
-            [report_pdf_paragraph(value, styles["DuePdfKpiValue"])],
+            [report_pdf_paragraph(label, label_style)],
+            [report_pdf_paragraph(value, value_style)],
         ], colWidths=[width])
         card.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(background)),
@@ -7307,24 +7396,24 @@ def report_pdf_kpis(story, kpis, styles, available_width):
 
     story.append(report_pdf_paragraph("Indicadores do período", styles["DuePdfSection"], bold=True))
     story.append(kpi_pair(
-        kpi_card("Total USD fechado", money(kpis["total_usd"]), "#EAF3FA", pair_width),
-        kpi_card("Total BRL", money(kpis["total_brl"]), "#FFF5D6", pair_width),
+        kpi_card("Total USD fechado", currency_text(kpis["total_usd"], "USD"), "#EAF3FA", pair_width, currency="USD"),
+        kpi_card("Total BRL", currency_text(kpis["total_brl"], "BRL"), "#FFF5D6", pair_width, currency="BRL"),
     ))
     story.append(kpi_pair(
         kpi_card("TAXA PONDERADA", rates, "#E5F4E8", pair_width, centered=True),
-        kpi_card("Resultado acumulado x PTAX", money(kpis["resultado_acumulado"]) if kpis["resultado_acumulado"] is not None else "-", "#EAF3FA", pair_width),
+        kpi_card("Resultado acumulado x PTAX", currency_text(kpis["resultado_acumulado"], "BRL") if kpis["resultado_acumulado"] is not None else "-", "#EAF3FA", pair_width),
     ))
     story.append(kpi_pair(
         kpi_card("Quantidade de operações", str(kpis["operacoes"]), "#E5F4E8", pair_width),
         kpi_card("Dias com operação", str(kpis["dias"]), "#EAF3FA", pair_width),
     ))
     story.append(kpi_pair(
-        kpi_card("Volume médio/operação USD", money(kpis["media_usd_operacao"]), "#EAF3FA", pair_width),
-        kpi_card("Volume médio/operação BRL", money(kpis["media_brl_operacao"]), "#FFF5D6", pair_width),
+        kpi_card("Volume médio/operação USD", currency_text(kpis["media_usd_operacao"], "USD"), "#EAF3FA", pair_width, currency="USD"),
+        kpi_card("Volume médio/operação BRL", currency_text(kpis["media_brl_operacao"], "BRL"), "#FFF5D6", pair_width, currency="BRL"),
     ))
     story.append(kpi_pair(
-        kpi_card("Volume médio/dia USD", money(kpis["media_usd_dia"]), "#E5F4E8", pair_width),
-        kpi_card("Volume médio/dia BRL", money(kpis["media_brl_dia"]), "#EAF3FA", pair_width),
+        kpi_card("Volume médio/dia USD", currency_text(kpis["media_usd_dia"], "USD"), "#E5F4E8", pair_width, currency="USD"),
+        kpi_card("Volume médio/dia BRL", currency_text(kpis["media_brl_dia"], "BRL"), "#EAF3FA", pair_width, currency="BRL"),
     ))
 
 def report_pdf_company_bar_drawing(rows, styles, width=790):
@@ -7478,13 +7567,15 @@ def render_contract_report_pdf(rendered_html, context):
                      ["TRADING/CLIENTE", "TOTAL USD", "TOTAL BRL", "%"],
                      trading_rows,
                      [available_width * .43, available_width * .18, available_width * .21, available_width * .18], styles,
-                     accent="#FFF5D6")
+                     accent="#FFF5D6",
+                     currency_amount_resolver=lambda row, index, value: {1: "USD", 2: "BRL"}.get(index))
     report_pdf_table(story, "Fechamentos por Banco Recebedor",
                      ["Banco", "Total BRL", "Participação %"],
                      [[item["nome"], money(item["total_brl"]), report_pdf_percent(item["participacao"])]
                       for item in context["por_banco"]],
                      [available_width * .61, available_width * .21, available_width * .18], styles,
-                     accent="#E5F4E8")
+                     accent="#E5F4E8",
+                     currency_amount_resolver=lambda row, index, value: "BRL" if index == 1 else None)
 
     report_pdf_table(story, "Estatísticas",
                      ["Indicador", "Valor"],
@@ -7492,7 +7583,8 @@ def render_contract_report_pdf(rendered_html, context):
                       ["Dias abaixo da PTAX", context["stats"]["dias_abaixo"]],
                       ["Total de dias com operação", context["stats"]["dias_operacao"]],
                       ["Resultado acumulado", money(context["stats"]["resultado_acumulado"]) if context["stats"]["resultado_acumulado"] is not None else "-"]],
-                     [available_width * .68, available_width * .32], styles, accent="#FFF5D6")
+                     [available_width * .68, available_width * .32], styles, accent="#FFF5D6",
+                     currency_amount_resolver=lambda row, index, value: "BRL" if index == 1 and row[0] == "Resultado acumulado" else None)
     report_pdf_table(story, f"Fechamentos por período — {context['agrupamento_label']}",
                      ["Período", "Moeda", "Operações", "Volume", "Total BRL", "Taxa ponderada", "Resultado acumulado", "Resultado (R$)"],
                      [[item["rotulo"], item["moeda"], item["resumo"]["contratos"], money(item["resumo"]["volume"]),
@@ -7503,7 +7595,10 @@ def render_contract_report_pdf(rendered_html, context):
                       for item in context["periodos"]],
                      [available_width * .17, available_width * .08, available_width * .09, available_width * .13,
                       available_width * .14, available_width * .12, available_width * .15, available_width * .12], styles,
-                     accent="#EAF3FA")
+                     accent="#EAF3FA", currency_columns=(1,),
+                     currency_amount_resolver=lambda row, index, value: {
+                         3: row[1], 4: "BRL", 6: "BRL", 7: "BRL"
+                     }.get(index))
 
     story.append(report_pdf_paragraph("Evolução por período — Taxa ponderada × PTAX BACEN", styles["DuePdfSection"], bold=True))
     for grafico in context["graficos"]:
@@ -14551,6 +14646,54 @@ def exportar_invoices():
     output.seek(0)
     return send_file(output, as_attachment=True, download_name="invoices_exportacao.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.route("/invoice/ultima")
+def ultima_invoice():
+    raw_empresa_id = request.args.get("empresa_id")
+    empresa_id = form_record_id(raw_empresa_id)
+    if raw_empresa_id not in (None, "") and not empresa_id:
+        return jsonify({"error": "A empresa selecionada é inválida."}), 400
+
+    conn = db()
+    try:
+        where = ""
+        params = []
+        if empresa_id:
+            if not conn.execute("SELECT id FROM empresas WHERE id=?", (empresa_id,)).fetchone():
+                return jsonify({"error": "A empresa selecionada não foi encontrada."}), 400
+            where = "WHERE empresa_id=?"
+            params.append(empresa_id)
+        invoice = conn.execute(f"""
+            SELECT empresa_id, numero_invoice, cliente_id, contrato_comercial_id,
+                   tipo_documento, competencia_id, banco_referenciado_id,
+                   data_emissao, moeda, valor_moeda, status, data_credito,
+                   observacao
+            FROM invoices
+            {where}
+            ORDER BY id DESC
+            LIMIT 1
+        """, params).fetchone()
+    finally:
+        conn.close()
+
+    if not invoice:
+        return jsonify({"error": "Nenhuma Invoice encontrada."}), 404
+    return jsonify({
+        "empresa_id": invoice["empresa_id"],
+        "numero_invoice": invoice["numero_invoice"] or "",
+        "cliente_id": invoice["cliente_id"],
+        "contrato_comercial_id": invoice["contrato_comercial_id"],
+        "tipo_documento": invoice["tipo_documento"] or "",
+        "competencia_id": invoice["competencia_id"],
+        "banco_referenciado_id": invoice["banco_referenciado_id"],
+        "data_emissao": date_br(invoice["data_emissao"]),
+        "moeda": invoice["moeda"] or "",
+        "valor_moeda": money(invoice["valor_moeda"]),
+        "status": invoice["status"] or "",
+        "data_credito": invoice["data_credito"] or "",
+        "observacao": invoice["observacao"] or "",
+    })
+
 
 @app.route("/invoice/nova", methods=["GET", "POST"])
 def nova_invoice():

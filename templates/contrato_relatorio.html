@@ -24,7 +24,7 @@
       <div><span>CNPJ</span><strong>{{ contrato.cnpj or '-' }}</strong></div>
       <div><span>Banco de Crédito</span><strong>{{ contrato.banco_credito or contrato.banco or '-' }}</strong></div>
       <div><span>Banco de Liquidação</span><strong>{{ contrato.banco_liquidacao or contrato.banco_credito or contrato.banco or '-' }}</strong></div>
-      <div><span>Moeda</span><strong>{{ contrato.moeda or '-' }}</strong></div>
+      <div><span>Moeda</span><strong><span class="currency-badge {{ contrato.moeda|currency_class }}">{{ contrato.moeda or '-' }}</span></strong></div>
       <div><span>Data do Contrato Câmbio</span><strong>{{ contrato.data_contrato|date_br or '-' }}</strong></div>
       <div><span>Data de recebimento</span><strong>{{ contrato.data_recebimento|date_br or '-' }}</strong></div>
       <div><span>Data de liquidação</span><strong>{{ contrato.data_liquidacao|date_br or '-' }}</strong></div>
@@ -34,11 +34,11 @@
   <section class="report-section">
     <h2>Valores</h2>
     <div class="report-data">
-      <div><span>Valor na moeda</span><strong>{{ contrato.valor_moeda|money }}</strong></div>
-      <div><span>Valor em reais</span><strong>{{ contrato.valor_reais|money if contrato.valor_reais is not none else '-' }}</strong></div>
+      <div><span>Valor na moeda</span><strong>{{ contrato.valor_moeda|currency_amount(contrato.moeda) }}</strong></div>
+      <div><span>Valor em <span class="currency-badge currency--brl">BRL</span></span><strong>{{ contrato.valor_reais|currency_amount('BRL') if contrato.valor_reais is not none else '-' }}</strong></div>
       <div><span>Taxa de câmbio</span><strong>{{ contrato.taxa_cambio|rate if contrato.taxa_cambio is not none else '-' }}</strong></div>
-      <div><span>Total vinculado</span><strong>{{ vinculado|money }}</strong></div>
-      <div><span>Saldo</span><strong>{{ saldo|money }}</strong></div>
+      <div><span>Total vinculado</span><strong>{{ vinculado|currency_amount(contrato.moeda) }}</strong></div>
+      <div><span>Saldo</span><strong>{{ saldo|currency_amount(contrato.moeda) }}</strong></div>
     </div>
   </section>
 
@@ -58,7 +58,7 @@
           <td>{{ v.chave_acesso or '-' }}</td>
           <td>{{ v.data_lancamento|date_br or '-' }}</td>
           <td>{{ v.cliente_due or '-' }}</td>
-          <td>{{ v.valor_movimentacao|money if v.valor_movimentacao is not none else v.valor_vinculado|money }}</td>
+          <td>{{ v.valor_movimentacao|currency_amount(contrato.moeda) if v.valor_movimentacao is not none else v.valor_vinculado|currency_amount(contrato.moeda) }}</td>
           <td>{{ v.observacao or '-' }}</td>
         </tr>
         {% else %}
@@ -74,7 +74,7 @@
       <thead><tr><th>Invoice</th><th>Empresa</th><th>Data</th><th>Valor</th><th>Moeda</th><th>Observa&ccedil;&atilde;o</th></tr></thead>
       <tbody>
         {% for f in fechamentos %}
-        <tr><td>{{ f.numero_invoice }}</td><td>{{ f.empresa_apelido or f.empresa_razao_social }}</td><td>{{ f.data_fechamento|date_br }}</td><td>{{ f.valor_moeda|money }}</td><td>{{ f.moeda }}</td><td>{{ f.observacao or '-' }}</td></tr>
+        <tr><td>{{ f.numero_invoice }}</td><td>{{ f.empresa_apelido or f.empresa_razao_social }}</td><td>{{ f.data_fechamento|date_br }}</td><td>{{ f.valor_moeda|currency_amount(f.moeda) }}</td><td><span class="currency-badge {{ f.moeda|currency_class }}">{{ f.moeda }}</span></td><td>{{ f.observacao or '-' }}</td></tr>
         {% else %}
         <tr><td colspan="6" class="empty">Nenhum fechamento novo vinculado.</td></tr>
         {% endfor %}

@@ -70,6 +70,22 @@
     }
   };
 
+  const currencyFilterClasses = ['currency--brl', 'currency--usd', 'currency--eur', 'currency--neutral'];
+  const updateCurrencyFilter = (select) => {
+    const code = String(select.value || '').trim().toUpperCase();
+    const className = code === 'BRL' ? 'currency--brl'
+      : code === 'USD' ? 'currency--usd'
+        : code === 'EUR' ? 'currency--eur'
+          : 'currency--neutral';
+    select.classList.remove(...currencyFilterClasses);
+    select.classList.add(className);
+  };
+
+  document.querySelectorAll('[data-currency-filter]').forEach((select) => {
+    select.addEventListener('change', () => updateCurrencyFilter(select));
+    updateCurrencyFilter(select);
+  });
+
   const copyToast = document.querySelector('[data-copy-toast]');
   let copyToastTimer;
   const showCopyToast = () => {
@@ -333,7 +349,9 @@
     };
     const loadContracts = async (preserveCurrent = false) => {
       const clientId = clientSelect.value;
-      const selectedValue = preserveCurrent ? initialValue : '';
+      const pendingValue = select.dataset.pendingContractId || '';
+      delete select.dataset.pendingContractId;
+      const selectedValue = pendingValue || (preserveCurrent ? initialValue : '');
       select.disabled = !clientId;
       select.innerHTML = '';
       select.append(option('', clientId ? 'Selecione um contrato' : 'Selecione primeiro um cliente'));
@@ -371,6 +389,70 @@
     };
     clientSelect.addEventListener('change', () => loadContracts(false));
     loadContracts(true);
+  });
+  document.querySelectorAll('[data-load-last-invoice]').forEach((button) => {
+    const form = button.closest('form') || document;
+    const feedback = form.querySelector('[data-load-last-invoice-feedback]')
+      || document.querySelector('[data-load-last-invoice-feedback]');
+    const url = button.dataset.loadLastInvoiceUrl;
+    const field = (name) => form.querySelector(`[name="${name}"]`);
+    const setField = (name, value) => {
+      const input = field(name);
+      if (input) input.value = value == null ? '' : String(value);
+      return input;
+    };
+    const setFeedback = (message) => {
+      if (!feedback) return;
+      feedback.hidden = !message;
+      feedback.textContent = message || '';
+    };
+    const change = (input) => {
+      if (input) input.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+
+    if (!url) return;
+    button.addEventListener('click', async () => {
+      const company = field('empresa_id');
+      const query = company && company.value
+        ? `?empresa_id=${encodeURIComponent(company.value)}`
+        : '';
+      button.disabled = true;
+      setFeedback('Carregando os dados do último documento...');
+      try {
+        const response = await fetch(url + query, { headers: { Accept: 'application/json' } });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error || 'Não foi possível carregar os dados.');
+
+        setField('empresa_id', payload.empresa_id);
+        setField('numero_invoice', payload.numero_invoice);
+        setField('tipo_documento', payload.tipo_documento);
+        setField('competencia_id', payload.competencia_id);
+        setField('data_emissao', payload.data_emissao);
+        setField('moeda', payload.moeda);
+        setField('valor_moeda', payload.valor_moeda);
+        setField('observacao', payload.observacao);
+        setField('data_credito', payload.data_credito);
+        setField('status', payload.status);
+
+        const companySelect = field('empresa_id');
+        change(companySelect);
+        setField('competencia_id', payload.competencia_id);
+        setField('banco_referenciado_id', payload.banco_referenciado_id);
+
+        const clientSelect = field('cliente_id');
+        const contractSelect = field('contrato_comercial_id');
+        setField('cliente_id', payload.cliente_id);
+        if (contractSelect) contractSelect.dataset.pendingContractId = payload.contrato_comercial_id || '';
+        change(clientSelect);
+        change(field('status'));
+
+        setFeedback('Dados carregados. Revise o número da Invoice antes de salvar.');
+      } catch (error) {
+        setFeedback(error.message || 'Não foi possível carregar os dados.');
+      } finally {
+        button.disabled = false;
+      }
+    });
   });
   document.querySelectorAll('[data-chave-acesso]').forEach((input) => input.addEventListener('input', () => {
     input.value = input.value.replace(/[^a-zA-Z0-9]/g, '').slice(0, 14).toUpperCase();
@@ -491,8 +573,8 @@
       const selectedRule = liquidationBank && liquidationBank.selectedOptions.length
         ? liquidationBank.selectedOptions[0].dataset.conversionRule || 'HALF_UP'
         : 'HALF_UP';
-      selectedTotal.textContent = `USD ${formatDisplayedMoney(total)}`;
-      brlTotalValue.textContent = `R$ ${conversionPreview(total, rate, selectedRule)}`;
+      selectedTotal.innerHTML = `<span class="currency-badge currency-amount currency--usd">${formatDisplayedMoney(total)}</span>`;
+      brlTotalValue.innerHTML = `<span class="currency-badge currency-amount currency--brl">${conversionPreview(total, rate, selectedRule)}</span>`;
       brlTotal.hidden = !rateInput || rate.digits <= 0n;
       dialogSummary.hidden = selected().length === 0;
     };

@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="page-heading"><div><h1>{{ 'Editar' if invoice else 'Nova' }} Invoice</h1><p class="muted">A Invoice é a fonte primária do fluxo financeiro.</p></div><a class="btn secondary" href="{{ url_for('detalhe_invoice', invoice_id=invoice.id) if invoice else url_for('lista_invoices') }}">Voltar</a></div>
+{% if not invoice %}<div class="actions"><button type="button" class="btn secondary" data-load-last-invoice data-load-last-invoice-url="{{ url_for('ultima_invoice') }}">Carregar dados do último documento</button><small class="muted" data-load-last-invoice-feedback role="status" aria-live="polite" hidden></small></div>{% endif %}
 {% set parcel_protected = invoice_lineage and invoice_lineage.numero_parcela %}
 {% set form_cliente_id = request.form.get('cliente_id') if request.method == 'POST' else (invoice.cliente_id if invoice else '') %}
 {% set form_contrato_id = request.form.get('contrato_comercial_id') if request.method == 'POST' else (invoice.contrato_comercial_id if invoice and invoice.contrato_comercial_id else '') %}

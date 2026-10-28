@@ -45,8 +45,8 @@
           <tbody>
           {% for total in totais_cliente_moeda %}
             <tr>
-              <td>{{ total.cliente or '-' }}</td><td>{{ total.moeda or '-' }}</td>
-              <td>{{ total.saldo_due|money }}</td><td>{{ total.saldo_contrato|money }}</td><td>{{ total.saldo_compativel|money }}</td>
+              <td>{{ total.cliente or '-' }}</td><td><span class="currency-badge {{ total.moeda|currency_class }}">{{ total.moeda or '-' }}</span></td>
+              <td>{{ total.saldo_due|currency_amount(total.moeda) }}</td><td>{{ total.saldo_contrato|currency_amount(total.moeda) }}</td><td>{{ total.saldo_compativel|currency_amount(total.moeda) }}</td>
               <td class="row-actions"><button type="button" class="saldo-analysis-detail-trigger" data-saldo-detail-target="{{ total._detail_id }}" aria-label="Abrir detalhamento de {{ total.cliente or 'cliente' }}" title="Abrir detalhamento">+</button></td>
             </tr>
           {% else %}
@@ -65,7 +65,7 @@
           <thead><tr><th>Empresa</th><th>Moeda</th><th>Saldo DUE</th><th>Saldo contratos</th><th>Saldo a vincular</th></tr></thead>
           <tbody>
           {% for total in totais_empresa_moeda %}
-            <tr><td>{{ total.empresa or '-' }}</td><td>{{ total.moeda or '-' }}</td><td>{{ total.saldo_due|money }}</td><td>{{ total.saldo_contrato|money }}</td><td>{{ total.saldo_compativel|money }}</td></tr>
+            <tr><td>{{ total.empresa or '-' }}</td><td><span class="currency-badge {{ total.moeda|currency_class }}">{{ total.moeda or '-' }}</span></td><td>{{ total.saldo_due|currency_amount(total.moeda) }}</td><td>{{ total.saldo_contrato|currency_amount(total.moeda) }}</td><td>{{ total.saldo_compativel|currency_amount(total.moeda) }}</td></tr>
           {% else %}
             <tr><td colspan="5" class="empty">Nenhum totalizador disponível.</td></tr>
           {% endfor %}
@@ -93,10 +93,10 @@
 
     {% for grupo in detalhe.grupos %}
     <section class="report-section saldo-client-detail-group">
-      <div class="section-heading"><h2>{{ grupo.empresa or '-' }} <span class="muted">&gt; {{ grupo.moeda or '-' }}</span></h2></div>
+      <div class="section-heading"><h2>{{ grupo.empresa or '-' }} <span class="muted">&gt; <span class="currency-badge {{ grupo.moeda|currency_class }}">{{ grupo.moeda or '-' }}</span></span></h2></div>
       <table class="compact-table saldo-client-detail-summary-table">
         <thead><tr><th>Saldo DUE</th><th>Saldo contratos</th><th>Saldo a vincular</th></tr></thead>
-        <tbody><tr><td>{{ grupo.saldo_due|money }}</td><td>{{ grupo.saldo_contrato|money }}</td><td>{{ grupo.saldo_compativel|money }}</td></tr></tbody>
+        <tbody><tr><td>{{ grupo.saldo_due|currency_amount(grupo.moeda) }}</td><td>{{ grupo.saldo_contrato|currency_amount(grupo.moeda) }}</td><td>{{ grupo.saldo_compativel|currency_amount(grupo.moeda) }}</td></tr></tbody>
       </table>
 
       <div class="saldo-client-detail-columns">
@@ -104,20 +104,20 @@
           <table class="compact-table saldo-client-detail-table">
             <thead><tr><th>Contrato</th><th>Data</th><th>Saldo aberto</th></tr></thead>
             <tbody>
-            {% for contrato in grupo.contratos %}<tr><td>{{ contrato.numero or '-' }}</td><td>{{ contrato.data|date_br or '-' }}</td><td>{{ contrato.saldo|money }}</td></tr>
+            {% for contrato in grupo.contratos %}<tr><td>{{ contrato.numero or '-' }}</td><td>{{ contrato.data|date_br or '-' }}</td><td>{{ contrato.saldo|currency_amount(grupo.moeda) }}</td></tr>
             {% else %}<tr><td colspan="3" class="empty">Nenhum Contrato em aberto.</td></tr>{% endfor %}
             </tbody>
-            <tfoot><tr><th colspan="2">Total Contratos</th><th>{{ grupo.saldo_contrato|money }}</th></tr></tfoot>
+            <tfoot><tr><th colspan="2">Total Contratos</th><th>{{ grupo.saldo_contrato|currency_amount(grupo.moeda) }}</th></tr></tfoot>
           </table>
         </section>
         <section><h3>SALDO A VINCULAR — POR DUEs</h3>
           <table class="compact-table saldo-client-detail-table">
             <thead><tr><th>DUE</th><th>Data</th><th>Saldo aberto</th></tr></thead>
             <tbody>
-            {% for due in grupo.dues %}<tr><td>{{ due.numero or '-' }}</td><td>{{ due.data|date_br or '-' }}</td><td>{{ due.saldo|money }}</td></tr>
+            {% for due in grupo.dues %}<tr><td>{{ due.numero or '-' }}</td><td>{{ due.data|date_br or '-' }}</td><td>{{ due.saldo|currency_amount(grupo.moeda) }}</td></tr>
             {% else %}<tr><td colspan="3" class="empty">Nenhuma DUE em aberto.</td></tr>{% endfor %}
             </tbody>
-            <tfoot><tr><th colspan="2">Total DUEs</th><th>{{ grupo.saldo_due|money }}</th></tr></tfoot>
+            <tfoot><tr><th colspan="2">Total DUEs</th><th>{{ grupo.saldo_due|currency_amount(grupo.moeda) }}</th></tr></tfoot>
           </table>
         </section>
       </div>

@@ -259,6 +259,74 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         conn.close()
         return invoice["id"]
 
+    def _insert_invoice_for_copy(self, number, empresa_id=1, competencia_id=1,
+                                 data_emissao="2026-08-01", valor_moeda=100,
+                                 status="AGUARDANDO_RECEBIMENTO", data_credito=None,
+                                 observacao=None):
+        conn = app.db()
+        conn.execute("""
+            INSERT INTO invoices
+                (empresa_id, numero_invoice, tipo_documento, competencia_id, cliente_id,
+                 data_emissao, moeda, valor_moeda, status, data_credito, observacao)
+            VALUES (?, ?, 'COMMERCIAL_INVOICE', ?, 1, ?, 'USD', ?, ?, ?, ?)
+        """, (empresa_id, number, competencia_id, data_emissao, valor_moeda, status,
+              data_credito, observacao))
+        conn.commit()
+        invoice_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        return invoice_id
+
+    def test_last_invoice_endpoint_scopes_by_company_and_uses_latest_id(self):
+        conn = app.db()
+        conn.execute("INSERT INTO empresas (razao_social, cnpj, apelido) VALUES (?,?,?)",
+                     ("Outra Empresa", "12345678000199", "Outra"))
+        conn.execute("INSERT INTO competencias (empresa_id, descricao, data_inicial, data_final) VALUES (?,?,?,?)",
+                     (2, "Setembro/2026", "2026-09-01", "2026-09-30"))
+        conn.commit()
+        conn.close()
+
+        self._insert_invoice_for_copy("INV-OLD", data_emissao="2026-01-01", valor_moeda=10)
+        self._insert_invoice_for_copy(
+            "INV-LATEST-COMPANY-ONE", data_emissao="2026-10-28", valor_moeda=1234.5,
+            status="RECEBIDA_AGUARDANDO_CAMBIO", data_credito="2026-10-29",
+            observacao="Observação copiada",
+        )
+        self._insert_invoice_for_copy("INV-LATEST-GLOBAL", empresa_id=2, competencia_id=2, valor_moeda=20)
+
+        company_response = self.client.get("/invoice/ultima?empresa_id=1")
+        self.assertEqual(company_response.status_code, 200)
+        company_payload = company_response.get_json()
+        self.assertEqual(company_payload["numero_invoice"], "INV-LATEST-COMPANY-ONE")
+        self.assertEqual(company_payload["data_emissao"], "28/10/2026")
+        self.assertEqual(company_payload["valor_moeda"], "1.234,50")
+        self.assertEqual(company_payload["data_credito"], "2026-10-29")
+        self.assertEqual(company_payload["observacao"], "Observação copiada")
+
+        global_response = self.client.get("/invoice/ultima")
+        self.assertEqual(global_response.status_code, 200)
+        global_payload = global_response.get_json()
+        self.assertEqual(global_payload["empresa_id"], 2)
+        self.assertEqual(global_payload["numero_invoice"], "INV-LATEST-GLOBAL")
+        self.assertEqual(global_payload["banco_referenciado_id"], None)
+        self.assertEqual(global_payload["data_credito"], "")
+        self.assertEqual(global_payload["observacao"], "")
+        conn = app.db()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM invoices").fetchone()[0], 3)
+        conn.close()
+
+    def test_last_invoice_endpoint_returns_not_found_without_matching_invoice(self):
+        response = self.client.get("/invoice/ultima?empresa_id=1")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()["error"], "Nenhuma Invoice encontrada.")
+
+    def test_new_invoice_form_renders_last_invoice_button(self):
+        response = self.client.get("/invoice/nova")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn('type="button"', html)
+        self.assertIn("Carregar dados do último documento", html)
+        self.assertIn('data-load-last-invoice-url="/invoice/ultima"', html)
+
     def _register_central_closing(self, invoice_id, value, data_fechamento,
                                   data_liquidacao, banco_liquidacao_id="1",
                                   taxa_cambio="5,0000", numero_contrato=None,

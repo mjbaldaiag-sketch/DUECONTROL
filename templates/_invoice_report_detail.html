@@ -11,15 +11,15 @@
       <h3 class="invoice-report-detail-summary-title">TOTAL POR EMPRESA</h3>
       <div class="table-wrap">
         <table class="compact-table invoice-report-table invoice-report-table--{{ table.variant }} invoice-report-company-table invoice-report-detail-summary-table">
-          <thead><tr><th>EMPRESA</th><th>USD</th><th class="invoice-report-percent-header">%</th></tr></thead>
+          <thead><tr><th>EMPRESA</th><th><span class="currency-badge currency--usd">USD</span></th><th class="invoice-report-percent-header">%</th></tr></thead>
           <tbody>
             {% for empresa in table.empresa_totals %}
-            <tr><td>{{ empresa.empresa }}</td><td>USD {{ empresa.valor|money }}</td><td class="invoice-report-percent-cell">{{ (empresa.valor / table.total * 100 if table.total else 0)|percent }}</td></tr>
+            <tr><td>{{ empresa.empresa }}</td><td>{{ empresa.valor|currency_amount('USD') }}</td><td class="invoice-report-percent-cell">{{ (empresa.valor / table.total * 100 if table.total else 0)|percent }}</td></tr>
             {% else %}
             <tr><td colspan="3" class="empty">Nenhuma Empresa encontrada.</td></tr>
             {% endfor %}
           </tbody>
-          <tfoot><tr><th>TOTAL</th><th>USD {{ table.total|money }}</th><th class="invoice-report-percent-cell">{{ (100 if table.total else 0)|percent }}</th></tr></tfoot>
+          <tfoot><tr><th>TOTAL</th><th>{{ table.total|currency_amount('USD') }}</th><th class="invoice-report-percent-cell">{{ (100 if table.total else 0)|percent }}</th></tr></tfoot>
         </table>
       </div>
     </div>
@@ -28,15 +28,15 @@
       <h3 class="invoice-report-detail-summary-title">TOTAL POR BANCO</h3>
       <div class="table-wrap">
         <table class="compact-table invoice-report-table invoice-report-table--{{ table.variant }} invoice-report-bank-table invoice-report-detail-summary-table">
-          <thead><tr><th>BANCO</th><th>USD</th><th class="invoice-report-percent-header">%</th></tr></thead>
+          <thead><tr><th>BANCO</th><th><span class="currency-badge currency--usd">USD</span></th><th class="invoice-report-percent-header">%</th></tr></thead>
           <tbody>
             {% for banco in table.detail_groups %}
-            <tr><td>{{ banco.banco }}</td><td>USD {{ banco.subtotal|money }}</td><td class="invoice-report-percent-cell">{{ (banco.subtotal / table.total * 100 if table.total else 0)|percent }}</td></tr>
+            <tr><td>{{ banco.banco }}</td><td>{{ banco.subtotal|currency_amount('USD') }}</td><td class="invoice-report-percent-cell">{{ (banco.subtotal / table.total * 100 if table.total else 0)|percent }}</td></tr>
             {% else %}
             <tr><td colspan="3" class="empty">Nenhum Banco encontrado.</td></tr>
             {% endfor %}
           </tbody>
-          <tfoot><tr><th>TOTAL</th><th>USD {{ table.total|money }}</th><th class="invoice-report-percent-cell">{{ (100 if table.total else 0)|percent }}</th></tr></tfoot>
+          <tfoot><tr><th>TOTAL</th><th>{{ table.total|currency_amount('USD') }}</th><th class="invoice-report-percent-cell">{{ (100 if table.total else 0)|percent }}</th></tr></tfoot>
         </table>
       </div>
     </div>
@@ -45,15 +45,15 @@
       <h3 class="invoice-report-detail-summary-title">TOTAL POR CLIENTE / TRADING</h3>
       <div class="table-wrap">
         <table class="compact-table invoice-report-table invoice-report-table--{{ table.variant }} invoice-report-client-table invoice-report-detail-summary-table">
-          <thead><tr><th>CLIENTE / TRADING</th><th>USD</th><th class="invoice-report-percent-header">%</th></tr></thead>
+          <thead><tr><th>CLIENTE / TRADING</th><th><span class="currency-badge currency--usd">USD</span></th><th class="invoice-report-percent-header">%</th></tr></thead>
           <tbody>
             {% for row in table.rows %}
-            <tr><td>{{ row.cliente }}</td><td>USD {{ row.valor|money }}</td><td class="invoice-report-percent-cell">{{ (row.valor / table.total * 100 if table.total else 0)|percent }}</td></tr>
+            <tr><td>{{ row.cliente }}</td><td>{{ row.valor|currency_amount('USD') }}</td><td class="invoice-report-percent-cell">{{ (row.valor / table.total * 100 if table.total else 0)|percent }}</td></tr>
             {% else %}
             <tr><td colspan="3" class="empty">Nenhum Cliente / Trading encontrado.</td></tr>
             {% endfor %}
           </tbody>
-          <tfoot><tr><th>TOTAL</th><th>USD {{ table.total|money }}</th><th class="invoice-report-percent-cell">{{ (100 if table.total else 0)|percent }}</th></tr></tfoot>
+          <tfoot><tr><th>TOTAL</th><th>{{ table.total|currency_amount('USD') }}</th><th class="invoice-report-percent-cell">{{ (100 if table.total else 0)|percent }}</th></tr></tfoot>
         </table>
       </div>
     </div>
@@ -66,15 +66,15 @@
           {% for banco in table.detail_groups %}
           {% if not loop.first %}<tbody class="invoice-detail-bank-separator"><tr class="invoice-detail-spacer"><td colspan="2" aria-hidden="true">&nbsp;</td></tr></tbody>{% endif %}
           <tbody class="invoice-detail-bank-group">
-          <tr class="invoice-detail-row invoice-detail-row--bank"><th scope="row"><span class="invoice-detail-bank-badge">BANCO: {{ banco.banco }}</span></th><td>USD {{ banco.subtotal|money }}</td></tr>
+          <tr class="invoice-detail-row invoice-detail-row--bank"><th scope="row"><span class="invoice-detail-bank-badge">BANCO: {{ banco.banco }}</span></th><td>{{ banco.subtotal|currency_amount('USD') }}</td></tr>
           {% for empresa in banco.empresas %}
           <tr class="invoice-detail-spacer"><td colspan="2" aria-hidden="true">&nbsp;</td></tr>
-          <tr class="invoice-detail-row invoice-detail-row--company"><th scope="row">EMPRESA: {{ empresa.empresa }}</th><td>USD {{ empresa.subtotal|money }}</td></tr>
+          <tr class="invoice-detail-row invoice-detail-row--company"><th scope="row">EMPRESA: {{ empresa.empresa }}</th><td>{{ empresa.subtotal|currency_amount('USD') }}</td></tr>
           {% for cliente in empresa.clientes %}
           <tr class="invoice-detail-spacer"><td colspan="2" aria-hidden="true">&nbsp;</td></tr>
-          <tr class="invoice-detail-row invoice-detail-row--client"><th scope="row">CLIENTE: {{ cliente.cliente }}</th><td>USD {{ cliente.subtotal|money }}</td></tr>
+          <tr class="invoice-detail-row invoice-detail-row--client"><th scope="row">CLIENTE: {{ cliente.cliente }}</th><td>{{ cliente.subtotal|currency_amount('USD') }}</td></tr>
           {% for invoice in cliente.invoices %}
-          <tr class="invoice-detail-row invoice-detail-row--invoice"><td><a href="{{ url_for('detalhe_invoice', invoice_id=invoice.id) }}">INVOICE {{ invoice.numero }}</a></td><td>USD {{ invoice.valor|money }}</td></tr>
+          <tr class="invoice-detail-row invoice-detail-row--invoice"><td><a href="{{ url_for('detalhe_invoice', invoice_id=invoice.id) }}">INVOICE {{ invoice.numero }}</a></td><td>{{ invoice.valor|currency_amount('USD') }}</td></tr>
           {% endfor %}
           {% endfor %}
           {% endfor %}
@@ -84,7 +84,7 @@
           <tr><td colspan="2" class="empty">Nenhuma Invoice encontrada.</td></tr>
           </tbody>
           {% endfor %}
-        <tfoot><tr><th>TOTAL DAS INVOICES</th><th>USD {{ table.total|money }}</th></tr></tfoot>
+        <tfoot><tr><th>TOTAL DAS INVOICES</th><th>{{ table.total|currency_amount('USD') }}</th></tr></tfoot>
       </table>
     </div>
   </div>
