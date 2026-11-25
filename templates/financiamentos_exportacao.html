@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% from "_pagination.html" import render_pagination %}
+{% from "_sorting.html" import sortable_header %}
+{% block content %}
+<div class="page-heading">
+  <div><h1>Financiamento de Exportações</h1><p class="muted">{{ total }} operação(ões) encontrada(s)</p></div>
+  <div class="actions"><a class="btn" href="{{ url_for('novo_financiamento_exportacao') }}">+ Novo financiamento</a><a class="btn secondary" href="{{ url_for('index') }}">Dashboard</a></div>
+</div>
+
+<form method="get" class="filters">
+  <label>Modalidade<select name="categoria_operacao"><option value="">Todas</option>{% for categoria in categorias %}<option value="{{ categoria }}" {{ 'selected' if filtros.categoria_operacao == categoria else '' }}>{{ categoria }}</option>{% endfor %}</select></label>
+  <label>Empresa<select name="empresa_id"><option value="">Todas</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if filtros.empresa_id == empresa.id else '' }}>{{ empresa.apelido or empresa.razao_social }}{% if empresa.cnpj %} — {{ empresa.cnpj|cnpj }}{% endif %}</option>{% endfor %}</select></label>
+  <label>Banco / contraparte<select name="banco_credito_id"><option value="">Todos</option>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if filtros.banco_credito_id == banco.id else '' }}>{{ banco.nome }}</option>{% endfor %}</select></label>
+  <label>Nº contrato de câmbio<input name="numero_contrato_cambio" value="{{ filtros.numero_contrato_cambio }}" placeholder="Parte do número"></label>
+  <label>Moeda<select name="moeda"><option value="">Todas</option>{% for moeda in moedas %}<option value="{{ moeda }}" {{ 'selected' if filtros.moeda == moeda else '' }}>{{ moeda }}</option>{% endfor %}</select></label>
+  <label>Status<select name="status"><option value="">Todos</option>{% for status in status_options %}<option value="{{ status }}" {{ 'selected' if filtros.status == status else '' }}>{{ status }}</option>{% endfor %}</select></label>
+  <label>Contratação — de<input name="data_contratacao_de" data-date-br value="{{ filtros.data_contratacao_de }}" placeholder="dd/mm/aaaa"></label>
+  <label>Contratação — até<input name="data_contratacao_ate" data-date-br value="{{ filtros.data_contratacao_ate }}" placeholder="dd/mm/aaaa"></label>
+  <label>Liquidação — de<input name="data_liquidacao_de" data-date-br value="{{ filtros.data_liquidacao_de }}" placeholder="dd/mm/aaaa"></label>
+  <label>Liquidação — até<input name="data_liquidacao_ate" data-date-br value="{{ filtros.data_liquidacao_ate }}" placeholder="dd/mm/aaaa"></label>
+  <div class="filter-actions"><button type="submit">Filtrar</button><a class="btn secondary" href="{{ url_for('lista_financiamento_exportacoes') }}">Limpar filtros</a></div>
+</form>
+
+<div class="table-wrap"><table class="compact-table" data-sortable-server><thead><tr>
+  {{ sortable_header('Modalidade', 'modalidade', sort, direction, sort_links) }}
+  {{ sortable_header('Empresa', 'empresa', sort, direction, sort_links) }}
+  <th>Banco / contraparte</th>{{ sortable_header('Contrato de câmbio', 'contrato', sort, direction, sort_links) }}
+  {{ sortable_header('Contratado', 'valor_contratado', sort, direction, sort_links, 'number') }}
+  {{ sortable_header('Liquidado', 'valor_liquidado', sort, direction, sort_links, 'number') }}
+  {{ sortable_header('Status', 'status', sort, direction, sort_links) }}<th>Ações</th>
+</tr></thead><tbody>
+{% for operacao in operacoes %}
+<tr>
+  <td><span class="status status-pendente">{{ operacao.categoria_operacao }}</span></td>
+  <td>{{ operacao.empresa_apelido or operacao.empresa_razao_social or '-' }}{% if operacao.empresa_cnpj %}<small class="status-note">{{ operacao.empresa_cnpj|cnpj }}</small>{% endif %}</td>
+  <td>{{ operacao.banco_credito_nome or '-' }}</td>
+  <td>{{ operacao.numero_contrato_cambio or '-' }}</td>
+  <td><span class="currency-badge {{ operacao.moeda|currency_class }}">{{ operacao.moeda }}</span> {{ operacao.valor_contratado_moeda|currency_amount(operacao.moeda) }}<small class="status-note">{{ operacao.valor_contratado_brl|currency_amount('BRL') }}</small></td>
+  <td><span class="currency-badge {{ operacao.moeda|currency_class }}">{{ operacao.moeda }}</span> {{ operacao.valor_liquidado_moeda|currency_amount(operacao.moeda) }}<small class="status-note">{{ operacao.valor_liquidado_brl|currency_amount('BRL') }}</small></td>
+  <td><span class="status {{ operacao.status|financiamento_status_class }}">{{ operacao.status }}</span></td>
+  <td class="row-actions"><a href="{{ url_for('detalhe_financiamento_exportacao', operacao_id=operacao.id) }}">Ver</a> <a href="{{ url_for('editar_financiamento_exportacao', operacao_id=operacao.id) }}">Editar</a></td>
+</tr>
+{% else %}<tr><td colspan="8" class="empty">Nenhum financiamento de exportação encontrado.</td></tr>{% endfor %}
+</tbody></table></div>
+{{ render_pagination(pagination, 'Paginação de financiamentos de exportação') }}
+{% endblock %}

@@ -5,6 +5,9 @@
   <div class="actions"><a class="btn secondary" href="{{ url_for('gestao_fechamentos_invoices') }}">Voltar</a></div>
 </div>
 <div class="detail-grid">
+  {% if operacao.financiamento_exportacao_id %}
+  <div><span>Financiamento de Exportação</span><strong><a href="{{ url_for('detalhe_financiamento_exportacao', operacao_id=operacao.financiamento_exportacao_id) }}">{{ operacao.financiamento_numero_contrato or operacao.financiamento_exportacao_id }}</a></strong></div>
+  {% endif %}
   <div><span>ID da Operação Financeira</span><strong>{{ operacao.id }}</strong></div>
   <div><span>Número da Operação Financeira</span><strong>{{ operacao.numero_operacao }}</strong></div>
   <div><span>Categoria</span><strong>{{ operacao.categoria_operacao }}</strong></div>
@@ -32,9 +35,17 @@
 
 <h2>Editar metadados</h2>
 <p class="muted">As Invoices e os valores consumidos são imutáveis. Para corrigir a alocação, exclua esta operação e registre outra.</p>
-<form method="post" action="{{ url_for('editar_operacao_financeira', operacao_id=operacao.id) }}" class="form inline-form">
+<form method="post" action="{{ url_for('editar_operacao_financeira', operacao_id=operacao.id) }}" class="form inline-form" data-financing-linked="{{ operacao.financiamento_exportacao_id or '' }}">
+  {% if operacao.financiamento_exportacao_id %}
+  <label>Número da Operação Financeira (derivado do financiamento)<input name="numero_operacao" value="{{ operacao.numero_operacao }}" readonly required></label>
+  {% else %}
   <label>Número da Operação Financeira<input name="numero_operacao" maxlength="120" value="{{ operacao.numero_operacao }}" required></label>
+  {% endif %}
+  {% if operacao.financiamento_exportacao_id %}
+  <label>Categoria<select name="categoria_operacao" required disabled>{% for categoria in categorias %}<option value="{{ categoria }}" {{ 'selected' if categoria == operacao.categoria_operacao }}>{{ categoria }}</option>{% endfor %}</select><input type="hidden" name="categoria_operacao" value="{{ operacao.categoria_operacao }}"></label>
+  {% else %}
   <label>Categoria<select name="categoria_operacao" required>{% for categoria in categorias %}<option value="{{ categoria }}" {{ 'selected' if categoria == operacao.categoria_operacao }}>{{ categoria }}</option>{% endfor %}</select></label>
+  {% endif %}
   <label>Data de Liquidação<input type="date" name="data_liquidacao" value="{{ operacao.data_liquidacao }}" required></label>
   <label>Taxa liquidação<input name="taxa_cambio" data-rate value="{{ operacao.taxa_cambio|rate }}" required></label>
   <label>Despesas banco intermediário (USD)<input name="despesas_banco_intermediario_usd" data-money value="{{ operacao.despesas_banco_intermediario_usd|money }}" min="0" step="0.01" {% if operacao.moeda|upper != 'USD' %}disabled title="Despesas intermediárias só podem ser informadas em operações USD."{% endif %}></label>

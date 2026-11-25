@@ -820,6 +820,30 @@
     const operationRate = operationForm ? operationForm.querySelector('[name="taxa_cambio"]') : null;
     const operationBank = operationForm
       ? operationForm.querySelector('[name="banco_liquidacao_id"]') : null;
+    const operationCategory = operationForm
+      ? operationForm.querySelector('[name="categoria_operacao"]') : null;
+    const financingOptionsSource = document.querySelector('[data-financing-options]');
+    const financingOptions = financingOptionsSource
+      ? [...financingOptionsSource.querySelectorAll('option')] : [];
+    const syncFinancingOptions = () => {
+      const category = operationCategory ? operationCategory.value : '';
+      if (!operationForm) return;
+      operationForm.querySelectorAll('[data-financing-select]').forEach((select) => {
+        [...select.options].forEach((option) => {
+          if (!option.value) return;
+          option.hidden = Boolean(category)
+            && option.dataset.financingCategory !== category;
+        });
+        const selectedOption = select.selectedOptions[0];
+        if (selectedOption && selectedOption.hidden) {
+          select.value = '';
+          const display = select.closest('[data-operation-group]')
+            ? select.closest('[data-operation-group]').querySelector('[data-financing-number-display]')
+            : null;
+          if (display) display.value = '';
+        }
+      });
+    };
     if (operationBank) {
       [...operationBank.options].forEach((option) => {
         option.dataset.conversionRule = bankRules.get(option.value) || 'HALF_UP';
@@ -868,7 +892,9 @@
           const currency = groupElement.dataset.operationCurrency || 'USD';
           const totalBrlAmount = decimalParts(conversionPreview(total, rate, selectedRule));
           const expenseBrlAmount = decimalParts(conversionPreview(expense, rate, selectedRule));
-          const principalBrlAmount = decimalSubtract(totalBrlAmount, expenseBrlAmount);
+          const principalBrlAmount = decimalParts(
+            conversionPreview(decimalSubtract(total, expense), rate, selectedRule),
+          );
           const totalBrl = formatDisplayedMoney(totalBrlAmount);
           const expenseBrl = formatDisplayedMoney(expenseBrlAmount);
           const principalBrl = formatDisplayedMoney(principalBrlAmount);
@@ -967,17 +993,52 @@
           label.textContent = `Número da Operação Financeira — Grupo ${index + 1} (${group.bank} · ${group.currency})`;
           const input = document.createElement('input');
           input.type = 'text';
-          input.name = `numero_operacao_grupo_${group.bankId}_${group.currency}`;
+          input.readOnly = true;
+          input.dataset.financingNumberDisplay = '1';
           input.maxLength = 120;
-          input.required = true;
-          input.placeholder = 'Obrigatório e único';
+          input.required = false;
+          input.placeholder = 'Preenchido pelo financiamento selecionado';
           label.appendChild(input);
           const groupKey = `${group.bankId}|${group.currency}`;
           const groupElement = document.createElement('div');
           groupElement.dataset.operationGroup = groupKey;
           groupElement.dataset.operationCurrency = group.currency;
           groupElement.className = 'central-closing-contract-field';
+          const groupCompanyIds = new Set(selected()
+            .filter((checkbox) => (
+              `${checkbox.dataset.invoiceBankId || ''}|${checkbox.dataset.invoiceCurrency || ''}`
+              === groupKey
+            ))
+            .map((checkbox) => checkbox.dataset.invoiceCompanyId || ''));
+          const financingLabel = document.createElement('label');
+          financingLabel.textContent = `Financiamento de Exportação — Grupo ${index + 1} (${group.bank} · ${group.currency})`;
+          const financingSelect = document.createElement('select');
+          financingSelect.name = `financiamento_id_grupo_${group.bankId}_${group.currency}`;
+          financingSelect.required = true;
+          financingSelect.disabled = groupCompanyIds.size !== 1;
+          financingSelect.dataset.financingSelect = '1';
+          const financingPlaceholder = document.createElement('option');
+          financingPlaceholder.value = '';
+          financingPlaceholder.textContent = groupCompanyIds.size === 1
+            ? 'Selecione um financiamento compatível'
+            : 'Seleção indisponível para grupo multiempresa';
+          financingSelect.appendChild(financingPlaceholder);
+          const groupCompanyId = groupCompanyIds.size === 1
+            ? [...groupCompanyIds][0] : '';
+          financingOptions
+            .filter((option) => option.dataset.financingCurrency === group.currency
+              && option.dataset.financingCompanyId === groupCompanyId)
+            .forEach((option) => financingSelect.appendChild(option.cloneNode(true)));
+          if (financingSelect.options.length === 1 && groupCompanyId) {
+            financingPlaceholder.textContent = 'Nenhum financiamento compatível ou com saldo disponível';
+          }
+          financingLabel.appendChild(financingSelect);
+          groupElement.appendChild(financingLabel);
           groupElement.appendChild(label);
+          financingSelect.addEventListener('change', () => {
+            const option = financingSelect.selectedOptions[0];
+            input.value = option ? option.dataset.financingNumber || '' : '';
+          });
 
           const expenseLabel = document.createElement('label');
           expenseLabel.textContent = 'Despesas banco intermediário (USD)';
@@ -1039,10 +1100,12 @@
           ? selectedDefaults[0] : '';
         operationBank.value = defaultBank;
       }
+      syncFinancingOptions();
       syncOperationTotals();
     };
     if (operationRate) operationRate.addEventListener('input', syncOperationTotals);
     if (operationBank) operationBank.addEventListener('change', syncOperationTotals);
+    if (operationCategory) operationCategory.addEventListener('change', syncFinancingOptions);
     if (operationSubmit && operationDialog) operationSubmit.addEventListener('click', () => {
       if (!selected().length || !sameClient(selected())) {
         window.alert('Selecione uma ou mais Invoices do mesmo Cliente.');
@@ -1063,6 +1126,14 @@
       closeOperationDialog();
     });
     if (operationForm) operationForm.addEventListener('submit', (event) => {
+      const financingSelects = [...operationForm.querySelectorAll('[data-financing-select]')];
+      const missingFinancing = financingSelects.find((select) => !select.value);
+      if (missingFinancing) {
+        event.preventDefault();
+        window.alert('Selecione um Financiamento de Exportação compatível para cada grupo.');
+        missingFinancing.focus();
+        return;
+      }
       const expenseInputs = [...operationForm.querySelectorAll('[data-operation-expense]')];
       for (const input of expenseInputs) {
         const raw = input.value.trim();
@@ -1109,6 +1180,16 @@
       }
     });
     sync();
+  });
+  document.querySelectorAll('form[data-financing-linked]').forEach((form) => {
+    if (!form.dataset.financingLinked) return;
+    const number = form.querySelector('[name="numero_operacao"]');
+    const category = form.querySelector('[name="categoria_operacao"]');
+    if (number) number.readOnly = true;
+    if (category) {
+      const original = category.value;
+      category.addEventListener('change', () => { category.value = original; });
+    }
   });
   document.querySelectorAll('form[data-previsao-embarque-form]').forEach((form) => {
     const category = form.querySelector('[data-previsao-cambio-category]');

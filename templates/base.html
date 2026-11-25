@@ -45,6 +45,14 @@
             </div>
           </div>
 
+          {% set financing_active = request.path.startswith('/financiamento-exportacoes') %}
+          <div class="sidebar-nav-group{{ ' is-active' if financing_active else '' }}" data-sidebar-group>
+            <div class="sidebar-nav-row">
+              <a class="sidebar-link{{ ' is-active' if financing_active else '' }}" href="{{ url_for('lista_financiamento_exportacoes') }}" data-sidebar-tooltip="Financiamento de Exportações" aria-label="Financiamento de Exportações"{% if financing_active %} aria-current="page"{% endif %}><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 6h16v12H4z"/><path d="M8 10h8M8 14h5"/><path d="M17 3v3M7 3v3"/></svg></span><span class="sidebar-label">Financiamento de Exportações</span>
+              {{- '' -}}</a>
+            </div>
+          </div>
+
           {% set dues_active = request.path.startswith('/due') %}
           <div class="sidebar-nav-group{{ ' is-active' if dues_active else '' }}" data-sidebar-group>
             <div class="sidebar-nav-row">

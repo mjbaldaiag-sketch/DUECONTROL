@@ -26,9 +26,9 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 21
+INVOICE_SCHEMA_VERSION = 25
 INVOICE_LEGACY_SCHEMA_VERSION = 15
-SAFRA_SCHEMA_VERSION = 21
+SAFRA_SCHEMA_VERSION = 25
 
 SALDO_TOLERANCE = Decimal("0.005")
 CONVERSION_RULE_HALF_DOWN = "HALF_DOWN"
@@ -54,6 +54,16 @@ CATEGORIAS_CAMBIO = (
     CATEGORIA_CAMBIO_FINANCEIRO,
 )
 OPERACAO_FINANCEIRA_CATEGORIAS = ("ACC", "ACE", "PPE")
+FINANCIAMENTO_STATUS_ABERTA = "ABERTA"
+FINANCIAMENTO_STATUS_PARCIAL = "PARCIAL"
+FINANCIAMENTO_STATUS_LIQUIDADA = "LIQUIDADA"
+FINANCIAMENTO_STATUS_OPTIONS = (
+    FINANCIAMENTO_STATUS_ABERTA,
+    FINANCIAMENTO_STATUS_PARCIAL,
+    FINANCIAMENTO_STATUS_LIQUIDADA,
+)
+FINANCIAMENTO_ORIGEM = "FINANCIAMENTO_EXPORTACOES"
+FINANCIAMENTO_ORIGEM_LEGADO = "INVOICE_LEGADO"
 PREVISAO_EMBARQUE_MIN_DIAS = 1
 PREVISAO_EMBARQUE_MAX_DIAS = 360
 PREVISAO_EMBARQUE_LEGADO_DIAS = 120
@@ -464,6 +474,310 @@ def migrate_invoice_status_constraint(conn):
         conn.rollback()
         conn.execute("PRAGMA foreign_keys = ON")
         raise
+
+
+def migrate_operacoes_financeiras_number_schema(conn):
+    """Remove a unicidade do número sem recriar operações ou seus vínculos."""
+    unique_number_index = None
+    for index in conn.execute("PRAGMA index_list('operacoes_financeiras')").fetchall():
+        if not index[2]:
+            continue
+        index_name = index[1]
+        escaped_index_name = index_name.replace('"', '""')
+        columns = [row[2] for row in conn.execute(
+            f'PRAGMA index_info("{escaped_index_name}")'
+        ).fetchall()]
+        if columns == ["numero_operacao"]:
+            unique_number_index = index_name
+            break
+    if not unique_number_index:
+        return False
+
+    index_sql = [row[0] for row in conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='index' AND tbl_name='operacoes_financeiras' AND sql IS NOT NULL"
+    ).fetchall()]
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("DROP TABLE IF EXISTS operacoes_financeiras_number_migration")
+        conn.execute("""
+            CREATE TABLE operacoes_financeiras_number_migration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                numero_operacao TEXT NOT NULL COLLATE NOCASE,
+                cliente_id INTEGER NOT NULL,
+                banco_credito_id INTEGER NOT NULL,
+                moeda TEXT NOT NULL,
+                categoria_operacao TEXT NOT NULL CHECK(categoria_operacao IN ('ACC','ACE','PPE')),
+                data_fechamento TEXT NOT NULL,
+                data_liquidacao TEXT NOT NULL,
+                banco_liquidacao_id INTEGER NOT NULL,
+                taxa_cambio REAL NOT NULL,
+                valor_brl REAL NOT NULL,
+                despesas_banco_intermediario_usd REAL NOT NULL DEFAULT 0
+                    CHECK(despesas_banco_intermediario_usd >= 0),
+                despesas_banco_intermediario_brl REAL NOT NULL DEFAULT 0
+                    CHECK(despesas_banco_intermediario_brl >= 0),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT,
+                FOREIGN KEY (banco_credito_id) REFERENCES contrapartes(id) ON DELETE RESTRICT,
+                FOREIGN KEY (banco_liquidacao_id) REFERENCES contrapartes(id) ON DELETE RESTRICT
+            )
+        """)
+        columns = (
+            "id,numero_operacao,cliente_id,banco_credito_id,moeda,categoria_operacao,"
+            "data_fechamento,data_liquidacao,banco_liquidacao_id,taxa_cambio,valor_brl,"
+            "despesas_banco_intermediario_usd,despesas_banco_intermediario_brl,"
+            "created_at,updated_at"
+        )
+        conn.execute(
+            f"INSERT INTO operacoes_financeiras_number_migration ({columns}) "
+            f"SELECT {columns} FROM operacoes_financeiras"
+        )
+        max_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM operacoes_financeiras_number_migration"
+        ).fetchone()[0]
+        conn.execute("DROP TABLE operacoes_financeiras")
+        conn.execute(
+            "ALTER TABLE operacoes_financeiras_number_migration "
+            "RENAME TO operacoes_financeiras"
+        )
+        for sql in index_sql:
+            conn.execute(sql)
+        sequence = conn.execute(
+            "SELECT 1 FROM sqlite_sequence WHERE name='operacoes_financeiras'"
+        ).fetchone()
+        if sequence:
+            conn.execute(
+                "UPDATE sqlite_sequence SET seq=? WHERE name='operacoes_financeiras'",
+                (max_id,),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO sqlite_sequence(name, seq) VALUES ('operacoes_financeiras', ?)",
+                (max_id,),
+            )
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON")
+        return True
+    except Exception:
+        conn.rollback()
+        conn.execute("PRAGMA foreign_keys = ON")
+        raise
+
+
+def migrate_operacoes_financeiras_export_schema(conn):
+    """Prepara as operações financeiras para o cadastro independente de exportação."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(operacoes_financeiras)")
+    }
+    if "empresa_id" not in columns or "data_contratacao" not in columns:
+        index_sql = [row[0] for row in conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='operacoes_financeiras' AND sql IS NOT NULL"
+        ).fetchall()]
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("DROP TABLE IF EXISTS operacoes_financeiras_export_migration")
+            conn.execute("""
+                CREATE TABLE operacoes_financeiras_export_migration (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    numero_operacao TEXT COLLATE NOCASE,
+                    cliente_id INTEGER,
+                    empresa_id INTEGER,
+                    banco_credito_id INTEGER NOT NULL,
+                    moeda TEXT NOT NULL,
+                    categoria_operacao TEXT NOT NULL CHECK(categoria_operacao IN ('ACC','ACE','PPE')),
+                    numero_contrato_cambio TEXT,
+                    data_contratacao TEXT,
+                    data_limite_liquidacao TEXT,
+                    valor_contratado_moeda REAL NOT NULL DEFAULT 0 CHECK(valor_contratado_moeda >= 0),
+                    taxa_contratada REAL,
+                    valor_contratado_brl REAL NOT NULL DEFAULT 0 CHECK(valor_contratado_brl >= 0),
+                    data_fechamento TEXT,
+                    data_liquidacao TEXT,
+                    banco_liquidacao_id INTEGER,
+                    taxa_cambio REAL,
+                    valor_brl REAL,
+                    despesas_banco_intermediario_usd REAL NOT NULL DEFAULT 0 CHECK(despesas_banco_intermediario_usd >= 0),
+                    despesas_banco_intermediario_brl REAL NOT NULL DEFAULT 0 CHECK(despesas_banco_intermediario_brl >= 0),
+                    status TEXT NOT NULL DEFAULT 'ABERTA' CHECK(status IN ('ABERTA','PARCIAL','LIQUIDADA')),
+                    observacao TEXT,
+                    origem TEXT NOT NULL DEFAULT 'INVOICE_LEGADO',
+                    financiamento_exportacao_id INTEGER,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT,
+                    FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE RESTRICT,
+                    FOREIGN KEY (banco_credito_id) REFERENCES contrapartes(id) ON DELETE RESTRICT,
+                    FOREIGN KEY (banco_liquidacao_id) REFERENCES contrapartes(id) ON DELETE RESTRICT,
+                    FOREIGN KEY (financiamento_exportacao_id)
+                        REFERENCES operacoes_financeiras(id) ON DELETE RESTRICT
+                )
+            """)
+            conn.execute("""
+                INSERT INTO operacoes_financeiras_export_migration
+                    (id,numero_operacao,cliente_id,empresa_id,banco_credito_id,moeda,
+                     categoria_operacao,numero_contrato_cambio,data_contratacao,
+                     data_limite_liquidacao,
+                     valor_contratado_moeda,taxa_contratada,valor_contratado_brl,
+                     data_fechamento,data_liquidacao,banco_liquidacao_id,taxa_cambio,
+                     valor_brl,despesas_banco_intermediario_usd,
+                     despesas_banco_intermediario_brl,status,observacao,origem,
+                     financiamento_exportacao_id,
+                     created_at,updated_at)
+                SELECT o.id, o.numero_operacao, o.cliente_id,
+                       (SELECT CASE WHEN COUNT(DISTINCT i.empresa_id)=1 THEN MIN(i.empresa_id) END
+                          FROM operacoes_financeiras_invoices oi_company
+                          JOIN invoices i ON i.id=oi_company.invoice_id
+                         WHERE oi_company.operacao_financeira_id=o.id),
+                       o.banco_credito_id, o.moeda, o.categoria_operacao, NULL,
+                       o.data_fechamento, NULL,
+                       COALESCE((SELECT SUM(oi.valor_moeda)
+                                   FROM operacoes_financeiras_invoices oi
+                                  WHERE oi.operacao_financeira_id=o.id), 0),
+                       o.taxa_cambio, COALESCE(o.valor_brl, 0), o.data_fechamento,
+                       o.data_liquidacao, o.banco_liquidacao_id, o.taxa_cambio,
+                       o.valor_brl, COALESCE(o.despesas_banco_intermediario_usd, 0),
+                       COALESCE(o.despesas_banco_intermediario_brl, 0),
+                       CASE WHEN o.data_liquidacao IS NOT NULL
+                                  AND COALESCE((SELECT SUM(oi_status.valor_moeda)
+                                                 FROM operacoes_financeiras_invoices oi_status
+                                                WHERE oi_status.operacao_financeira_id=o.id), 0) > 0
+                            THEN 'LIQUIDADA' ELSE 'ABERTA' END,
+                       NULL, 'INVOICE_LEGADO', NULL, o.created_at, o.updated_at
+                  FROM operacoes_financeiras o
+            """)
+            max_id = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM operacoes_financeiras_export_migration"
+            ).fetchone()[0]
+            conn.execute("DROP TABLE operacoes_financeiras")
+            conn.execute(
+                "ALTER TABLE operacoes_financeiras_export_migration RENAME TO operacoes_financeiras"
+            )
+            for sql in index_sql:
+                conn.execute(sql)
+            sequence = conn.execute(
+                "SELECT 1 FROM sqlite_sequence WHERE name='operacoes_financeiras'"
+            ).fetchone()
+            if sequence:
+                conn.execute(
+                    "UPDATE sqlite_sequence SET seq=? WHERE name='operacoes_financeiras'",
+                    (max_id,),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO sqlite_sequence(name, seq) VALUES ('operacoes_financeiras', ?)",
+                    (max_id,),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+
+    operation_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(operacoes_financeiras)"
+        )
+    }
+    if "data_limite_liquidacao" not in operation_columns:
+        conn.execute(
+            "ALTER TABLE operacoes_financeiras ADD COLUMN data_limite_liquidacao TEXT"
+        )
+    if "financiamento_exportacao_id" not in operation_columns:
+        conn.execute(
+            "ALTER TABLE operacoes_financeiras ADD COLUMN "
+            "financiamento_exportacao_id INTEGER "
+            "REFERENCES operacoes_financeiras(id) ON DELETE RESTRICT"
+        )
+
+    invoice_link_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(operacoes_financeiras_invoices)"
+        )
+    }
+    if "observacao" not in invoice_link_columns:
+        conn.execute(
+            "ALTER TABLE operacoes_financeiras_invoices ADD COLUMN observacao TEXT"
+        )
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS operacoes_financeiras_liquidacoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operacao_financeira_id INTEGER NOT NULL,
+            data_liquidacao TEXT NOT NULL,
+            taxa_liquidacao REAL NOT NULL CHECK(taxa_liquidacao > 0),
+            valor_liquidado_moeda REAL NOT NULL CHECK(valor_liquidado_moeda > 0),
+            valor_liquidado_brl REAL NOT NULL CHECK(valor_liquidado_brl >= 0),
+            observacao TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (operacao_financeira_id) REFERENCES operacoes_financeiras(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS operacoes_financeiras_dues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operacao_financeira_id INTEGER NOT NULL,
+            due_id INTEGER NOT NULL,
+            moeda TEXT NOT NULL,
+            valor_vinculado REAL NOT NULL CHECK(valor_vinculado > 0),
+            observacao TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(operacao_financeira_id, due_id),
+            FOREIGN KEY (operacao_financeira_id) REFERENCES operacoes_financeiras(id) ON DELETE CASCADE,
+            FOREIGN KEY (due_id) REFERENCES dues(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS operacoes_financeiras_contratos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operacao_financeira_id INTEGER NOT NULL,
+            contrato_id INTEGER NOT NULL,
+            moeda TEXT NOT NULL,
+            valor_vinculado REAL NOT NULL CHECK(valor_vinculado > 0),
+            observacao TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(operacao_financeira_id, contrato_id),
+            FOREIGN KEY (operacao_financeira_id) REFERENCES operacoes_financeiras(id) ON DELETE CASCADE,
+            FOREIGN KEY (contrato_id) REFERENCES contratos(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_operacoes_financeiras_empresa ON operacoes_financeiras(empresa_id);
+        CREATE INDEX IF NOT EXISTS idx_operacoes_financeiras_financiamento
+            ON operacoes_financeiras(financiamento_exportacao_id);
+        CREATE INDEX IF NOT EXISTS idx_operacoes_financeiras_status ON operacoes_financeiras(status);
+        CREATE INDEX IF NOT EXISTS idx_operacoes_financeiras_contrato ON operacoes_financeiras(numero_contrato_cambio);
+        CREATE INDEX IF NOT EXISTS idx_operacoes_financeiras_liquidacoes_operacao ON operacoes_financeiras_liquidacoes(operacao_financeira_id);
+        CREATE INDEX IF NOT EXISTS idx_operacoes_financeiras_dues_operacao ON operacoes_financeiras_dues(operacao_financeira_id);
+        CREATE INDEX IF NOT EXISTS idx_operacoes_financeiras_dues_due ON operacoes_financeiras_dues(due_id);
+        CREATE INDEX IF NOT EXISTS idx_operacoes_financeiras_contratos_operacao ON operacoes_financeiras_contratos(operacao_financeira_id);
+        CREATE INDEX IF NOT EXISTS idx_operacoes_financeiras_contratos_contrato ON operacoes_financeiras_contratos(contrato_id);
+    """)
+    conn.execute("""
+        INSERT INTO operacoes_financeiras_liquidacoes
+            (operacao_financeira_id,data_liquidacao,taxa_liquidacao,
+             valor_liquidado_moeda,valor_liquidado_brl,observacao)
+        SELECT o.id, o.data_liquidacao, COALESCE(o.taxa_cambio, o.taxa_contratada),
+               o.valor_contratado_moeda, COALESCE(o.valor_brl, o.valor_contratado_brl),
+               'Liquidação histórica migrada do fluxo de Invoice.'
+          FROM operacoes_financeiras o
+         WHERE o.origem=? AND o.data_liquidacao IS NOT NULL
+           AND COALESCE(o.taxa_cambio, o.taxa_contratada, 0) > 0
+           AND o.valor_contratado_moeda > 0
+           AND NOT EXISTS (
+               SELECT 1 FROM operacoes_financeiras_liquidacoes l
+                WHERE l.operacao_financeira_id=o.id
+           )
+    """, (FINANCIAMENTO_ORIGEM_LEGADO,))
+    conn.execute("""
+        UPDATE operacoes_financeiras
+           SET status=CASE WHEN EXISTS (
+               SELECT 1 FROM operacoes_financeiras_liquidacoes l
+                WHERE l.operacao_financeira_id=operacoes_financeiras.id
+           ) THEN 'LIQUIDADA' ELSE 'ABERTA' END
+         WHERE origem=?
+    """, (FINANCIAMENTO_ORIGEM_LEGADO,))
 
 
 def migrate_produtos_schema(conn):
@@ -1059,25 +1373,40 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS operacoes_financeiras (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                numero_operacao TEXT NOT NULL COLLATE NOCASE UNIQUE,
-                cliente_id INTEGER NOT NULL,
+                numero_operacao TEXT COLLATE NOCASE,
+                cliente_id INTEGER,
+                empresa_id INTEGER,
                 banco_credito_id INTEGER NOT NULL,
                 moeda TEXT NOT NULL,
                 categoria_operacao TEXT NOT NULL CHECK(categoria_operacao IN ('ACC','ACE','PPE')),
-                data_fechamento TEXT NOT NULL,
-                data_liquidacao TEXT NOT NULL,
-                banco_liquidacao_id INTEGER NOT NULL,
-                taxa_cambio REAL NOT NULL,
-                valor_brl REAL NOT NULL,
+                numero_contrato_cambio TEXT,
+                data_contratacao TEXT,
+                data_limite_liquidacao TEXT,
+                valor_contratado_moeda REAL NOT NULL DEFAULT 0 CHECK(valor_contratado_moeda >= 0),
+                taxa_contratada REAL,
+                valor_contratado_brl REAL NOT NULL DEFAULT 0 CHECK(valor_contratado_brl >= 0),
+                data_fechamento TEXT,
+                data_liquidacao TEXT,
+                banco_liquidacao_id INTEGER,
+                taxa_cambio REAL,
+                valor_brl REAL,
                 despesas_banco_intermediario_usd REAL NOT NULL DEFAULT 0
                     CHECK(despesas_banco_intermediario_usd >= 0),
                 despesas_banco_intermediario_brl REAL NOT NULL DEFAULT 0
                     CHECK(despesas_banco_intermediario_brl >= 0),
+                status TEXT NOT NULL DEFAULT 'ABERTA'
+                    CHECK(status IN ('ABERTA','PARCIAL','LIQUIDADA')),
+                observacao TEXT,
+                origem TEXT NOT NULL DEFAULT 'FINANCIAMENTO_EXPORTACOES',
+                financiamento_exportacao_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT,
+                FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE RESTRICT,
                 FOREIGN KEY (banco_credito_id) REFERENCES contrapartes(id) ON DELETE RESTRICT,
-                FOREIGN KEY (banco_liquidacao_id) REFERENCES contrapartes(id) ON DELETE RESTRICT
+                FOREIGN KEY (banco_liquidacao_id) REFERENCES contrapartes(id) ON DELETE RESTRICT,
+                FOREIGN KEY (financiamento_exportacao_id)
+                    REFERENCES operacoes_financeiras(id) ON DELETE RESTRICT
             );
 
             CREATE TABLE IF NOT EXISTS operacoes_financeiras_invoices (
@@ -1086,11 +1415,56 @@ def init_db():
                 invoice_id INTEGER NOT NULL,
                 moeda TEXT NOT NULL,
                 valor_moeda REAL NOT NULL CHECK(valor_moeda > 0),
+                observacao TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(operacao_financeira_id, invoice_id),
                 FOREIGN KEY (operacao_financeira_id)
                     REFERENCES operacoes_financeiras(id) ON DELETE CASCADE,
                 FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS operacoes_financeiras_liquidacoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operacao_financeira_id INTEGER NOT NULL,
+                data_liquidacao TEXT NOT NULL,
+                taxa_liquidacao REAL NOT NULL CHECK(taxa_liquidacao > 0),
+                valor_liquidado_moeda REAL NOT NULL CHECK(valor_liquidado_moeda > 0),
+                valor_liquidado_brl REAL NOT NULL CHECK(valor_liquidado_brl >= 0),
+                observacao TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (operacao_financeira_id)
+                    REFERENCES operacoes_financeiras(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS operacoes_financeiras_dues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operacao_financeira_id INTEGER NOT NULL,
+                due_id INTEGER NOT NULL,
+                moeda TEXT NOT NULL,
+                valor_vinculado REAL NOT NULL CHECK(valor_vinculado > 0),
+                observacao TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(operacao_financeira_id, due_id),
+                FOREIGN KEY (operacao_financeira_id)
+                    REFERENCES operacoes_financeiras(id) ON DELETE CASCADE,
+                FOREIGN KEY (due_id) REFERENCES dues(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS operacoes_financeiras_contratos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operacao_financeira_id INTEGER NOT NULL,
+                contrato_id INTEGER NOT NULL,
+                moeda TEXT NOT NULL,
+                valor_vinculado REAL NOT NULL CHECK(valor_vinculado > 0),
+                observacao TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(operacao_financeira_id, contrato_id),
+                FOREIGN KEY (operacao_financeira_id)
+                    REFERENCES operacoes_financeiras(id) ON DELETE CASCADE,
+                FOREIGN KEY (contrato_id) REFERENCES contratos(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS due_invoice (
@@ -1292,6 +1666,8 @@ def init_db():
                 "despesas_banco_intermediario_brl REAL NOT NULL DEFAULT 0 "
                 "CHECK(despesas_banco_intermediario_brl >= 0)"
             )
+        migrate_operacoes_financeiras_number_schema(conn)
+        migrate_operacoes_financeiras_export_schema(conn)
         header_columns = {row[1] for row in conn.execute("PRAGMA table_info(fechamentos)")}
         if "taxa_cambio" not in header_columns:
             conn.execute("ALTER TABLE fechamentos ADD COLUMN taxa_cambio REAL")
@@ -1800,6 +2176,13 @@ def closing_brl_value(valor_moeda, taxa_cambio, regra=CONVERSION_RULE_DEFAULT):
         else ROUND_HALF_UP
     )
     return value.quantize(Decimal("0.01"), rounding=rounding)
+
+
+def financial_operation_principal_brl(total_moeda, despesas_usd, taxa_cambio,
+                                      regra=CONVERSION_RULE_DEFAULT):
+    """Arredonda a amortização principal de forma independente das despesas."""
+    principal_moeda = decimal_value(total_moeda) - decimal_value(despesas_usd)
+    return closing_brl_value(principal_moeda, taxa_cambio, regra)
 
 
 def selected_record_ids(form, operation="excluir"):
@@ -10991,7 +11374,8 @@ def invoice_summary(conn, invoice_id):
                  WHERE oi_total.operacao_financeira_id=o.id) AS operacao_valor_moeda,
                o.created_at,
                bank_credito.nome AS banco_credito_nome,
-               bank_liquidacao.nome AS banco_liquidacao_nome
+               bank_liquidacao.nome AS banco_liquidacao_nome,
+               bank_liquidacao.regra_conversao_brl AS regra_conversao_brl
         FROM operacoes_financeiras_invoices oi
         JOIN operacoes_financeiras o ON o.id=oi.operacao_financeira_id
         LEFT JOIN contrapartes bank_credito ON bank_credito.id=o.banco_credito_id
@@ -12814,6 +13198,7 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
             "id": invoice["id"],
             "numero_invoice": invoice["numero_invoice"],
             "tipo_documento": invoice["tipo_documento"],
+            "empresa_id": invoice["empresa_id"],
             "empresa_apelido": invoice["empresa_apelido"],
             "empresa_razao_social": invoice["empresa_razao_social"],
             "valor_moeda": invoice["valor_fechamento"],
@@ -12868,8 +13253,9 @@ def financial_operation_groups(conn, raw_ids, data_fechamento=None, data_liquida
         group["despesas_banco_intermediario_brl"] = closing_brl_value(
             expense, group["taxa_cambio"], group["regra_conversao_brl"]
         )
-        group["amortizacao_principal_brl"] = (
-            group["valor_brl"] - group["despesas_banco_intermediario_brl"]
+        group["amortizacao_principal_brl"] = financial_operation_principal_brl(
+            group["valor_moeda"], expense, group["taxa_cambio"],
+            group["regra_conversao_brl"]
         )
         group["amortizacao_principal_usd"] = (
             group["valor_moeda"] - expense
@@ -13408,6 +13794,7 @@ def financial_operation_headers(conn):
     rows = conn.execute("""
         SELECT o.*, cl.nome AS cliente_nome,
                bc.nome AS banco_credito_nome, bl.nome AS banco_liquidacao_nome,
+               bl.regra_conversao_brl AS regra_conversao_brl,
                MIN(e.prioridade) AS empresa_prioridade,
                GROUP_CONCAT(DISTINCT COALESCE(NULLIF(TRIM(e.apelido), ''), e.razao_social))
                    AS empresas_apelidos,
@@ -13435,6 +13822,7 @@ def financial_operation_breakdown(operation, total_moeda=None):
     expense_usd = decimal_value(data.get("despesas_banco_intermediario_usd", 0))
     expense_brl = decimal_value(data.get("despesas_banco_intermediario_brl", 0))
     total_brl = decimal_value(data.get("valor_brl", 0))
+    conversion_rule = normalize_conversion_rule(data.get("regra_conversao_brl"))
     data["operacao_valor_moeda"] = total
     data["despesas_banco_intermediario_usd"] = expense_usd
     data["despesas_banco_intermediario_brl"] = expense_brl
@@ -13442,20 +13830,33 @@ def financial_operation_breakdown(operation, total_moeda=None):
     data["amortizacao_principal_usd"] = (
         total - expense_usd if currency == "USD" else None
     )
-    data["amortizacao_principal_brl"] = total_brl - expense_brl
+    if data.get("taxa_cambio") is not None:
+        data["amortizacao_principal_brl"] = financial_operation_principal_brl(
+            total, expense_usd, data["taxa_cambio"], conversion_rule
+        )
+    else:
+        data["amortizacao_principal_brl"] = total_brl - expense_brl
     return data
 
 
 def financial_operation_detail(conn, operacao_id):
     header = conn.execute("""
         SELECT o.*, cl.nome AS cliente_nome,
-               bc.nome AS banco_credito_nome, bl.nome AS banco_liquidacao_nome
+               bc.nome AS banco_credito_nome, bl.nome AS banco_liquidacao_nome,
+               bl.regra_conversao_brl AS regra_conversao_brl,
+               financiamento.id AS financiamento_id,
+               financiamento.numero_contrato_cambio AS financiamento_numero_contrato,
+               financiamento.categoria_operacao AS financiamento_categoria,
+               financiamento.empresa_id AS financiamento_empresa_id
         FROM operacoes_financeiras o
         JOIN clientes cl ON cl.id=o.cliente_id
         JOIN contrapartes bc ON bc.id=o.banco_credito_id
         JOIN contrapartes bl ON bl.id=o.banco_liquidacao_id
+        LEFT JOIN operacoes_financeiras financiamento
+               ON financiamento.id=o.financiamento_exportacao_id
+              AND financiamento.origem=?
         WHERE o.id=?
-    """, (operacao_id,)).fetchone()
+    """, (FINANCIAMENTO_ORIGEM, operacao_id)).fetchone()
     if not header:
         return None
     items = conn.execute("""
@@ -13471,6 +13872,481 @@ def financial_operation_detail(conn, operacao_id):
     data["items"] = items
     data["valor_moeda"] = sum((decimal_value(item["valor_moeda"]) for item in items), Decimal("0"))
     return financial_operation_breakdown(data)
+
+
+@app.template_filter("financiamento_status_class")
+def financiamento_status_class(status):
+    return {
+        FINANCIAMENTO_STATUS_ABERTA: "status-pendente",
+        FINANCIAMENTO_STATUS_PARCIAL: "status-parcial",
+        FINANCIAMENTO_STATUS_LIQUIDADA: "status-concluido",
+    }.get(status, "status-pendente")
+
+
+def financiamento_currency(value):
+    currency = normalized_currency_code(value)
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise ValueError("Informe uma moeda válida com três letras.")
+    return currency
+
+
+def financiamento_operation_total_liquidado(conn, operacao_id, exclude_id=None):
+    query = """
+        SELECT COALESCE(SUM(valor_liquidado_moeda), 0),
+               COALESCE(SUM(valor_liquidado_brl), 0)
+          FROM operacoes_financeiras_liquidacoes
+         WHERE operacao_financeira_id=?
+    """
+    params = [operacao_id]
+    if exclude_id is not None:
+        query += " AND id<>?"
+        params.append(exclude_id)
+    row = conn.execute(query, params).fetchone()
+    return decimal_value(row[0]), decimal_value(row[1])
+
+
+def financiamento_recalcular_status(conn, operacao_id):
+    operation = conn.execute(
+        "SELECT valor_contratado_moeda FROM operacoes_financeiras WHERE id=?",
+        (operacao_id,),
+    ).fetchone()
+    if not operation:
+        return None
+    contracted = decimal_value(operation["valor_contratado_moeda"])
+    liquidated, _ = financiamento_operation_total_liquidado(conn, operacao_id)
+    if liquidated <= SALDO_TOLERANCE:
+        status = FINANCIAMENTO_STATUS_ABERTA
+    elif liquidated >= contracted - SALDO_TOLERANCE:
+        status = FINANCIAMENTO_STATUS_LIQUIDADA
+    else:
+        status = FINANCIAMENTO_STATUS_PARCIAL
+    conn.execute(
+        "UPDATE operacoes_financeiras SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (status, operacao_id),
+    )
+    return status
+
+
+def financiamento_auditar(conn, operacao_id, acao, anteriores=None, novos=None,
+                          entidade="operacao_financeira"):
+    conn.execute(
+        """
+        INSERT INTO auditoria_eventos
+            (entidade, entidade_id, acao, dados_anteriores, dados_novos, usuario)
+        VALUES (?,?,?,?,?,?)
+        """,
+        (
+            entidade,
+            operacao_id,
+            acao,
+            json.dumps(anteriores, ensure_ascii=False, default=str)
+            if anteriores is not None else None,
+            json.dumps(novos, ensure_ascii=False, default=str)
+            if novos is not None else None,
+            session.get("usuario") or session.get("user") or session.get("username"),
+        ),
+    )
+
+
+def financiamento_empresa(conn, raw_id, required=True):
+    empresa_id = form_record_id(raw_id)
+    row = conn.execute(
+        "SELECT id, razao_social, apelido, cnpj FROM empresas WHERE id=?",
+        (empresa_id,),
+    ).fetchone() if empresa_id else None
+    if required and not row:
+        raise ValueError("Selecione uma Empresa válida.")
+    return row
+
+
+def financiamento_parse_form(form, conn, current=None):
+    empresa = financiamento_empresa(conn, form.get("empresa_id"), required=True)
+    banco = resolve_counterparty(conn, form.get("banco_credito_id"), required=True)
+    categoria = normalize_operacao_financeira_category(
+        form.get("categoria_operacao")
+    )
+    data_contratacao = parse_date(form.get("data_contratacao"))
+    raw_data_limite = (form.get("data_limite_liquidacao") or "").strip()
+    data_limite_liquidacao = parse_date(raw_data_limite) if raw_data_limite else None
+    if not data_contratacao:
+        raise ValueError("A Data de contratação é obrigatória.")
+    if raw_data_limite and not data_limite_liquidacao:
+        raise ValueError("A Data limite de liquidacao e invalida.")
+    if data_limite_liquidacao and data_limite_liquidacao < data_contratacao:
+        raise ValueError("A Data limite de liquidacao nao pode ser anterior a contratacao.")
+    moeda = financiamento_currency(form.get("moeda") or "USD")
+    valor = parse_money_decimal(
+        form.get("valor_contratado_moeda"), "O valor contratado"
+    )
+    if valor <= 0:
+        raise ValueError("O valor contratado deve ser maior que zero.")
+    taxa = parse_exchange_rate(form.get("taxa_contratada"))
+    regra = normalize_conversion_rule(banco["regra_conversao_brl"])
+    numero_contrato = normalize_operacao_financeira_number(
+        form.get("numero_contrato_cambio"), required=False
+    )
+    observacao = (form.get("observacao") or "").strip() or None
+    return {
+        "empresa_id": empresa["id"],
+        "banco_credito_id": banco["id"],
+        "moeda": moeda,
+        "categoria_operacao": categoria,
+        "numero_contrato_cambio": numero_contrato,
+        "data_contratacao": data_contratacao,
+        "data_limite_liquidacao": data_limite_liquidacao,
+        "valor_contratado_moeda": valor,
+        "taxa_contratada": taxa,
+        "valor_contratado_brl": closing_brl_value(valor, taxa, regra),
+        "observacao": observacao,
+    }
+
+
+def financiamento_operation_detail(conn, operacao_id):
+    header = conn.execute("""
+        SELECT o.*, e.razao_social AS empresa_razao_social, e.apelido AS empresa_apelido,
+               e.cnpj AS empresa_cnpj, cp.nome AS banco_credito_nome,
+               cp.regra_conversao_brl AS regra_conversao_brl
+          FROM operacoes_financeiras o
+          LEFT JOIN empresas e ON e.id=o.empresa_id
+          LEFT JOIN contrapartes cp ON cp.id=o.banco_credito_id
+         WHERE o.id=? AND o.origem=?
+    """, (operacao_id, FINANCIAMENTO_ORIGEM)).fetchone()
+    if not header:
+        return None
+    data = dict(header)
+    data["valor_contratado_moeda"] = decimal_value(data.get("valor_contratado_moeda"))
+    data["valor_contratado_brl"] = decimal_value(data.get("valor_contratado_brl"))
+    data["liquidacoes"] = conn.execute("""
+        SELECT * FROM operacoes_financeiras_liquidacoes
+         WHERE operacao_financeira_id=? ORDER BY data_liquidacao, id
+    """, (operacao_id,)).fetchall()
+    data["invoices"] = conn.execute("""
+        SELECT oi.*, i.numero_invoice, i.tipo_documento, i.moeda AS invoice_moeda,
+               i.valor_moeda AS invoice_valor_moeda, i.empresa_id AS invoice_empresa_id,
+               e.apelido AS empresa_apelido, e.razao_social AS empresa_razao_social
+          FROM operacoes_financeiras_invoices oi
+          JOIN invoices i ON i.id=oi.invoice_id
+          JOIN empresas e ON e.id=i.empresa_id
+         WHERE oi.operacao_financeira_id=?
+         ORDER BY i.numero_invoice, i.id
+    """, (operacao_id,)).fetchall()
+    data["operacoes_financeiras_vinculadas"] = conn.execute("""
+        SELECT child.id AS operacao_id, child.numero_operacao,
+               child.categoria_operacao, child.data_liquidacao,
+               child.valor_contratado_moeda AS valor_operacao_moeda,
+               child.valor_brl AS valor_operacao_brl,
+               COUNT(oi.id) AS quantidade_invoices,
+               COALESCE(SUM(oi.valor_moeda), 0) AS valor_invoices_moeda
+          FROM operacoes_financeiras child
+          LEFT JOIN operacoes_financeiras_invoices oi
+                 ON oi.operacao_financeira_id=child.id
+         WHERE child.financiamento_exportacao_id=?
+         GROUP BY child.id
+         ORDER BY child.data_liquidacao, child.id
+    """, (operacao_id,)).fetchall()
+    data["invoices_operacoes_financeiras"] = conn.execute("""
+        SELECT oi.*, linked.id AS operacao_id, linked.numero_operacao,
+               linked.categoria_operacao, i.numero_invoice,
+               i.tipo_documento, i.moeda AS invoice_moeda,
+               i.valor_moeda AS invoice_valor_moeda,
+               i.empresa_id AS invoice_empresa_id,
+               e.apelido AS empresa_apelido, e.razao_social AS empresa_razao_social
+          FROM operacoes_financeiras_invoices oi
+          JOIN operacoes_financeiras linked
+            ON linked.id=oi.operacao_financeira_id
+          JOIN invoices i ON i.id=oi.invoice_id
+          JOIN empresas e ON e.id=i.empresa_id
+         WHERE linked.financiamento_exportacao_id=?
+         ORDER BY i.numero_invoice, i.id
+    """, (operacao_id,)).fetchall()
+    data["dues"] = conn.execute("""
+        SELECT od.*, d.numero_due, d.chave_acesso, d.cnpj AS due_cnpj,
+               d.moeda AS due_moeda, d.valor_original AS due_valor_original
+          FROM operacoes_financeiras_dues od
+          JOIN dues d ON d.id=od.due_id
+         WHERE od.operacao_financeira_id=?
+         ORDER BY d.numero_due, d.id
+    """, (operacao_id,)).fetchall()
+    data["contratos"] = conn.execute("""
+        SELECT oc.*, c.numero_contrato, c.cnpj AS contrato_cnpj,
+               c.moeda AS contrato_moeda, c.valor_moeda AS contrato_valor_moeda
+          FROM operacoes_financeiras_contratos oc
+          JOIN contratos c ON c.id=oc.contrato_id
+         WHERE oc.operacao_financeira_id=?
+         ORDER BY c.numero_contrato, c.id
+    """, (operacao_id,)).fetchall()
+    data["valor_liquidado_moeda"], data["valor_liquidado_brl"] = (
+        financiamento_operation_total_liquidado(conn, operacao_id)
+    )
+    data["data_liquidacao_ultima"] = (
+        data["liquidacoes"][-1]["data_liquidacao"] if data["liquidacoes"] else None
+    )
+    data["taxa_liquidacao_ultima"] = (
+        data["liquidacoes"][-1]["taxa_liquidacao"] if data["liquidacoes"] else None
+    )
+    data["saldo_liquidacao_moeda"] = normalize_balance(
+        data["valor_contratado_moeda"] - data["valor_liquidado_moeda"]
+    )
+    data["saldo_liquidacao_brl"] = normalize_balance(
+        data["valor_contratado_brl"] - data["valor_liquidado_brl"]
+    )
+    data["valor_reservado_operacoes_moeda"] = financiamento_registro_consumido(
+        conn, operacao_id
+    )
+    data["saldo_operacoes_moeda"] = financiamento_registro_available(
+        conn, operacao_id
+    )
+    data["status"] = data.get("status") or financiamento_recalcular_status(conn, operacao_id)
+    return data
+
+
+def financiamento_due_link_total(conn, due_id, exclude_id=None):
+    query = "SELECT COALESCE(SUM(valor_vinculado),0) FROM operacoes_financeiras_dues WHERE due_id=?"
+    params = [due_id]
+    if exclude_id is not None:
+        query += " AND id<>?"
+        params.append(exclude_id)
+    return decimal_value(conn.execute(query, params).fetchone()[0])
+
+
+def financiamento_due_available(conn, due_id, exclude_id=None):
+    due = conn.execute("SELECT valor_original FROM dues WHERE id=?", (due_id,)).fetchone()
+    if not due:
+        return Decimal("0")
+    return due_balance(
+        due["valor_original"],
+        decimal_value(due_effect(conn, due_id))
+        + financiamento_due_link_total(conn, due_id, exclude_id),
+    )
+
+
+def financiamento_contract_link_total(conn, contrato_id, exclude_id=None):
+    query = "SELECT COALESCE(SUM(valor_vinculado),0) FROM operacoes_financeiras_contratos WHERE contrato_id=?"
+    params = [contrato_id]
+    if exclude_id is not None:
+        query += " AND id<>?"
+        params.append(exclude_id)
+    return decimal_value(conn.execute(query, params).fetchone()[0])
+
+
+def financiamento_contract_available(conn, contrato_id, exclude_id=None):
+    contrato = contract_summary(conn, contrato_id)
+    if not contrato:
+        return Decimal("0")
+    return contract_balance(
+        contrato["valor_moeda"],
+        decimal_value(contrato["vinculado"])
+        + financiamento_contract_link_total(conn, contrato_id, exclude_id),
+    )
+
+
+def financiamento_invoice_available(conn, invoice_id, operacao_id=None, link_id=None):
+    summary = invoice_summary(conn, invoice_id)
+    if not summary:
+        return Decimal("0")
+    current = conn.execute("""
+        SELECT valor_moeda FROM operacoes_financeiras_invoices
+         WHERE invoice_id=? AND operacao_financeira_id=?
+    """, (invoice_id, operacao_id)).fetchone() if operacao_id else None
+    current_value = decimal_value(current["valor_moeda"]) if current else Decimal("0")
+    if link_id and current and current["valor_moeda"] is not None:
+        same = conn.execute(
+            "SELECT valor_moeda FROM operacoes_financeiras_invoices WHERE id=?",
+            (link_id,),
+        ).fetchone()
+        current_value = decimal_value(same["valor_moeda"]) if same else Decimal("0")
+    return normalize_balance(decimal_value(summary["saldo_fechamentos"]) + current_value)
+
+
+def financiamento_registro_consumido(conn, financiamento_id, exclude_operation_id=None):
+    """Retorna o saldo de financiamento já reservado por operações/Invoices."""
+    direct = conn.execute(
+        """
+        SELECT COALESCE(SUM(valor_moeda), 0)
+          FROM operacoes_financeiras_invoices
+         WHERE operacao_financeira_id=?
+        """,
+        (financiamento_id,),
+    ).fetchone()[0]
+    query = """
+        SELECT COALESCE(SUM(oi.valor_moeda), 0)
+          FROM operacoes_financeiras_invoices oi
+          JOIN operacoes_financeiras linked ON linked.id=oi.operacao_financeira_id
+         WHERE linked.financiamento_exportacao_id=?
+    """
+    params = [financiamento_id]
+    if exclude_operation_id is not None:
+        query += " AND linked.id<>?"
+        params.append(exclude_operation_id)
+    linked_operations = conn.execute(query, params).fetchone()[0]
+    return decimal_value(direct) + decimal_value(linked_operations)
+
+
+def financiamento_registro_available(conn, financiamento_id, exclude_operation_id=None):
+    financing = conn.execute(
+        """
+        SELECT valor_contratado_moeda
+          FROM operacoes_financeiras
+         WHERE id=? AND origem=?
+        """,
+        (financiamento_id, FINANCIAMENTO_ORIGEM),
+    ).fetchone()
+    if not financing:
+        return Decimal("0")
+    return normalize_balance(
+        decimal_value(financing["valor_contratado_moeda"])
+        - financiamento_registro_consumido(
+            conn, financiamento_id, exclude_operation_id
+        )
+    )
+
+
+def financiamento_opcoes_registro(conn):
+    """Lista financiamentos de exportação com saldo para novo lançamento."""
+    rows = []
+    for row in conn.execute(
+        """
+        SELECT o.id, o.numero_contrato_cambio, o.empresa_id,
+               o.moeda, o.categoria_operacao,
+               e.apelido AS empresa_apelido,
+               e.razao_social AS empresa_razao_social
+          FROM operacoes_financeiras o
+          JOIN empresas e ON e.id=o.empresa_id
+         WHERE o.origem=?
+           AND o.empresa_id IS NOT NULL
+         ORDER BY COALESCE(NULLIF(TRIM(o.numero_contrato_cambio), ''),
+                           printf('#%d', o.id)), o.id
+        """,
+        (FINANCIAMENTO_ORIGEM,),
+    ).fetchall():
+        data = dict(row)
+        data["moeda"] = normalized_currency_code(data["moeda"])
+        data["numero_identificador"] = (
+            normalize_operacao_financeira_number(
+                data["numero_contrato_cambio"], required=False
+            ) or str(data["id"])
+        )
+        data["saldo_financiamento"] = financiamento_registro_available(
+            conn, data["id"]
+        )
+        if data["saldo_financiamento"] > SALDO_TOLERANCE:
+            rows.append(data)
+    return rows
+
+
+def financiamento_validar_registro(conn, financiamento_id, group, categoria, amount):
+    financiamento_id = form_record_id(financiamento_id)
+    financiamento = conn.execute(
+        """
+        SELECT o.*, e.apelido AS empresa_apelido,
+               e.razao_social AS empresa_razao_social
+          FROM operacoes_financeiras o
+          JOIN empresas e ON e.id=o.empresa_id
+         WHERE o.id=? AND o.origem=?
+        """,
+        (financiamento_id, FINANCIAMENTO_ORIGEM),
+    ).fetchone() if financiamento_id else None
+    if not financiamento:
+        raise ValueError(
+            "Selecione um contrato de Financiamento de Exportação válido."
+        )
+    company_ids = {
+        item["empresa_id"]
+        for item in group["invoices"]
+        if item.get("empresa_id") is not None
+    }
+    if len(company_ids) != 1:
+        raise ValueError(
+            "As Invoices de cada grupo devem pertencer a uma única empresa "
+            "para vincular um Financiamento de Exportação."
+        )
+    company_id = next(iter(company_ids))
+    if financiamento["empresa_id"] != company_id:
+        raise ValueError(
+            "O Financiamento de Exportação e as Invoices devem pertencer à mesma empresa."
+        )
+    if normalized_currency_code(financiamento["moeda"]) != normalized_currency_code(group["moeda"]):
+        raise ValueError(
+            "A moeda do Financiamento de Exportação deve ser igual à moeda das Invoices."
+        )
+    if financiamento["categoria_operacao"] != categoria:
+        raise ValueError(
+            "A modalidade do Financiamento de Exportação deve ser igual à da operação."
+        )
+    available = financiamento_registro_available(conn, financiamento_id)
+    if amount > available + SALDO_TOLERANCE:
+        raise ValueError(
+            "O valor da operação ultrapassa o saldo disponível do Financiamento de Exportação."
+        )
+    data = dict(financiamento)
+    data["numero_identificador"] = (
+        normalize_operacao_financeira_number(
+            data["numero_contrato_cambio"], required=False
+        ) or str(data["id"])
+    )
+    data["saldo_financiamento"] = available
+    return data
+
+
+def financiamento_link_amount_for_operation(conn, table, operation_id, exclude_id=None):
+    query = f"SELECT COALESCE(SUM(valor_{'moeda' if table.endswith('invoices') else 'vinculado'}),0) FROM {table} WHERE operacao_financeira_id=?"
+    params = [operation_id]
+    if exclude_id is not None:
+        query += " AND id<>?"
+        params.append(exclude_id)
+    return decimal_value(conn.execute(query, params).fetchone()[0])
+
+
+def financiamento_opcoes_invoices(conn, operation):
+    rows = []
+    query = "SELECT id FROM invoices WHERE empresa_id=? AND moeda=? ORDER BY numero_invoice, id"
+    for item in conn.execute(query, (operation["empresa_id"], operation["moeda"])).fetchall():
+        summary = invoice_summary(conn, item["id"])
+        if summary:
+            summary = dict(summary)
+            summary["saldo_financiamento"] = financiamento_invoice_available(
+                conn, item["id"], operation["id"]
+            )
+            if summary["saldo_financiamento"] > SALDO_TOLERANCE:
+                rows.append(summary)
+    return rows
+
+
+def financiamento_opcoes_dues(conn, operation):
+    empresa_cnpj = conn.execute(
+        "SELECT cnpj FROM empresas WHERE id=?", (operation["empresa_id"],)
+    ).fetchone()[0]
+    rows = []
+    for item in conn.execute(
+        "SELECT * FROM dues WHERE moeda=? ORDER BY numero_due, id",
+        (operation["moeda"],),
+    ).fetchall():
+        if re.sub(r"\D", "", str(item["cnpj"] or "")) != re.sub(r"\D", "", str(empresa_cnpj or "")):
+            continue
+        data = dict(item)
+        data["saldo_financiamento"] = financiamento_due_available(conn, item["id"])
+        if data["saldo_financiamento"] > SALDO_TOLERANCE:
+            rows.append(data)
+    return rows
+
+
+def financiamento_opcoes_contratos(conn, operation):
+    empresa = conn.execute(
+        "SELECT cnpj FROM empresas WHERE id=?", (operation["empresa_id"],)
+    ).fetchone()
+    rows = []
+    for item in conn.execute(
+        "SELECT id FROM contratos WHERE moeda=? ORDER BY numero_contrato, id",
+        (operation["moeda"],),
+    ).fetchall():
+        summary = contract_summary(conn, item["id"])
+        if not summary or re.sub(r"\D", "", str(summary["cnpj"] or "")) != re.sub(r"\D", "", str(empresa["cnpj"] or "")):
+            continue
+        data = dict(summary)
+        data["saldo_financiamento"] = financiamento_contract_available(conn, item["id"])
+        if data["saldo_financiamento"] > SALDO_TOLERANCE:
+            rows.append(data)
+    return rows
 
 
 def create_central_closing_contract(conn, group, number):
@@ -14265,6 +15141,7 @@ def central_closing_page_data(conn, closing_filters=None, closing_pagination=Non
             closing_sort, closing_direction, global_context,
         ),
         "operacoes_financeiras": financial_operation_headers(conn),
+        "financiamentos_exportacao": financiamento_opcoes_registro(conn),
         "moedas": [row[0] for row in conn.execute(
             "SELECT DISTINCT moeda FROM invoices ORDER BY moeda"
         ).fetchall()],
@@ -14494,34 +15371,53 @@ def registrar_operacoes_financeiras():
             categoria_operacao=request.form.get("categoria_operacao"),
         )
         for group in groups:
-            number = request.form.get(
-                f"numero_operacao_grupo_{group['banco_credito_id']}_{group['moeda']}"
+            financing_key = (
+                f"financiamento_id_grupo_{group['banco_credito_id']}_"
+                f"{group['moeda']}"
             )
-            if number is None:
-                number = request.form.get(f"numero_operacao_{group['index']}")
-            if number is None and len(groups) == 1:
-                number = request.form.get("numero_operacao")
-            number = normalize_operacao_financeira_number(number)
-            if conn.execute(
-                "SELECT 1 FROM operacoes_financeiras WHERE numero_operacao=? COLLATE NOCASE",
-                (number,),
-            ).fetchone():
-                raise ValueError(f"Já existe uma Operação Financeira com o número {number}.")
+            financing = financiamento_validar_registro(
+                conn,
+                request.form.get(financing_key),
+                group,
+                group["categoria_operacao"],
+                group["valor_moeda"],
+            )
+            number = financing["numero_identificador"]
+            empresa_id = next(
+                item["empresa_id"] for item in group["invoices"]
+            )
             cursor = conn.execute("""
                 INSERT INTO operacoes_financeiras
-                    (numero_operacao,cliente_id,banco_credito_id,moeda,categoria_operacao,
-                     data_fechamento,data_liquidacao,banco_liquidacao_id,taxa_cambio,valor_brl,
-                     despesas_banco_intermediario_usd,despesas_banco_intermediario_brl)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    (numero_operacao,cliente_id,empresa_id,banco_credito_id,moeda,categoria_operacao,
+                     numero_contrato_cambio,data_contratacao,valor_contratado_moeda,taxa_contratada,
+                     valor_contratado_brl,data_fechamento,data_liquidacao,banco_liquidacao_id,
+                     taxa_cambio,valor_brl,despesas_banco_intermediario_usd,
+                     despesas_banco_intermediario_brl,status,origem,
+                     financiamento_exportacao_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
-                number, group["cliente_id"], group["banco_credito_id"], group["moeda"],
-                group["categoria_operacao"], group["data_fechamento"],
+                number, group["cliente_id"], empresa_id, group["banco_credito_id"], group["moeda"],
+                group["categoria_operacao"], None, group["data_fechamento"],
+                float(group["valor_moeda"]), float(group["taxa_cambio"]),
+                float(group["valor_brl"]), group["data_fechamento"],
                 group["data_liquidacao"], group["banco_liquidacao_id"],
                 float(group["taxa_cambio"]), float(group["valor_brl"]),
                 float(group["despesas_banco_intermediario_usd"]),
                 float(group["despesas_banco_intermediario_brl"]),
+                FINANCIAMENTO_STATUS_LIQUIDADA, FINANCIAMENTO_ORIGEM_LEGADO,
+                financing["id"],
             ))
             operation_id = cursor.lastrowid
+            conn.execute("""
+                INSERT INTO operacoes_financeiras_liquidacoes
+                    (operacao_financeira_id,data_liquidacao,taxa_liquidacao,
+                     valor_liquidado_moeda,valor_liquidado_brl,observacao)
+                VALUES (?,?,?,?,?,?)
+            """, (
+                operation_id, group["data_liquidacao"], float(group["taxa_cambio"]),
+                float(group["valor_moeda"]), float(group["valor_brl"]),
+                "Liquidação histórica do fluxo legado de Invoice",
+            ))
             for item in group["invoices"]:
                 if item["fechamento_parcial"]:
                     source_summary = invoice_summary(conn, item["id"])
@@ -14554,7 +15450,7 @@ def registrar_operacoes_financeiras():
         flash(str(exc), "danger")
     except sqlite3.IntegrityError:
         conn.rollback()
-        flash("Não foi possível registrar as Operações Financeiras. Verifique os números e tente novamente.", "danger")
+        flash("Não foi possível registrar as Operações Financeiras. Verifique os financiamentos selecionados e tente novamente.", "danger")
     except sqlite3.Error:
         conn.rollback()
         flash("Não foi possível registrar as Operações Financeiras; nenhuma alteração foi mantida.", "danger")
@@ -14588,16 +15484,28 @@ def editar_operacao_financeira(operacao_id):
         detail = financial_operation_detail(conn, operacao_id)
         if not detail:
             raise ValueError("Operação Financeira não encontrada.")
-        number = normalize_operacao_financeira_number(request.form.get("numero_operacao"))
-        duplicate = conn.execute(
-            "SELECT 1 FROM operacoes_financeiras WHERE numero_operacao=? COLLATE NOCASE AND id<>?",
-            (number, operacao_id),
-        ).fetchone()
-        if duplicate:
-            raise ValueError(f"Já existe uma Operação Financeira com o número {number}.")
         category = normalize_operacao_financeira_category(
             request.form.get("categoria_operacao")
         )
+        if detail.get("financiamento_exportacao_id"):
+            if not detail.get("financiamento_id"):
+                raise ValueError(
+                    "O financiamento de exportacao vinculado nao foi encontrado."
+                )
+            if category != detail.get("financiamento_categoria"):
+                raise ValueError(
+                    "A modalidade da operacao vinculada deve ser igual a do financiamento."
+                )
+            number = (
+                normalize_operacao_financeira_number(
+                    detail.get("financiamento_numero_contrato"), required=False
+                )
+                or str(detail["financiamento_id"])
+            )
+        else:
+            number = normalize_operacao_financeira_number(
+                request.form.get("numero_operacao")
+            )
         data_liquidacao = parse_date(request.form.get("data_liquidacao"))
         if not data_liquidacao:
             raise ValueError("A Data de Liquida\u00e7\u00e3o \u00e9 obrigat\u00f3ria.")
@@ -14660,6 +15568,815 @@ def excluir_operacao_financeira(operacao_id):
     finally:
         conn.close()
     return redirect(url_for("gestao_fechamentos_invoices"))
+
+
+def financiamento_filtros(args):
+    filtros = {
+        "categoria_operacao": (args.get("categoria_operacao") or "").strip().upper(),
+        "empresa_id": form_record_id(args.get("empresa_id")),
+        "banco_credito_id": form_record_id(args.get("banco_credito_id")),
+        "numero_contrato_cambio": (args.get("numero_contrato_cambio") or "").strip(),
+        "moeda": normalized_currency_code(args.get("moeda")),
+        "status": (args.get("status") or "").strip().upper(),
+        "data_contratacao_de": (args.get("data_contratacao_de") or "").strip(),
+        "data_contratacao_ate": (args.get("data_contratacao_ate") or "").strip(),
+        "data_liquidacao_de": (args.get("data_liquidacao_de") or "").strip(),
+        "data_liquidacao_ate": (args.get("data_liquidacao_ate") or "").strip(),
+    }
+    where, params = ["o.origem=?"], [FINANCIAMENTO_ORIGEM]
+    if filtros["categoria_operacao"]:
+        if filtros["categoria_operacao"] not in OPERACAO_FINANCEIRA_CATEGORIAS:
+            raise ValueError("Selecione uma modalidade válida: ACC, ACE ou PPE.")
+        where.append("o.categoria_operacao=?")
+        params.append(filtros["categoria_operacao"])
+    if filtros["empresa_id"]:
+        where.append("o.empresa_id=?")
+        params.append(filtros["empresa_id"])
+    if filtros["banco_credito_id"]:
+        where.append("o.banco_credito_id=?")
+        params.append(filtros["banco_credito_id"])
+    if filtros["numero_contrato_cambio"]:
+        where.append("o.numero_contrato_cambio LIKE ?")
+        params.append(f"%{filtros['numero_contrato_cambio']}%")
+    if filtros["moeda"]:
+        where.append("o.moeda=?")
+        params.append(filtros["moeda"])
+    if filtros["status"]:
+        if filtros["status"] not in FINANCIAMENTO_STATUS_OPTIONS:
+            raise ValueError("Selecione um status válido.")
+        where.append("o.status=?")
+        params.append(filtros["status"])
+    for key, column, operator in (
+        ("data_contratacao_de", "o.data_contratacao", ">="),
+        ("data_contratacao_ate", "o.data_contratacao", "<="),
+    ):
+        if filtros[key]:
+            filtros[key] = parse_date(filtros[key])
+            where.append(f"{column} {operator}?")
+            params.append(filtros[key])
+    for key, operator in (
+        ("data_liquidacao_de", ">="),
+        ("data_liquidacao_ate", "<="),
+    ):
+        if filtros[key]:
+            filtros[key] = parse_date(filtros[key])
+            where.append(
+                "EXISTS (SELECT 1 FROM operacoes_financeiras_liquidacoes lf "
+                "WHERE lf.operacao_financeira_id=o.id AND lf.data_liquidacao "
+                + operator + "?)"
+            )
+            params.append(filtros[key])
+    return filtros, where, params
+
+
+def financiamento_sorting(args):
+    fields = {
+        "id": ("o.id", "number"),
+        "modalidade": ("o.categoria_operacao", "text"),
+        "empresa": ("e.apelido", "text"),
+        "contrato": ("o.numero_contrato_cambio", "text"),
+        "data_contratacao": ("o.data_contratacao", "date"),
+        "moeda": ("o.moeda", "text"),
+        "valor_contratado": ("o.valor_contratado_moeda", "number"),
+        "valor_liquidado": ("COALESCE(SUM(l.valor_liquidado_moeda),0)", "number"),
+        "status": ("o.status", "text"),
+    }
+    return fields, *build_sorting(
+        args, fields, default_sort="data_contratacao", default_direction="DESC"
+    )
+
+
+def financiamento_decorate_row(row):
+    data = dict(row)
+    for key in (
+        "valor_contratado_moeda", "valor_contratado_brl",
+        "valor_liquidado_moeda", "valor_liquidado_brl",
+    ):
+        data[key] = decimal_value(data.get(key))
+    return data
+
+
+def financiamento_form_context(conn, operation=None):
+    empresas, _ = empresas_for_form(conn)
+    currencies = {"USD"}
+    for table, column in (
+        ("operacoes_financeiras", "moeda"),
+        ("invoices", "moeda"),
+        ("dues", "moeda"),
+        ("contratos", "moeda"),
+    ):
+        currencies.update(
+            normalized_currency_code(row[0])
+            for row in conn.execute(
+                f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"
+            ).fetchall()
+            if normalized_currency_code(row[0])
+        )
+    return {
+        "empresas": empresas,
+        "contrapartes": contrapartes_for_form(conn),
+        "moedas": sorted(currencies),
+        "categorias": OPERACAO_FINANCEIRA_CATEGORIAS,
+        "status_options": FINANCIAMENTO_STATUS_OPTIONS,
+    }
+
+
+@app.route("/financiamento-exportacoes", methods=["GET", "POST"])
+def lista_financiamento_exportacoes():
+    if request.method == "POST":
+        return novo_financiamento_exportacao()
+    try:
+        filtros, where, params = financiamento_filtros(request.args)
+        fields, sort, direction, sort_links = financiamento_sorting(request.args)
+    except ValueError as exc:
+        flash(str(exc), "danger")
+        filtros, where, params = financiamento_filtros({})
+        fields, sort, direction, sort_links = financiamento_sorting({})
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    conn = db()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM operacoes_financeiras o " + clause, params
+    ).fetchone()[0]
+    pagination = build_pagination(
+        request.args, total, endpoint="lista_financiamento_exportacoes"
+    )
+    if request.args.get("sort") in fields:
+        order = (
+            f"{sort_sql_term(fields[sort][0], direction, fields[sort][1])}, "
+            f"o.id {direction}"
+        )
+    else:
+        order = "o.data_contratacao DESC, o.id DESC"
+    rows = conn.execute(f"""
+        SELECT o.*, e.apelido AS empresa_apelido, e.razao_social AS empresa_razao_social,
+               e.cnpj AS empresa_cnpj, cp.nome AS banco_credito_nome,
+               COALESCE(SUM(l.valor_liquidado_moeda),0) AS valor_liquidado_moeda,
+               COALESCE(SUM(l.valor_liquidado_brl),0) AS valor_liquidado_brl,
+               MAX(l.data_liquidacao) AS data_liquidacao_ultima
+          FROM operacoes_financeiras o
+          LEFT JOIN empresas e ON e.id=o.empresa_id
+          LEFT JOIN contrapartes cp ON cp.id=o.banco_credito_id
+          LEFT JOIN operacoes_financeiras_liquidacoes l
+                 ON l.operacao_financeira_id=o.id
+          {clause}
+         GROUP BY o.id
+         ORDER BY {order}
+         LIMIT ? OFFSET ?
+    """, params + [pagination["per_page"], pagination["offset"]]).fetchall()
+    context = financiamento_form_context(conn)
+    conn.close()
+    return render_template(
+        "financiamentos_exportacao.html",
+        operacoes=[financiamento_decorate_row(row) for row in rows],
+        total=total, filtros=filtros, sort=sort, direction=direction,
+        sort_links=sort_links, pagination=pagination, **context,
+    )
+
+
+def render_financiamento_form(conn, operation=None, error=None):
+    context = financiamento_form_context(conn, operation)
+    return render_template(
+        "financiamento_exportacao_form.html",
+        operacao=operation, error=error, **context,
+    )
+
+
+@app.route("/financiamento-exportacoes/nova", methods=["GET", "POST"])
+def novo_financiamento_exportacao():
+    conn = db()
+    if request.method == "GET":
+        response = render_financiamento_form(conn)
+        conn.close()
+        return response
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        values = financiamento_parse_form(request.form, conn)
+        cursor = conn.execute("""
+            INSERT INTO operacoes_financeiras
+                (empresa_id,banco_credito_id,moeda,categoria_operacao,
+                 numero_contrato_cambio,data_contratacao,data_limite_liquidacao,
+                 valor_contratado_moeda,
+                 taxa_contratada,valor_contratado_brl,data_fechamento,
+                 taxa_cambio,valor_brl,status,observacao,origem)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            values["empresa_id"], values["banco_credito_id"], values["moeda"],
+            values["categoria_operacao"], values["numero_contrato_cambio"],
+            values["data_contratacao"], values["data_limite_liquidacao"],
+            float(values["valor_contratado_moeda"]),
+            float(values["taxa_contratada"]), float(values["valor_contratado_brl"]),
+            values["data_contratacao"], float(values["taxa_contratada"]),
+            float(values["valor_contratado_brl"]), FINANCIAMENTO_STATUS_ABERTA,
+            values["observacao"], FINANCIAMENTO_ORIGEM,
+        ))
+        operacao_id = cursor.lastrowid
+        financiamento_auditar(conn, operacao_id, "CRIACAO", None, values)
+        conn.commit()
+        flash("Financiamento de Exportação cadastrado com sucesso.", "success")
+        return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        response = render_financiamento_form(
+            conn, error=str(exc) if isinstance(exc, ValueError) else "Não foi possível cadastrar a operação."
+        )
+        conn.close()
+        return response, 400 if isinstance(exc, ValueError) else 500
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/editar", methods=["GET", "POST"])
+def editar_financiamento_exportacao(operacao_id):
+    conn = db()
+    operation = conn.execute(
+        "SELECT * FROM operacoes_financeiras WHERE id=? AND origem=?",
+        (operacao_id, FINANCIAMENTO_ORIGEM),
+    ).fetchone()
+    if not operation:
+        conn.close()
+        return "Financiamento de Exportação não encontrado", 404
+    if request.method == "GET":
+        response = render_financiamento_form(conn, operation)
+        conn.close()
+        return response
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        values = financiamento_parse_form(request.form, conn, operation)
+        liquidated, _ = financiamento_operation_total_liquidado(conn, operacao_id)
+        if values["valor_contratado_moeda"] < liquidated - SALDO_TOLERANCE:
+            raise ValueError("O valor contratado não pode ser menor que o valor liquidado.")
+        for table, column in (
+            ("operacoes_financeiras_invoices", "valor_moeda"),
+            ("operacoes_financeiras_dues", "valor_vinculado"),
+            ("operacoes_financeiras_contratos", "valor_vinculado"),
+        ):
+            linked = decimal_value(conn.execute(
+                f"SELECT COALESCE(SUM({column}),0) FROM {table} WHERE operacao_financeira_id=?",
+                (operacao_id,),
+            ).fetchone()[0])
+            if values["valor_contratado_moeda"] < linked - SALDO_TOLERANCE:
+                raise ValueError("O valor contratado não pode ser menor que os valores vinculados.")
+        linked_operation_value = conn.execute(
+            """
+            SELECT COALESCE(SUM(oi.valor_moeda), 0)
+              FROM operacoes_financeiras_invoices oi
+              JOIN operacoes_financeiras linked
+                ON linked.id=oi.operacao_financeira_id
+             WHERE linked.financiamento_exportacao_id=?
+            """,
+            (operacao_id,),
+        ).fetchone()[0]
+        if values["valor_contratado_moeda"] < decimal_value(linked_operation_value) - SALDO_TOLERANCE:
+            raise ValueError(
+                "O valor contratado nao pode ser menor que as operacoes financeiras vinculadas."
+            )
+        linked_identity = conn.execute(
+            """
+            SELECT COUNT(*) AS total, MIN(empresa_id) AS empresa_id,
+                   MIN(moeda) AS moeda, MIN(categoria_operacao) AS categoria_operacao
+              FROM operacoes_financeiras
+             WHERE financiamento_exportacao_id=?
+            """,
+            (operacao_id,),
+        ).fetchone()
+        if linked_identity["total"]:
+            current_number = normalize_operacao_financeira_number(
+                operation["numero_contrato_cambio"], required=False
+            ) or ""
+            new_number = values["numero_contrato_cambio"] or ""
+            if (
+                values["empresa_id"] != linked_identity["empresa_id"]
+                or values["moeda"] != linked_identity["moeda"]
+                or values["categoria_operacao"] != linked_identity["categoria_operacao"]
+                or new_number != current_number
+            ):
+                raise ValueError(
+                    "Empresa, moeda, modalidade e identificador de um financiamento "
+                    "com Operações Financeiras vinculadas não podem ser alterados."
+                )
+        before = dict(operation)
+        conn.execute("""
+            UPDATE operacoes_financeiras
+               SET empresa_id=?, banco_credito_id=?, moeda=?, categoria_operacao=?,
+                   numero_contrato_cambio=?, data_contratacao=?, data_limite_liquidacao=?,
+                   valor_contratado_moeda=?, taxa_contratada=?, valor_contratado_brl=?,
+                   data_fechamento=?, taxa_cambio=?, valor_brl=?, observacao=?,
+                   updated_at=CURRENT_TIMESTAMP
+             WHERE id=?
+        """, (
+            values["empresa_id"], values["banco_credito_id"], values["moeda"],
+            values["categoria_operacao"], values["numero_contrato_cambio"],
+            values["data_contratacao"], values["data_limite_liquidacao"],
+            float(values["valor_contratado_moeda"]),
+            float(values["taxa_contratada"]), float(values["valor_contratado_brl"]),
+            values["data_contratacao"], float(values["taxa_contratada"]),
+            float(values["valor_contratado_brl"]), values["observacao"], operacao_id,
+        ))
+        financiamento_recalcular_status(conn, operacao_id)
+        financiamento_auditar(conn, operacao_id, "EDICAO", before, values)
+        conn.commit()
+        flash("Financiamento de Exportação atualizado com sucesso.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível atualizar a operação.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>")
+def detalhe_financiamento_exportacao(operacao_id):
+    conn = db()
+    operation = financiamento_operation_detail(conn, operacao_id)
+    if not operation:
+        conn.close()
+        return "Financiamento de Exportação não encontrado", 404
+    context = financiamento_form_context(conn, operation)
+    context.update({
+        "invoice_options": financiamento_opcoes_invoices(conn, operation),
+        "due_options": financiamento_opcoes_dues(conn, operation),
+        "contract_options": financiamento_opcoes_contratos(conn, operation),
+        "auditoria": conn.execute("""
+            SELECT * FROM auditoria_eventos
+             WHERE entidade IN ('operacao_financeira','operacao_financeira_invoice',
+                                'operacao_financeira_due','operacao_financeira_contrato',
+                                'operacao_financeira_liquidacao')
+               AND entidade_id=?
+             ORDER BY created_at DESC, id DESC
+        """, (operacao_id,)).fetchall(),
+    })
+    conn.close()
+    return render_template("financiamento_exportacao_detalhe.html", operacao=operation, **context)
+
+
+def financiamento_liquidacao_values(conn, operation, form, current=None):
+    data = parse_date(form.get("data_liquidacao"))
+    if not data:
+        raise ValueError("A Data de liquidação é obrigatória.")
+    if operation["data_contratacao"] and data < operation["data_contratacao"]:
+        raise ValueError("A Data de liquidação não pode ser anterior à contratação.")
+    value = parse_money_decimal(form.get("valor_liquidado_moeda"), "O valor liquidado")
+    if value <= 0:
+        raise ValueError("O valor liquidado deve ser maior que zero.")
+    rate = parse_exchange_rate(form.get("taxa_liquidacao"))
+    regra = normalize_conversion_rule(operation.get("regra_conversao_brl"))
+    return {
+        "data_liquidacao": data,
+        "taxa_liquidacao": rate,
+        "valor_liquidado_moeda": value,
+        "valor_liquidado_brl": closing_brl_value(value, rate, regra),
+        "observacao": (form.get("observacao") or "").strip() or None,
+    }
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/liquidacoes", methods=["POST"])
+def adicionar_liquidacao_financiamento(operacao_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = financiamento_operation_detail(conn, operacao_id)
+        if not operation:
+            raise ValueError("Financiamento de Exportação não encontrado.")
+        values = financiamento_liquidacao_values(conn, operation, request.form)
+        existing, _ = financiamento_operation_total_liquidado(conn, operacao_id)
+        if existing + values["valor_liquidado_moeda"] > operation["valor_contratado_moeda"] + SALDO_TOLERANCE:
+            raise ValueError("A liquidação não pode ultrapassar o valor contratado.")
+        cursor = conn.execute("""
+            INSERT INTO operacoes_financeiras_liquidacoes
+                (operacao_financeira_id,data_liquidacao,taxa_liquidacao,
+                 valor_liquidado_moeda,valor_liquidado_brl,observacao)
+            VALUES (?,?,?,?,?,?)
+        """, (
+            operacao_id, values["data_liquidacao"], float(values["taxa_liquidacao"]),
+            float(values["valor_liquidado_moeda"]), float(values["valor_liquidado_brl"]),
+            values["observacao"],
+        ))
+        financiamento_recalcular_status(conn, operacao_id)
+        financiamento_auditar(
+            conn, operacao_id, "LIQUIDACAO_CRIADA", None,
+            {**values, "id": cursor.lastrowid}, "operacao_financeira_liquidacao",
+        )
+        conn.commit()
+        flash("Liquidação cambial registrada com sucesso.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível registrar a liquidação.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/liquidacoes/<int:liquidacao_id>/editar", methods=["POST"])
+def editar_liquidacao_financiamento(operacao_id, liquidacao_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = financiamento_operation_detail(conn, operacao_id)
+        current = conn.execute(
+            "SELECT * FROM operacoes_financeiras_liquidacoes WHERE id=? AND operacao_financeira_id=?",
+            (liquidacao_id, operacao_id),
+        ).fetchone()
+        if not operation or not current:
+            raise ValueError("Liquidação cambial não encontrada.")
+        values = financiamento_liquidacao_values(conn, operation, request.form, current)
+        existing, _ = financiamento_operation_total_liquidado(conn, operacao_id, liquidacao_id)
+        if existing + values["valor_liquidado_moeda"] > operation["valor_contratado_moeda"] + SALDO_TOLERANCE:
+            raise ValueError("A liquidação não pode ultrapassar o valor contratado.")
+        conn.execute("""
+            UPDATE operacoes_financeiras_liquidacoes
+               SET data_liquidacao=?, taxa_liquidacao=?, valor_liquidado_moeda=?,
+                   valor_liquidado_brl=?, observacao=?, updated_at=CURRENT_TIMESTAMP
+             WHERE id=? AND operacao_financeira_id=?
+        """, (
+            values["data_liquidacao"], float(values["taxa_liquidacao"]),
+            float(values["valor_liquidado_moeda"]), float(values["valor_liquidado_brl"]),
+            values["observacao"], liquidacao_id, operacao_id,
+        ))
+        financiamento_recalcular_status(conn, operacao_id)
+        financiamento_auditar(conn, operacao_id, "LIQUIDACAO_EDITADA", dict(current), values, "operacao_financeira_liquidacao")
+        conn.commit()
+        flash("Liquidação cambial atualizada com sucesso.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível atualizar a liquidação.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/liquidacoes/<int:liquidacao_id>/excluir", methods=["POST"])
+def excluir_liquidacao_financiamento(operacao_id, liquidacao_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT * FROM operacoes_financeiras_liquidacoes WHERE id=? AND operacao_financeira_id=?",
+            (liquidacao_id, operacao_id),
+        ).fetchone()
+        if not current:
+            raise ValueError("Liquidação cambial não encontrada.")
+        conn.execute("DELETE FROM operacoes_financeiras_liquidacoes WHERE id=?", (liquidacao_id,))
+        financiamento_recalcular_status(conn, operacao_id)
+        financiamento_auditar(conn, operacao_id, "LIQUIDACAO_EXCLUIDA", dict(current), None, "operacao_financeira_liquidacao")
+        conn.commit()
+        flash("Liquidação cambial excluída com sucesso.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível excluir a liquidação.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+def financiamento_validar_operacao(conn, operacao_id):
+    operation = conn.execute(
+        "SELECT * FROM operacoes_financeiras WHERE id=? AND origem=?",
+        (operacao_id, FINANCIAMENTO_ORIGEM),
+    ).fetchone()
+    if not operation:
+        raise ValueError("Financiamento de Exportação não encontrado.")
+    if not operation["empresa_id"]:
+        raise ValueError("A operação legada não possui empresa definida para novos vínculos.")
+    return operation
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/invoices", methods=["POST"])
+def vincular_invoice_financiamento(operacao_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = financiamento_validar_operacao(conn, operacao_id)
+        invoice_id = form_record_id(request.form.get("invoice_id"))
+        invoice = conn.execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+        if not invoice:
+            raise ValueError("Invoice não encontrada.")
+        if invoice["empresa_id"] != operation["empresa_id"]:
+            raise ValueError("A Invoice e a operação devem pertencer à mesma empresa.")
+        if normalized_currency_code(invoice["moeda"]) != normalized_currency_code(operation["moeda"]):
+            raise ValueError("A moeda da Invoice deve ser igual à moeda da operação.")
+        if conn.execute(
+            "SELECT 1 FROM operacoes_financeiras_invoices WHERE operacao_financeira_id=? AND invoice_id=?",
+            (operacao_id, invoice_id),
+        ).fetchone():
+            raise ValueError("A Invoice já está vinculada a esta operação.")
+        amount = parse_money_decimal(request.form.get("valor_vinculado"), "O valor do vínculo")
+        if amount <= 0:
+            raise ValueError("O valor do vínculo deve ser maior que zero.")
+        linked = financiamento_link_amount_for_operation(conn, "operacoes_financeiras_invoices", operacao_id)
+        if linked + amount > decimal_value(operation["valor_contratado_moeda"]) + SALDO_TOLERANCE:
+            raise ValueError("Os vínculos não podem ultrapassar o valor contratado da operação.")
+        if amount > financiamento_invoice_available(conn, invoice_id) + SALDO_TOLERANCE:
+            raise ValueError("O vínculo não pode ultrapassar o saldo cambial disponível da Invoice.")
+        cursor = conn.execute("""
+            INSERT INTO operacoes_financeiras_invoices
+                (operacao_financeira_id,invoice_id,moeda,valor_moeda,observacao)
+            VALUES (?,?,?,?,?)
+        """, (operacao_id, invoice_id, operation["moeda"], float(amount),
+              (request.form.get("observacao") or "").strip() or None))
+        refresh_invoice_status(conn, invoice_id)
+        financiamento_auditar(conn, operacao_id, "INVOICE_VINCULADA", None,
+                               {"id": cursor.lastrowid, "invoice_id": invoice_id, "valor_moeda": amount},
+                               "operacao_financeira_invoice")
+        conn.commit()
+        flash("Invoice vinculada ao financiamento.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível vincular a Invoice.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/invoices/<int:link_id>/editar", methods=["POST"])
+def editar_invoice_financiamento(operacao_id, link_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = financiamento_validar_operacao(conn, operacao_id)
+        link = conn.execute(
+            "SELECT * FROM operacoes_financeiras_invoices WHERE id=? AND operacao_financeira_id=?",
+            (link_id, operacao_id),
+        ).fetchone()
+        if not link:
+            raise ValueError("Vínculo com Invoice não encontrado.")
+        amount = parse_money_decimal(request.form.get("valor_vinculado"), "O valor do vínculo")
+        if amount <= 0:
+            raise ValueError("O valor do vínculo deve ser maior que zero.")
+        linked = financiamento_link_amount_for_operation(conn, "operacoes_financeiras_invoices", operacao_id, link_id)
+        if linked + amount > decimal_value(operation["valor_contratado_moeda"]) + SALDO_TOLERANCE:
+            raise ValueError("Os vínculos não podem ultrapassar o valor contratado da operação.")
+        if amount > financiamento_invoice_available(conn, link["invoice_id"], operacao_id, link_id) + SALDO_TOLERANCE:
+            raise ValueError("O vínculo não pode ultrapassar o saldo cambial disponível da Invoice.")
+        conn.execute("""
+            UPDATE operacoes_financeiras_invoices
+               SET valor_moeda=?, observacao=? WHERE id=? AND operacao_financeira_id=?
+        """, (float(amount), (request.form.get("observacao") or "").strip() or None, link_id, operacao_id))
+        refresh_invoice_status(conn, link["invoice_id"])
+        financiamento_auditar(conn, operacao_id, "INVOICE_VINCULO_EDITADO", dict(link),
+                               {"id": link_id, "invoice_id": link["invoice_id"], "valor_moeda": amount},
+                               "operacao_financeira_invoice")
+        conn.commit()
+        flash("Vínculo com Invoice atualizado.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível atualizar o vínculo.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/invoices/<int:link_id>/excluir", methods=["POST"])
+def excluir_invoice_financiamento(operacao_id, link_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        link = conn.execute(
+            "SELECT * FROM operacoes_financeiras_invoices WHERE id=? AND operacao_financeira_id=?",
+            (link_id, operacao_id),
+        ).fetchone()
+        if not link:
+            raise ValueError("Vínculo com Invoice não encontrado.")
+        conn.execute("DELETE FROM operacoes_financeiras_invoices WHERE id=?", (link_id,))
+        refresh_invoice_status(conn, link["invoice_id"])
+        financiamento_auditar(conn, operacao_id, "INVOICE_DESVINCULADA", dict(link), None, "operacao_financeira_invoice")
+        conn.commit()
+        flash("Invoice desvinculada do financiamento.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível desvincular a Invoice.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+def financiamento_validar_link_due(conn, operation, due_id, amount, link_id=None):
+    due = conn.execute("SELECT * FROM dues WHERE id=?", (due_id,)).fetchone()
+    if not due:
+        raise ValueError("DUE não encontrada.")
+    company = conn.execute("SELECT cnpj FROM empresas WHERE id=?", (operation["empresa_id"],)).fetchone()
+    if not company or re.sub(r"\D", "", str(company["cnpj"] or "")) != re.sub(r"\D", "", str(due["cnpj"] or "")):
+        raise ValueError("A DUE e a operação devem pertencer à mesma empresa.")
+    if normalized_currency_code(due["moeda"]) != normalized_currency_code(operation["moeda"]):
+        raise ValueError("A moeda da DUE deve ser igual à moeda da operação.")
+    if amount <= 0:
+        raise ValueError("O valor do vínculo deve ser maior que zero.")
+    linked = financiamento_link_amount_for_operation(conn, "operacoes_financeiras_dues", operation["id"], link_id)
+    if linked + amount > decimal_value(operation["valor_contratado_moeda"]) + SALDO_TOLERANCE:
+        raise ValueError("Os vínculos não podem ultrapassar o valor contratado da operação.")
+    if amount > financiamento_due_available(conn, due_id, link_id) + SALDO_TOLERANCE:
+        raise ValueError("O vínculo não pode ultrapassar o saldo disponível da DUE.")
+    return due
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/dues", methods=["POST"])
+def vincular_due_financiamento(operacao_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = financiamento_validar_operacao(conn, operacao_id)
+        due_id = form_record_id(request.form.get("due_id"))
+        if conn.execute("SELECT 1 FROM operacoes_financeiras_dues WHERE operacao_financeira_id=? AND due_id=?", (operacao_id, due_id)).fetchone():
+            raise ValueError("A DUE já está vinculada a esta operação.")
+        amount = parse_money_decimal(request.form.get("valor_vinculado"), "O valor do vínculo")
+        due = financiamento_validar_link_due(conn, operation, due_id, amount)
+        cursor = conn.execute("""
+            INSERT INTO operacoes_financeiras_dues
+                (operacao_financeira_id,due_id,moeda,valor_vinculado,observacao)
+            VALUES (?,?,?,?,?)
+        """, (operacao_id, due_id, operation["moeda"], float(amount),
+              (request.form.get("observacao") or "").strip() or None))
+        financiamento_auditar(conn, operacao_id, "DUE_VINCULADA", None,
+                               {"id": cursor.lastrowid, "due_id": due_id, "valor_vinculado": amount},
+                               "operacao_financeira_due")
+        conn.commit()
+        flash("DUE vinculada ao financiamento.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível vincular a DUE.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/dues/<int:link_id>/editar", methods=["POST"])
+def editar_due_financiamento(operacao_id, link_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = financiamento_validar_operacao(conn, operacao_id)
+        link = conn.execute("SELECT * FROM operacoes_financeiras_dues WHERE id=? AND operacao_financeira_id=?", (link_id, operacao_id)).fetchone()
+        if not link:
+            raise ValueError("Vínculo com DUE não encontrado.")
+        amount = parse_money_decimal(request.form.get("valor_vinculado"), "O valor do vínculo")
+        financiamento_validar_link_due(conn, operation, link["due_id"], amount, link_id)
+        conn.execute("UPDATE operacoes_financeiras_dues SET valor_vinculado=?,observacao=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (float(amount), (request.form.get("observacao") or "").strip() or None, link_id))
+        financiamento_auditar(conn, operacao_id, "DUE_VINCULO_EDITADO", dict(link), {"id": link_id, "due_id": link["due_id"], "valor_vinculado": amount}, "operacao_financeira_due")
+        conn.commit()
+        flash("Vínculo com DUE atualizado.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível atualizar o vínculo.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/dues/<int:link_id>/excluir", methods=["POST"])
+def excluir_due_financiamento(operacao_id, link_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        link = conn.execute("SELECT * FROM operacoes_financeiras_dues WHERE id=? AND operacao_financeira_id=?", (link_id, operacao_id)).fetchone()
+        if not link:
+            raise ValueError("Vínculo com DUE não encontrado.")
+        conn.execute("DELETE FROM operacoes_financeiras_dues WHERE id=?", (link_id,))
+        financiamento_auditar(conn, operacao_id, "DUE_DESVINCULADA", dict(link), None, "operacao_financeira_due")
+        conn.commit()
+        flash("DUE desvinculada do financiamento.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível desvincular a DUE.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+def financiamento_validar_link_contrato(conn, operation, contrato_id, amount, link_id=None):
+    contrato = contract_summary(conn, contrato_id)
+    if not contrato:
+        raise ValueError("Contrato Câmbio não encontrado.")
+    company = conn.execute("SELECT cnpj FROM empresas WHERE id=?", (operation["empresa_id"],)).fetchone()
+    if not company or re.sub(r"\D", "", str(company["cnpj"] or "")) != re.sub(r"\D", "", str(contrato["cnpj"] or "")):
+        raise ValueError("O Contrato Câmbio e a operação devem pertencer à mesma empresa.")
+    if normalized_currency_code(contrato["moeda"]) != normalized_currency_code(operation["moeda"]):
+        raise ValueError("A moeda do Contrato Câmbio deve ser igual à moeda da operação.")
+    if contrato.get("categoria_cambio") == CATEGORIA_CAMBIO_FINANCEIRO:
+        raise ValueError("Contratos de Câmbio Financeiro não podem ser vinculados.")
+    if amount <= 0:
+        raise ValueError("O valor do vínculo deve ser maior que zero.")
+    linked = financiamento_link_amount_for_operation(conn, "operacoes_financeiras_contratos", operation["id"], link_id)
+    if linked + amount > decimal_value(operation["valor_contratado_moeda"]) + SALDO_TOLERANCE:
+        raise ValueError("Os vínculos não podem ultrapassar o valor contratado da operação.")
+    if amount > financiamento_contract_available(conn, contrato_id, link_id) + SALDO_TOLERANCE:
+        raise ValueError("O vínculo não pode ultrapassar o saldo disponível do Contrato Câmbio.")
+    return contrato
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/contratos", methods=["POST"])
+def vincular_contrato_financiamento(operacao_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = financiamento_validar_operacao(conn, operacao_id)
+        contrato_id = form_record_id(request.form.get("contrato_id"))
+        if conn.execute("SELECT 1 FROM operacoes_financeiras_contratos WHERE operacao_financeira_id=? AND contrato_id=?", (operacao_id, contrato_id)).fetchone():
+            raise ValueError("O Contrato Câmbio já está vinculado a esta operação.")
+        amount = parse_money_decimal(request.form.get("valor_vinculado"), "O valor do vínculo")
+        contrato = financiamento_validar_link_contrato(conn, operation, contrato_id, amount)
+        cursor = conn.execute("""
+            INSERT INTO operacoes_financeiras_contratos
+                (operacao_financeira_id,contrato_id,moeda,valor_vinculado,observacao)
+            VALUES (?,?,?,?,?)
+        """, (operacao_id, contrato_id, operation["moeda"], float(amount),
+              (request.form.get("observacao") or "").strip() or None))
+        financiamento_auditar(conn, operacao_id, "CONTRATO_VINCULADO", None,
+                               {"id": cursor.lastrowid, "contrato_id": contrato_id, "valor_vinculado": amount},
+                               "operacao_financeira_contrato")
+        conn.commit()
+        flash("Contrato Câmbio vinculado ao financiamento.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível vincular o Contrato Câmbio.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/contratos/<int:link_id>/editar", methods=["POST"])
+def editar_contrato_financiamento(operacao_id, link_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = financiamento_validar_operacao(conn, operacao_id)
+        link = conn.execute("SELECT * FROM operacoes_financeiras_contratos WHERE id=? AND operacao_financeira_id=?", (link_id, operacao_id)).fetchone()
+        if not link:
+            raise ValueError("Vínculo com Contrato Câmbio não encontrado.")
+        amount = parse_money_decimal(request.form.get("valor_vinculado"), "O valor do vínculo")
+        financiamento_validar_link_contrato(conn, operation, link["contrato_id"], amount, link_id)
+        conn.execute("UPDATE operacoes_financeiras_contratos SET valor_vinculado=?,observacao=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (float(amount), (request.form.get("observacao") or "").strip() or None, link_id))
+        financiamento_auditar(conn, operacao_id, "CONTRATO_VINCULO_EDITADO", dict(link), {"id": link_id, "contrato_id": link["contrato_id"], "valor_vinculado": amount}, "operacao_financeira_contrato")
+        conn.commit()
+        flash("Vínculo com Contrato Câmbio atualizado.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível atualizar o vínculo.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/contratos/<int:link_id>/excluir", methods=["POST"])
+def excluir_contrato_financiamento(operacao_id, link_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        link = conn.execute("SELECT * FROM operacoes_financeiras_contratos WHERE id=? AND operacao_financeira_id=?", (link_id, operacao_id)).fetchone()
+        if not link:
+            raise ValueError("Vínculo com Contrato Câmbio não encontrado.")
+        conn.execute("DELETE FROM operacoes_financeiras_contratos WHERE id=?", (link_id,))
+        financiamento_auditar(conn, operacao_id, "CONTRATO_DESVINCULADO", dict(link), None, "operacao_financeira_contrato")
+        conn.commit()
+        flash("Contrato Câmbio desvinculado do financiamento.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(str(exc) if isinstance(exc, ValueError) else "Não foi possível desvincular o Contrato Câmbio.", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for("detalhe_financiamento_exportacao", operacao_id=operacao_id))
+
+
+@app.route("/financiamento-exportacoes/<int:operacao_id>/excluir", methods=["POST"])
+def excluir_financiamento_exportacao(operacao_id):
+    conn = db()
+    invoice_ids = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = financiamento_operation_detail(conn, operacao_id)
+        if not operation:
+            raise ValueError("Financiamento de Exportação não encontrado.")
+        linked_operations = conn.execute(
+            "SELECT COUNT(*) FROM operacoes_financeiras "
+            "WHERE financiamento_exportacao_id=?",
+            (operacao_id,),
+        ).fetchone()[0]
+        if linked_operations:
+            raise ValueError(
+                "O financiamento possui Operações Financeiras vinculadas "
+                "e não pode ser excluído."
+            )
+        invoice_ids = [row["invoice_id"] for row in operation["invoices"]]
+        financiamento_auditar(
+            conn, operacao_id, "EXCLUSAO", dict(operation), None,
+        )
+        conn.execute("DELETE FROM operacoes_financeiras WHERE id=?", (operacao_id,))
+        for invoice_id in invoice_ids:
+            refresh_invoice_status(conn, invoice_id, force=True)
+        conn.commit()
+        flash("Financiamento de Exportação excluído com sucesso.", "success")
+    except (ValueError, sqlite3.Error) as exc:
+        conn.rollback()
+        flash(
+            str(exc) if isinstance(exc, ValueError)
+            else "Não foi possível excluir o financiamento de exportação.",
+            "danger",
+        )
+    finally:
+        conn.close()
+    return redirect(url_for("lista_financiamento_exportacoes"))
 
 
 @app.route("/invoices/fechamentos/<int:fechamento_id>")

@@ -25,7 +25,7 @@
       <tbody>
       {% for invoice in eligible_invoices %}
         <tr>
-          <td class="selection-column"><input type="checkbox" name="selected_ids" value="{{ invoice.id }}" data-central-checkbox data-client-id="{{ invoice.cliente_id }}" data-invoice-number="{{ invoice.numero_invoice }}" data-invoice-currency="{{ invoice.moeda }}" data-invoice-bank-id="{{ invoice.banco_credito_id }}" data-invoice-bank-name="{{ invoice.banco_credito_nome }}" data-invoice-liquidation-bank-id="{{ invoice.banco_liquidacao_padrao_id or '' }}" data-invoice-embarque-default="{{ invoice.previsao_embarque_dias_padrao or '' }}" data-invoice-available="{{ invoice.valor_fechamento }}" data-invoice-splittable="{{ invoice.desdobramento_habilitado }}"></td>
+          <td class="selection-column"><input type="checkbox" name="selected_ids" value="{{ invoice.id }}" data-central-checkbox data-client-id="{{ invoice.cliente_id }}" data-invoice-company-id="{{ invoice.empresa_id }}" data-invoice-number="{{ invoice.numero_invoice }}" data-invoice-currency="{{ invoice.moeda }}" data-invoice-bank-id="{{ invoice.banco_credito_id }}" data-invoice-bank-name="{{ invoice.banco_credito_nome }}" data-invoice-liquidation-bank-id="{{ invoice.banco_liquidacao_padrao_id or '' }}" data-invoice-embarque-default="{{ invoice.previsao_embarque_dias_padrao or '' }}" data-invoice-available="{{ invoice.valor_fechamento }}" data-invoice-splittable="{{ invoice.desdobramento_habilitado }}"></td>
           <td><a href="{{ url_for('detalhe_invoice', invoice_id=invoice.id) }}">{{ invoice.numero_invoice }}</a></td>
           <td>{{ invoice.empresa_apelido or invoice.empresa_razao_social }}</td>
           <td>{{ invoice.cliente_nome }}</td>
@@ -46,6 +46,16 @@
 {{ render_pagination(eligible_pagination, 'Paginação de Invoices elegíveis') }}
 
 <div hidden data-central-bank-rules>{% for banco in contrapartes %}<span data-bank-id="{{ banco.id }}" data-conversion-rule="{{ banco.regra_conversao_brl or 'HALF_UP' }}"></span>{% endfor %}</div>
+<select hidden data-financing-options aria-hidden="true">
+  {% for financiamento in financiamentos_exportacao %}
+  <option value="{{ financiamento.id }}"
+          data-financing-company-id="{{ financiamento.empresa_id }}"
+          data-financing-currency="{{ financiamento.moeda }}"
+          data-financing-category="{{ financiamento.categoria_operacao }}"
+          data-financing-number="{{ financiamento.numero_identificador }}"
+          data-financing-balance="{{ financiamento.saldo_financiamento }}">{{ financiamento.numero_identificador }} — {{ financiamento.categoria_operacao }} — {{ financiamento.empresa_apelido or financiamento.empresa_razao_social }} — saldo {{ financiamento.saldo_financiamento|currency_amount(financiamento.moeda) }}</option>
+  {% endfor %}
+</select>
 <dialog data-central-closing-dialog aria-labelledby="central-closing-dialog-title">
   <form method="post" action="{{ url_for('registrar_fechamentos_invoices') }}" data-central-closing-dialog-form>
     <h2 id="central-closing-dialog-title">Registrar fechamento de câmbio</h2>

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading"><div><h1>{{ 'Editar' if operacao else 'Novo' }} financiamento de exporta&#231;&#227;o</h1><p class="muted">Cadastro independente de ACC, ACE ou PPE. Liquida&#231;&#245;es e v&#237;nculos s&#227;o registrados no detalhe.</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('lista_financiamento_exportacoes') }}">Voltar</a></div></div>
+{% if error %}<div class="flash danger">{{ error }}</div>{% endif %}
+<form method="post" class="form">
+  <div class="form-grid">
+    <label>Modalidade*<select name="categoria_operacao" required>{% for categoria in categorias %}<option value="{{ categoria }}" {{ 'selected' if operacao and operacao.categoria_operacao == categoria else '' }}>{{ categoria }}</option>{% endfor %}</select></label>
+    <label>Empresa / CNPJ*<select name="empresa_id" required><option value="">Selecione</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if operacao and operacao.empresa_id == empresa.id else '' }}>{{ empresa.apelido or empresa.razao_social }}{% if empresa.cnpj %} &#8212; {{ empresa.cnpj|cnpj }}{% endif %}</option>{% endfor %}</select></label>
+    <label>Banco / contraparte*<select name="banco_credito_id" required><option value="">Selecione</option>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if operacao and operacao.banco_credito_id == banco.id else '' }}>{{ banco.nome }}</option>{% endfor %}</select></label>
+    <label>N&#186; contrato de c&#226;mbio<input name="numero_contrato_cambio" maxlength="120" value="{{ operacao.numero_contrato_cambio if operacao else '' }}" placeholder="Opcional"></label>
+    <label>Data de contrata&#231;&#227;o*<input name="data_contratacao" data-date-br value="{{ operacao.data_contratacao|date_br if operacao else today_iso()|date_br }}" placeholder="dd/mm/aaaa" required></label>
+    <label>Data limite liquidação<input name="data_limite_liquidacao" data-date-br value="{{ operacao.data_limite_liquidacao|date_br if operacao and operacao.data_limite_liquidacao else '' }}" placeholder="dd/mm/aaaa"></label>
+    <label>Moeda*<select name="moeda" required>{% for moeda in moedas %}<option value="{{ moeda }}" {{ 'selected' if (operacao and operacao.moeda == moeda) or (not operacao and moeda == 'USD') else '' }}>{{ moeda }}</option>{% endfor %}</select></label>
+    <label>Valor contratado na moeda estrangeira*<input name="valor_contratado_moeda" data-money inputmode="decimal" value="{{ operacao.valor_contratado_moeda|money if operacao else '' }}" required></label>
+    <label>Taxa contratada*<input name="taxa_contratada" data-rate inputmode="decimal" value="{{ operacao.taxa_contratada|rate if operacao and operacao.taxa_contratada is not none else '' }}" required></label>
+    <label class="form-wide">Observa&#231;&#227;o<textarea name="observacao" rows="3">{{ operacao.observacao if operacao else '' }}</textarea></label>
+  </div>
+  <p class="muted">O valor contratado em BRL ser&#225; calculado automaticamente pelo backend conforme a taxa e a regra de convers&#227;o do banco. Status, liquida&#231;&#245;es e saldos n&#227;o s&#227;o editados manualmente.</p>
+  <div class="form-actions"><button type="submit">{{ 'Salvar altera&#231;&#245;es' if operacao else 'Cadastrar financiamento' }}</button><a class="btn secondary" href="{{ url_for('lista_financiamento_exportacoes') }}">Cancelar</a></div>
+</form>
+{% endblock %}

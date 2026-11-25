@@ -1046,6 +1046,156 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         ))
         conn.close()
 
+    def test_schema_migration_removes_operation_number_unique_and_preserves_ids_and_links(self):
+        migration_path = Path(tempfile.mktemp(prefix="duecontrol_operation_number_migration_", suffix=".db"))
+        previous_db = app.DB
+        try:
+            app.DB = migration_path
+            app.init_db()
+            conn = app.db()
+            conn.execute(
+                "INSERT INTO empresas (razao_social, cnpj) VALUES (?, ?)",
+                ("Empresa Migração", "11111111000111"),
+            )
+            conn.execute(
+                "INSERT INTO clientes (nome, pais) VALUES (?, ?)",
+                ("Cliente Migração", "BR"),
+            )
+            conn.execute("INSERT INTO contrapartes (nome) VALUES (?)", ("Banco Migração",))
+            conn.execute(
+                "INSERT INTO invoices (empresa_id, numero_invoice, tipo_documento, moeda, valor_moeda) "
+                "VALUES (1, 'INV-MIGRACAO', 'COMMERCIAL_INVOICE', 'USD', 100)",
+            )
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("DROP TABLE operacoes_financeiras_invoices")
+            conn.execute("DROP TABLE operacoes_financeiras")
+            conn.executescript("""
+                CREATE TABLE operacoes_financeiras (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    numero_operacao TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    cliente_id INTEGER NOT NULL,
+                    banco_credito_id INTEGER NOT NULL,
+                    moeda TEXT NOT NULL,
+                    categoria_operacao TEXT NOT NULL CHECK(categoria_operacao IN ('ACC','ACE','PPE')),
+                    data_fechamento TEXT NOT NULL,
+                    data_liquidacao TEXT NOT NULL,
+                    banco_liquidacao_id INTEGER NOT NULL,
+                    taxa_cambio REAL NOT NULL,
+                    valor_brl REAL NOT NULL,
+                    despesas_banco_intermediario_usd REAL NOT NULL DEFAULT 0,
+                    despesas_banco_intermediario_brl REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT,
+                    FOREIGN KEY (banco_credito_id) REFERENCES contrapartes(id) ON DELETE RESTRICT,
+                    FOREIGN KEY (banco_liquidacao_id) REFERENCES contrapartes(id) ON DELETE RESTRICT
+                );
+                CREATE TABLE operacoes_financeiras_invoices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operacao_financeira_id INTEGER NOT NULL,
+                    invoice_id INTEGER NOT NULL,
+                    moeda TEXT NOT NULL,
+                    valor_moeda REAL NOT NULL CHECK(valor_moeda > 0),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(operacao_financeira_id, invoice_id),
+                    FOREIGN KEY (operacao_financeira_id)
+                        REFERENCES operacoes_financeiras(id) ON DELETE CASCADE,
+                    FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+                );
+                CREATE INDEX idx_operacoes_financeiras_cliente
+                    ON operacoes_financeiras(cliente_id);
+                CREATE INDEX idx_operacoes_financeiras_data
+                    ON operacoes_financeiras(data_fechamento);
+                CREATE INDEX idx_operacoes_financeiras_categoria
+                    ON operacoes_financeiras(categoria_operacao);
+                CREATE INDEX idx_operacoes_financeiras_invoices_operacao
+                    ON operacoes_financeiras_invoices(operacao_financeira_id);
+                CREATE INDEX idx_operacoes_financeiras_invoices_invoice
+                    ON operacoes_financeiras_invoices(invoice_id);
+            """)
+            conn.execute("""
+                INSERT INTO operacoes_financeiras
+                    (id, numero_operacao, cliente_id, banco_credito_id, moeda,
+                     categoria_operacao, data_fechamento, data_liquidacao,
+                     banco_liquidacao_id, taxa_cambio, valor_brl,
+                     despesas_banco_intermediario_usd, despesas_banco_intermediario_brl)
+                VALUES (17, 'OP-LEGADA', 1, 1, 'USD', 'ACC',
+                        '2026-11-26', '2026-11-26', 1, 5, 500, 0, 0)
+            """)
+            conn.execute("""
+                INSERT INTO operacoes_financeiras_invoices
+                    (id, operacao_financeira_id, invoice_id, moeda, valor_moeda)
+                VALUES (31, 17, 1, 'USD', 100)
+            """)
+            conn.execute("PRAGMA user_version = 21")
+            conn.commit()
+            conn.close()
+
+            app.init_db()
+            conn = app.db()
+            operation = conn.execute(
+                "SELECT id, numero_operacao, financiamento_exportacao_id "
+                "FROM operacoes_financeiras WHERE id=17"
+            ).fetchone()
+            link = conn.execute(
+                "SELECT id, operacao_financeira_id, invoice_id, valor_moeda "
+                "FROM operacoes_financeiras_invoices WHERE id=31"
+            ).fetchone()
+            self.assertEqual(dict(operation), {
+                "id": 17, "numero_operacao": "OP-LEGADA",
+                "financiamento_exportacao_id": None,
+            })
+            self.assertEqual(dict(link), {
+                "id": 31, "operacao_financeira_id": 17,
+                "invoice_id": 1, "valor_moeda": 100,
+            })
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                app.INVOICE_SCHEMA_VERSION,
+            )
+            self.assertIn(
+                "financiamento_exportacao_id",
+                {row[1] for row in conn.execute(
+                    "PRAGMA table_info(operacoes_financeiras)"
+                ).fetchall()},
+            )
+            foreign_keys = conn.execute(
+                "PRAGMA foreign_key_list(operacoes_financeiras)"
+            ).fetchall()
+            self.assertTrue(any(
+                row[3] == "financiamento_exportacao_id"
+                and row[4] == "id"
+                and row[6].upper() == "RESTRICT"
+                for row in foreign_keys
+            ))
+            number_unique_indexes = []
+            for index in conn.execute("PRAGMA index_list(operacoes_financeiras)").fetchall():
+                if not index[2]:
+                    continue
+                columns = [row[2] for row in conn.execute(
+                    f'PRAGMA index_info("{index[1].replace(chr(34), chr(34) * 2)}")'
+                ).fetchall()]
+                if columns == ["numero_operacao"]:
+                    number_unique_indexes.append(index[1])
+            self.assertEqual(number_unique_indexes, [])
+            conn.execute("""
+                INSERT INTO operacoes_financeiras
+                    (numero_operacao, cliente_id, banco_credito_id, moeda,
+                     categoria_operacao, data_fechamento, data_liquidacao,
+                     banco_liquidacao_id, taxa_cambio, valor_brl)
+                VALUES ('OP-LEGADA', 1, 1, 'USD', 'ACE',
+                        '2026-11-27', '2026-11-27', 1, 6, 600)
+            """)
+            conn.commit()
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM operacoes_financeiras WHERE numero_operacao='OP-LEGADA'"
+            ).fetchone()[0], 2)
+            conn.close()
+        finally:
+            app.DB = previous_db
+            migration_path.unlink(missing_ok=True)
+
     def test_schema_migrates_v1_to_v6_without_recreating_existing_contracts(self):
         migration_path = Path(tempfile.mktemp(prefix="duecontrol_invoice_migration_", suffix=".db"))
         previous_db = app.DB
@@ -4185,19 +4335,47 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         self.assertEqual(response.status_code, 302)
 
     def _register_financial_operation(self, invoice_ids, amounts, number,
-                                      category="ACC", rate="5,0000", expense="0,00"):
+                                      category="ACC", rate="5,0000", expense="0,00",
+                                      banco_liquidacao_id="1"):
+        conn = app.db()
+        invoice = conn.execute(
+            "SELECT empresa_id, moeda FROM invoices WHERE id=?",
+            (invoice_ids[0],),
+        ).fetchone()
+        total = sum(
+            (app.parse_money_decimal(value, "valor") for value in amounts),
+            app.Decimal("0"),
+        )
+        rate_value = app.parse_exchange_rate(rate)
+        conn.execute(
+            """
+            INSERT INTO operacoes_financeiras
+                (empresa_id,banco_credito_id,moeda,categoria_operacao,
+                 numero_contrato_cambio,data_contratacao,valor_contratado_moeda,
+                 taxa_contratada,valor_contratado_brl,status,origem)
+            VALUES (?,1,?,?,?,?,?,?,?,'ABERTA',?)
+            """,
+            (
+                invoice["empresa_id"], invoice["moeda"], category, number,
+                "2026-08-01", float(total), float(rate_value),
+                float(total * rate_value), app.FINANCIAMENTO_ORIGEM,
+            ),
+        )
+        financing_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        conn.close()
         data = {
             "selected_ids": [str(invoice_id) for invoice_id in invoice_ids],
             "categoria_operacao": category,
             "data_liquidacao": "26/11/2026",
             "taxa_cambio": rate,
-            "banco_liquidacao_id": "1",
+            "banco_liquidacao_id": banco_liquidacao_id,
         }
         for invoice_id, amount in zip(invoice_ids, amounts):
             data[f"valor_operacao_{invoice_id}"] = amount
         if expense is not None:
             data["despesas_banco_intermediario_grupo_1_USD"] = expense
-        data["numero_operacao_grupo_1_USD"] = number
+        data[f"financiamento_id_grupo_1_{invoice['moeda']}"] = str(financing_id)
         response = self.client.post("/invoices/operacoes-financeiras", data=data)
         self.assertEqual(response.status_code, 302)
         return response
@@ -4244,6 +4422,74 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         self.assertIn("OP-001", invoice_detail.get_data(as_text=True))
         saldo = self.client.get(f"/invoices/{invoice_id}/saldo").get_json()
         self.assertEqual(saldo["total_operacoes_financeiras"], 100.0)
+
+    def test_financial_operation_number_can_be_reused_without_merging_launches(self):
+        first_invoice = self._create_invoice("INV-OP-DUPLICATE-A", "100,00")
+        second_invoice = self._create_invoice("INV-OP-DUPLICATE-B", "80,00")
+        self._register_invoice_receipt(first_invoice, "100,00")
+        self._register_invoice_receipt(second_invoice, "80,00")
+        self._register_financial_operation(
+            [first_invoice], ["100,00"], "OP-REUTILIZADA"
+        )
+        self._register_financial_operation(
+            [second_invoice], ["80,00"], "OP-REUTILIZADA"
+        )
+
+        conn = app.db()
+        operations = conn.execute(
+            "SELECT id FROM operacoes_financeiras "
+            "WHERE numero_operacao=? ORDER BY id",
+            ("OP-REUTILIZADA",),
+        ).fetchall()
+        self.assertEqual(len(operations), 2)
+        self.assertNotEqual(operations[0]["id"], operations[1]["id"])
+        self.assertEqual(
+            conn.execute(
+                "SELECT invoice_id FROM operacoes_financeiras_invoices "
+                "WHERE operacao_financeira_id=?",
+                (operations[0]["id"],),
+            ).fetchone()[0],
+            first_invoice,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT invoice_id FROM operacoes_financeiras_invoices "
+                "WHERE operacao_financeira_id=?",
+                (operations[1]["id"],),
+            ).fetchone()[0],
+            second_invoice,
+        )
+        conn.close()
+
+        response = self.client.post(
+            f"/invoices/operacoes-financeiras/{operations[1]['id']}/editar",
+            data={
+                "numero_operacao": "OP-REUTILIZADA",
+                "categoria_operacao": "ACC",
+                "data_liquidacao": "27/11/2026",
+                "taxa_cambio": "6,0000",
+                "banco_liquidacao_id": "1",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM operacoes_financeiras "
+                "WHERE numero_operacao=?",
+                ("OP-REUTILIZADA",),
+            ).fetchone()[0],
+            2,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT valor_moeda FROM operacoes_financeiras_invoices "
+                "WHERE operacao_financeira_id=?",
+                (operations[1]["id"],),
+            ).fetchone()[0],
+            80,
+        )
+        conn.close()
 
     def test_financial_operation_groups_invoices_and_rejects_invalid_or_overbalance(self):
         first = self._create_invoice("INV-OP-GROUP-A", "100,00")
@@ -4412,9 +4658,14 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
             detail["despesas_banco_intermediario_brl"], app.Decimal("0.05")
         )
         self.assertEqual(
-            detail["amortizacao_principal_brl"], app.Decimal("4.96")
+            detail["amortizacao_principal_brl"], app.Decimal("4.95")
         )
         self.assertEqual(
+            detail["despesas_banco_intermediario_brl"]
+            + detail["amortizacao_principal_brl"],
+            app.Decimal("5.00"),
+        )
+        self.assertNotEqual(
             detail["despesas_banco_intermediario_brl"]
             + detail["amortizacao_principal_brl"],
             app.Decimal(str(detail["valor_brl"])),
@@ -4440,6 +4691,45 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         ).fetchone())
         conn.close()
 
+    def test_financial_operation_uses_half_down_for_independent_principal(self):
+        conn = app.db()
+        conn.execute(
+            "INSERT INTO contrapartes (nome, regra_conversao_brl) VALUES (?,?)",
+            ("Banco Half-Down", app.CONVERSION_RULE_HALF_DOWN),
+        )
+        bank_id = conn.execute(
+            "SELECT id FROM contrapartes WHERE nome=?", ("Banco Half-Down",)
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        invoice_id = self._create_invoice("INV-OP-HALF-DOWN", "102.465,00")
+        self._register_invoice_receipt(invoice_id, "102.465,00")
+        self._register_financial_operation(
+            [invoice_id], ["102.465,00"], "ACC BB 2026 5",
+            rate="5,7324", expense="30,00", banco_liquidacao_id=str(bank_id),
+        )
+
+        conn = app.db()
+        operation = conn.execute(
+            "SELECT id, valor_brl, despesas_banco_intermediario_brl "
+            "FROM operacoes_financeiras WHERE numero_operacao=?",
+            ("ACC BB 2026 5",),
+        ).fetchone()
+        detail = app.financial_operation_detail(conn, operation["id"])
+        self.assertEqual(app.Decimal(str(operation["valor_brl"])), app.Decimal("587370.37"))
+        self.assertEqual(
+            app.Decimal(str(operation["despesas_banco_intermediario_brl"])),
+            app.Decimal("171.97"),
+        )
+        self.assertEqual(detail["amortizacao_principal_brl"], app.Decimal("587198.39"))
+        self.assertEqual(
+            detail["amortizacao_principal_brl"]
+            + detail["despesas_banco_intermediario_brl"],
+            app.Decimal("587370.36"),
+        )
+        conn.close()
+
     def test_financial_operation_edit_preserves_id_and_consumption(self):
         invoice_id = self._create_invoice("INV-OP-EDIT-COMPOSITION", "100,00")
         self._register_invoice_receipt(invoice_id, "100,00")
@@ -4462,7 +4752,7 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
             f"/invoices/operacoes-financeiras/{operation_id}/editar",
             data={
                 "numero_operacao": "OP-EDIT-COMPOSITION-UPDATED",
-                "categoria_operacao": "ACE",
+                "categoria_operacao": "ACC",
                 "data_liquidacao": "27/11/2026",
                 "taxa_cambio": "6,0000",
                 "banco_liquidacao_id": "1",
@@ -4480,7 +4770,7 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
             (operation_id,),
         ).fetchone()
         self.assertEqual(updated["id"], operation_id)
-        self.assertEqual(updated["numero_operacao"], "OP-EDIT-COMPOSITION-UPDATED")
+        self.assertEqual(updated["numero_operacao"], "OP-EDIT-COMPOSITION")
         self.assertEqual(app.Decimal(str(updated["valor_brl"])), app.Decimal("600.00"))
         self.assertEqual(
             app.Decimal(str(updated["despesas_banco_intermediario_brl"])),
@@ -4517,7 +4807,7 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
             f"/invoices/operacoes-financeiras/{operation['id']}/editar",
             data={
                 "numero_operacao": "OP-SPLIT-EDIT",
-                "categoria_operacao": "ACE",
+                "categoria_operacao": "PPE",
                 "data_liquidacao": "27/11/2026",
                 "taxa_cambio": "6",
                 "banco_liquidacao_id": "1",
@@ -4528,8 +4818,8 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         updated = conn.execute(
             "SELECT * FROM operacoes_financeiras WHERE id=?", (operation["id"],)
         ).fetchone()
-        self.assertEqual(updated["numero_operacao"], "OP-SPLIT-EDIT")
-        self.assertEqual(updated["categoria_operacao"], "ACE")
+        self.assertEqual(updated["numero_operacao"], "OP-SPLIT")
+        self.assertEqual(updated["categoria_operacao"], "PPE")
         self.assertEqual(updated["valor_brl"], 240)
         self.assertEqual(
             conn.execute(
