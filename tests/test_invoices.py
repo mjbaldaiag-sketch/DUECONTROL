@@ -1033,6 +1033,13 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         self.assertIn("contrato_comercial", {
             row[1] for row in conn.execute("PRAGMA table_info(invoices)").fetchall()
         })
+        operation_columns = {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(operacoes_financeiras)"
+            ).fetchall()
+        }
+        self.assertIn("despesas_banco_intermediario_usd", operation_columns)
+        self.assertIn("despesas_banco_intermediario_brl", operation_columns)
         self.assertTrue(any(
             row[1] == "idx_invoices_contrato_comercial"
             for row in conn.execute("PRAGMA index_list(invoices)").fetchall()
@@ -2611,16 +2618,23 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         response = self.client.get("/invoices/exportar?numero_invoice=INV-EXPORT-A")
         self.assertEqual(response.status_code, 200)
         workbook = pd.ExcelFile(BytesIO(response.data))
-        self.assertEqual(workbook.sheet_names, ["Invoices", "Recebimentos", "Cambios", "DU-Es"])
+        self.assertEqual(
+            workbook.sheet_names,
+            ["Invoices", "Recebimentos", "Cambios", "DU-Es", "Operacoes Financeiras"],
+        )
         invoices = pd.read_excel(BytesIO(response.data), sheet_name="Invoices")
         receipts = pd.read_excel(BytesIO(response.data), sheet_name="Recebimentos")
         changes = pd.read_excel(BytesIO(response.data), sheet_name="Cambios")
         dues = pd.read_excel(BytesIO(response.data), sheet_name="DU-Es")
+        operations = pd.read_excel(
+            BytesIO(response.data), sheet_name="Operacoes Financeiras"
+        )
         self.assertEqual(len(invoices), 1)
         self.assertEqual(invoices.iloc[0]["Numero da Invoice"], "INV-EXPORT-A")
         self.assertEqual(len(receipts), 1)
         self.assertEqual(len(changes), 1)
         self.assertEqual(len(dues), 1)
+        self.assertEqual(len(operations), 0)
         self.assertIn("Saldo de recebimento", invoices.columns)
         self.assertIn("Banco de credito", receipts.columns)
         self.assertIn("Taxa de cambio", changes.columns)
@@ -4171,17 +4185,18 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         self.assertEqual(response.status_code, 302)
 
     def _register_financial_operation(self, invoice_ids, amounts, number,
-                                      category="ACC", rate="5,0000"):
+                                      category="ACC", rate="5,0000", expense="0,00"):
         data = {
             "selected_ids": [str(invoice_id) for invoice_id in invoice_ids],
             "categoria_operacao": category,
-            "data_fechamento": "25/11/2026",
             "data_liquidacao": "26/11/2026",
             "taxa_cambio": rate,
             "banco_liquidacao_id": "1",
         }
         for invoice_id, amount in zip(invoice_ids, amounts):
             data[f"valor_operacao_{invoice_id}"] = amount
+        if expense is not None:
+            data["despesas_banco_intermediario_grupo_1_USD"] = expense
         data["numero_operacao_grupo_1_USD"] = number
         response = self.client.post("/invoices/operacoes-financeiras", data=data)
         self.assertEqual(response.status_code, 302)
@@ -4199,6 +4214,7 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(operation)
         self.assertEqual(operation["categoria_operacao"], "ACC")
+        self.assertEqual(operation["data_fechamento"], operation["data_liquidacao"])
         self.assertAlmostEqual(operation["valor_brl"], 500.0)
         item = conn.execute(
             "SELECT * FROM operacoes_financeiras_invoices WHERE operacao_financeira_id=?",
@@ -4260,7 +4276,6 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
                 f"valor_operacao_{invalid}": "100,00",
                 "numero_operacao_grupo_1_USD": "OP-INVALID-CATEGORY",
                 "categoria_operacao": "INVALID",
-                "data_fechamento": "25/11/2026",
                 "data_liquidacao": "26/11/2026",
                 "taxa_cambio": "5",
                 "banco_liquidacao_id": "1",
@@ -4275,7 +4290,6 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
                 f"valor_operacao_{invalid}": "101,00",
                 "numero_operacao_grupo_1_USD": "OP-OVER",
                 "categoria_operacao": "PPE",
-                "data_fechamento": "25/11/2026",
                 "data_liquidacao": "26/11/2026",
                 "taxa_cambio": "5",
                 "banco_liquidacao_id": "1",
@@ -4291,6 +4305,191 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+        conn.close()
+
+    def test_financial_operation_separates_principal_and_intermediary_expenses(self):
+        invoice_id = self._create_invoice("INV-OP-COMPOSITION", "100.000,00")
+        self._register_invoice_receipt(invoice_id, "100.000,00")
+        self._register_financial_operation(
+            [invoice_id], ["100.000,00"], "OP-COMPOSITION",
+            rate="5,4000", expense="2.000,00",
+        )
+
+        conn = app.db()
+        operation = conn.execute(
+            "SELECT * FROM operacoes_financeiras WHERE numero_operacao=?",
+            ("OP-COMPOSITION",),
+        ).fetchone()
+        self.assertEqual(app.Decimal(str(operation["valor_brl"])), app.Decimal("540000.00"))
+        self.assertEqual(
+            app.Decimal(str(operation["despesas_banco_intermediario_usd"])),
+            app.Decimal("2000.00"),
+        )
+        self.assertEqual(
+            app.Decimal(str(operation["despesas_banco_intermediario_brl"])),
+            app.Decimal("10800.00"),
+        )
+        link = conn.execute(
+            "SELECT valor_moeda FROM operacoes_financeiras_invoices "
+            "WHERE operacao_financeira_id=?",
+            (operation["id"],),
+        ).fetchone()
+        self.assertEqual(app.Decimal(str(link["valor_moeda"])), app.Decimal("100000.00"))
+        summary = app.invoice_summary(conn, invoice_id)
+        composition = summary["operacoes_financeiras"][0]
+        self.assertEqual(
+            composition["amortizacao_principal_usd"], app.Decimal("98000.00")
+        )
+        self.assertEqual(
+            composition["amortizacao_principal_brl"], app.Decimal("529200.00")
+        )
+        self.assertEqual(summary["total_operacoes_financeiras"], app.Decimal("100000.00"))
+        self.assertEqual(summary["saldo_fechamentos"], app.Decimal("0"))
+        conn.close()
+
+        detail = self.client.get(f"/invoices/operacoes-financeiras/{operation['id']}")
+        html = detail.get_data(as_text=True)
+        self.assertIn("98.000,00", html)
+        self.assertIn("10.800,00", html)
+        self.assertIn("529.200,00", html)
+
+        export = self.client.get(f"/invoices/exportar?numero_invoice=INV-OP-COMPOSITION")
+        self.assertEqual(export.status_code, 200)
+        import pandas as pd
+        operations = pd.read_excel(
+            BytesIO(export.data), sheet_name="Operacoes Financeiras"
+        )
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(operations.iloc[0]["Despesas banco intermediario USD"], 2000)
+        self.assertEqual(operations.iloc[0]["Amortizacao principal BRL"], 529200)
+
+    def test_financial_operation_expense_validations_and_rounding(self):
+        def post_operation(invoice_id, expense, number):
+            return self.client.post("/invoices/operacoes-financeiras", data={
+                "selected_ids": str(invoice_id),
+                f"valor_operacao_{invoice_id}": "100,00",
+                f"despesas_banco_intermediario_grupo_1_USD": expense,
+                "numero_operacao_grupo_1_USD": number,
+                "categoria_operacao": "ACC",
+                "data_liquidacao": "26/11/2026",
+                "taxa_cambio": "5,0000",
+                "banco_liquidacao_id": "1",
+            })
+
+        for suffix, expense in (
+            ("NEGATIVE", "-1,00"),
+            ("OVER", "100,01"),
+            ("SCALE", "1,234"),
+        ):
+            invoice_id = self._create_invoice(f"INV-OP-{suffix}", "100,00")
+            self._register_invoice_receipt(invoice_id, "100,00")
+            response = post_operation(invoice_id, expense, f"OP-{suffix}")
+            self.assertEqual(response.status_code, 302)
+
+        conn = app.db()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM operacoes_financeiras "
+                "WHERE numero_operacao IN ('OP-NEGATIVE','OP-OVER','OP-SCALE')"
+            ).fetchone()[0],
+            0,
+        )
+        conn.close()
+
+        invoice_id = self._create_invoice("INV-OP-ROUNDING", "1,00")
+        self._register_invoice_receipt(invoice_id, "1,00")
+        self._register_financial_operation(
+            [invoice_id], ["1,00"], "OP-ROUNDING",
+            rate="5,0050", expense="0,01",
+        )
+        conn = app.db()
+        operation = conn.execute(
+            "SELECT * FROM operacoes_financeiras WHERE numero_operacao='OP-ROUNDING'"
+        ).fetchone()
+        detail = app.financial_operation_detail(conn, operation["id"])
+        self.assertEqual(app.Decimal(str(detail["valor_brl"])), app.Decimal("5.01"))
+        self.assertEqual(
+            detail["despesas_banco_intermediario_brl"], app.Decimal("0.05")
+        )
+        self.assertEqual(
+            detail["amortizacao_principal_brl"], app.Decimal("4.96")
+        )
+        self.assertEqual(
+            detail["despesas_banco_intermediario_brl"]
+            + detail["amortizacao_principal_brl"],
+            app.Decimal(str(detail["valor_brl"])),
+        )
+        conn.close()
+
+        eur_id = self._create_invoice("INV-OP-EUR-EXPENSE", "100,00", currency="EUR")
+        self._register_invoice_receipt(eur_id, "100,00")
+        response = self.client.post("/invoices/operacoes-financeiras", data={
+            "selected_ids": str(eur_id),
+            f"valor_operacao_{eur_id}": "100,00",
+            "despesas_banco_intermediario_grupo_1_EUR": "1,00",
+            "numero_operacao_grupo_1_EUR": "OP-EUR-EXPENSE",
+            "categoria_operacao": "ACC",
+            "data_liquidacao": "26/11/2026",
+            "taxa_cambio": "5,0000",
+            "banco_liquidacao_id": "1",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        self.assertIsNone(conn.execute(
+            "SELECT id FROM operacoes_financeiras WHERE numero_operacao='OP-EUR-EXPENSE'"
+        ).fetchone())
+        conn.close()
+
+    def test_financial_operation_edit_preserves_id_and_consumption(self):
+        invoice_id = self._create_invoice("INV-OP-EDIT-COMPOSITION", "100,00")
+        self._register_invoice_receipt(invoice_id, "100,00")
+        self._register_financial_operation(
+            [invoice_id], ["100,00"], "OP-EDIT-COMPOSITION", expense="2,00"
+        )
+        conn = app.db()
+        operation = conn.execute(
+            "SELECT * FROM operacoes_financeiras WHERE numero_operacao='OP-EDIT-COMPOSITION'"
+        ).fetchone()
+        operation_id = operation["id"]
+        original_link = conn.execute(
+            "SELECT invoice_id, valor_moeda FROM operacoes_financeiras_invoices "
+            "WHERE operacao_financeira_id=?",
+            (operation_id,),
+        ).fetchone()
+        conn.close()
+
+        response = self.client.post(
+            f"/invoices/operacoes-financeiras/{operation_id}/editar",
+            data={
+                "numero_operacao": "OP-EDIT-COMPOSITION-UPDATED",
+                "categoria_operacao": "ACE",
+                "data_liquidacao": "27/11/2026",
+                "taxa_cambio": "6,0000",
+                "banco_liquidacao_id": "1",
+                "despesas_banco_intermediario_usd": "3,00",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        updated = conn.execute(
+            "SELECT * FROM operacoes_financeiras WHERE id=?", (operation_id,)
+        ).fetchone()
+        updated_link = conn.execute(
+            "SELECT invoice_id, valor_moeda FROM operacoes_financeiras_invoices "
+            "WHERE operacao_financeira_id=?",
+            (operation_id,),
+        ).fetchone()
+        self.assertEqual(updated["id"], operation_id)
+        self.assertEqual(updated["numero_operacao"], "OP-EDIT-COMPOSITION-UPDATED")
+        self.assertEqual(app.Decimal(str(updated["valor_brl"])), app.Decimal("600.00"))
+        self.assertEqual(
+            app.Decimal(str(updated["despesas_banco_intermediario_brl"])),
+            app.Decimal("18.00"),
+        )
+        self.assertEqual(dict(updated_link), dict(original_link))
+        summary = app.invoice_summary(conn, invoice_id)
+        self.assertEqual(summary["total_operacoes_financeiras"], app.Decimal("100"))
+        self.assertEqual(summary["saldo_fechamentos"], app.Decimal("0"))
         conn.close()
 
     def test_financial_operation_partial_split_edit_and_delete_preserve_items(self):
@@ -4319,7 +4518,6 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
             data={
                 "numero_operacao": "OP-SPLIT-EDIT",
                 "categoria_operacao": "ACE",
-                "data_fechamento": "26/11/2026",
                 "data_liquidacao": "27/11/2026",
                 "taxa_cambio": "6",
                 "banco_liquidacao_id": "1",

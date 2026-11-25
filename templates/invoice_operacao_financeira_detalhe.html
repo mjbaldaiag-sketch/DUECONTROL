@@ -11,8 +11,14 @@
   <div><span>Cliente</span><strong>{{ operacao.cliente_nome }}</strong></div>
   <div><span>Banco de Crédito</span><strong>{{ operacao.banco_credito_nome }}</strong></div>
   <div><span>Moeda / Total</span><strong>{{ operacao.valor_moeda|currency_amount(operacao.moeda) }}</strong></div>
-  <div><span>Taxa</span><strong>{{ operacao.taxa_cambio|rate }}</strong></div>
+  {% if operacao.moeda|upper == 'USD' %}
+  <div><span>Amortização principal (USD)</span><strong>{{ operacao.amortizacao_principal_usd|currency_amount('USD') }}</strong></div>
+  <div><span>Despesas banco intermediário (USD)</span><strong>{{ operacao.despesas_banco_intermediario_usd|currency_amount('USD') }}</strong></div>
+  {% endif %}
+  <div><span>Taxa liquidação</span><strong>{{ operacao.taxa_cambio|rate }}</strong></div>
   <div><span>Valor em <span class="currency-badge currency--brl">BRL</span></span><strong>{{ operacao.valor_brl|currency_amount('BRL') }}</strong></div>
+  <div><span>Amortização principal em <span class="currency-badge currency--brl">BRL</span></span><strong>{{ operacao.amortizacao_principal_brl|currency_amount('BRL') }}</strong></div>
+  <div><span>Despesas banco intermediário em <span class="currency-badge currency--brl">BRL</span></span><strong>{{ operacao.despesas_banco_intermediario_brl|currency_amount('BRL') }}</strong></div>
   <div><span>Data de Fechamento</span><strong>{{ operacao.data_fechamento|date_br }}</strong></div>
   <div><span>Data de Liquidação</span><strong>{{ operacao.data_liquidacao|date_br }}</strong></div>
   <div><span>Banco de Liquidação</span><strong>{{ operacao.banco_liquidacao_nome }}</strong></div>
@@ -29,9 +35,9 @@
 <form method="post" action="{{ url_for('editar_operacao_financeira', operacao_id=operacao.id) }}" class="form inline-form">
   <label>Número da Operação Financeira<input name="numero_operacao" maxlength="120" value="{{ operacao.numero_operacao }}" required></label>
   <label>Categoria<select name="categoria_operacao" required>{% for categoria in categorias %}<option value="{{ categoria }}" {{ 'selected' if categoria == operacao.categoria_operacao }}>{{ categoria }}</option>{% endfor %}</select></label>
-  <label>Data de Fechamento<input type="date" name="data_fechamento" value="{{ operacao.data_fechamento }}" required></label>
   <label>Data de Liquidação<input type="date" name="data_liquidacao" value="{{ operacao.data_liquidacao }}" required></label>
-  <label>Taxa<input name="taxa_cambio" data-rate value="{{ operacao.taxa_cambio|rate }}" required></label>
+  <label>Taxa liquidação<input name="taxa_cambio" data-rate value="{{ operacao.taxa_cambio|rate }}" required></label>
+  <label>Despesas banco intermediário (USD)<input name="despesas_banco_intermediario_usd" data-money value="{{ operacao.despesas_banco_intermediario_usd|money }}" min="0" step="0.01" {% if operacao.moeda|upper != 'USD' %}disabled title="Despesas intermediárias só podem ser informadas em operações USD."{% endif %}></label>
   <label>Banco de Liquidação<select name="banco_liquidacao_id" required>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if banco.id == operacao.banco_liquidacao_id }}>{{ banco.nome }}</option>{% endfor %}</select></label>
   <div class="form-actions"><button type="submit">Salvar alterações</button></div>
 </form>

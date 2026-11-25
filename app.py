@@ -26,9 +26,9 @@ CONTRACT_IMPORT_STAGE_PREFIX = "duecontrol_contract_import_"
 INVOICE_IMPORT_STAGE_TTL = 1800
 INVOICE_IMPORT_STAGE_PREFIX = "duecontrol_invoice_import_"
 INVOICE_CONTRACT_SCHEMA_VERSION = 1
-INVOICE_SCHEMA_VERSION = 20
+INVOICE_SCHEMA_VERSION = 21
 INVOICE_LEGACY_SCHEMA_VERSION = 15
-SAFRA_SCHEMA_VERSION = 20
+SAFRA_SCHEMA_VERSION = 21
 
 SALDO_TOLERANCE = Decimal("0.005")
 CONVERSION_RULE_HALF_DOWN = "HALF_DOWN"
@@ -1069,6 +1069,10 @@ def init_db():
                 banco_liquidacao_id INTEGER NOT NULL,
                 taxa_cambio REAL NOT NULL,
                 valor_brl REAL NOT NULL,
+                despesas_banco_intermediario_usd REAL NOT NULL DEFAULT 0
+                    CHECK(despesas_banco_intermediario_usd >= 0),
+                despesas_banco_intermediario_brl REAL NOT NULL DEFAULT 0
+                    CHECK(despesas_banco_intermediario_brl >= 0),
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT,
@@ -1275,6 +1279,18 @@ def init_db():
             conn.execute(
                 "ALTER TABLE operacoes_financeiras ADD COLUMN updated_at TEXT "
                 "NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            )
+        if "despesas_banco_intermediario_usd" not in operacao_columns:
+            conn.execute(
+                "ALTER TABLE operacoes_financeiras ADD COLUMN "
+                "despesas_banco_intermediario_usd REAL NOT NULL DEFAULT 0 "
+                "CHECK(despesas_banco_intermediario_usd >= 0)"
+            )
+        if "despesas_banco_intermediario_brl" not in operacao_columns:
+            conn.execute(
+                "ALTER TABLE operacoes_financeiras ADD COLUMN "
+                "despesas_banco_intermediario_brl REAL NOT NULL DEFAULT 0 "
+                "CHECK(despesas_banco_intermediario_brl >= 0)"
             )
         header_columns = {row[1] for row in conn.execute("PRAGMA table_info(fechamentos)")}
         if "taxa_cambio" not in header_columns:
@@ -1711,6 +1727,16 @@ def parse_decimal_number(value):
         return Decimal(text)
     except (InvalidOperation, ValueError):
         raise ValueError("Valor inválido. Use o formato 1.234,56.")
+
+
+def parse_money_decimal(value, label="Valor"):
+    """Parse a monetary value without silently rounding fractional cents."""
+    amount = parse_decimal_number(value)
+    if not amount.is_finite():
+        raise ValueError(f"{label} inv\u00e1lido.")
+    if amount.as_tuple().exponent < -2:
+        raise ValueError(f"{label} deve ter no m\u00e1ximo duas casas decimais.")
+    return amount.quantize(Decimal("0.01"))
 
 
 def parse_exchange_rate(value):
@@ -10958,6 +10984,11 @@ def invoice_summary(conn, invoice_id):
                o.cliente_id, o.banco_credito_id, o.moeda AS operacao_moeda,
                o.categoria_operacao, o.data_fechamento, o.data_liquidacao,
                o.banco_liquidacao_id, o.taxa_cambio, o.valor_brl,
+               o.despesas_banco_intermediario_usd,
+               o.despesas_banco_intermediario_brl,
+               (SELECT COALESCE(SUM(oi_total.valor_moeda), 0)
+                  FROM operacoes_financeiras_invoices oi_total
+                 WHERE oi_total.operacao_financeira_id=o.id) AS operacao_valor_moeda,
                o.created_at,
                bank_credito.nome AS banco_credito_nome,
                bank_liquidacao.nome AS banco_liquidacao_nome
@@ -10968,6 +10999,10 @@ def invoice_summary(conn, invoice_id):
         WHERE oi.invoice_id=?
         ORDER BY o.data_fechamento DESC, o.id DESC, oi.id DESC
     """, (invoice_id,)).fetchall()
+    operacoes_financeiras = [
+        financial_operation_breakdown(row, row["operacao_valor_moeda"])
+        for row in operacoes_financeiras
+    ]
     fechamentos = conn.execute("""
         SELECT f.*, h.id AS fechamento_id, h.cliente_id AS fechamento_cliente_id,
                h.banco_credito_id AS fechamento_banco_credito_id,
@@ -12620,6 +12655,17 @@ def central_closing_invoice(conn, invoice_id):
     data["banco_liquidacao_padrao_id"] = (
         padroes["banco_liquidacao_id"] if padroes else None
     )
+    banco_liquidacao_padrao = (
+        conn.execute(
+            "SELECT nome FROM contrapartes WHERE id=?",
+            (data["banco_liquidacao_padrao_id"],),
+        ).fetchone()
+        if data["banco_liquidacao_padrao_id"]
+        else None
+    )
+    data["banco_liquidacao_padrao_nome"] = (
+        banco_liquidacao_padrao["nome"] if banco_liquidacao_padrao else None
+    )
     data["previsao_embarque_dias_padrao"] = (
         padroes["previsao_embarque_dias"] if padroes else None
     )
@@ -12643,6 +12689,36 @@ def financial_operation_amounts_from_form(form):
         if match:
             amounts[int(match.group(1))] = value
     return amounts
+
+
+def financial_operation_expenses_from_form(form):
+    expenses = {}
+    for key, value in form.items():
+        match = re.fullmatch(
+            r"despesas_banco_intermediario_grupo_([1-9]\d*)_([A-Za-z0-9]+)",
+            str(key),
+        )
+        if match:
+            expenses[(int(match.group(1)), match.group(2).upper())] = value
+    return expenses
+
+
+def validate_financial_operation_expense(value, total, currency):
+    expense = parse_money_decimal(
+        value,
+        "As despesas do banco intermedi\u00e1rio",
+    )
+    if expense < 0:
+        raise ValueError("As despesas do banco intermedi\u00e1rio n\u00e3o podem ser negativas.")
+    if expense > decimal_value(total):
+        raise ValueError(
+            "As despesas do banco intermedi\u00e1rio n\u00e3o podem superar o valor total da opera\u00e7\u00e3o."
+        )
+    if str(currency or "").upper() != "USD" and expense > 0:
+        raise ValueError(
+            "As despesas do banco intermedi\u00e1rio s\u00f3 podem ser informadas em opera\u00e7\u00f5es USD."
+        )
+    return expense
 
 
 def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=None,
@@ -12766,17 +12842,39 @@ def central_closing_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=
 
 def financial_operation_groups(conn, raw_ids, data_fechamento=None, data_liquidacao=None,
                                taxa_cambio=None, banco_liquidacao_id=None,
-                               amounts=None, categoria_operacao=None):
+                               amounts=None, categoria_operacao=None, expenses=None):
     """Reaproveita a seleção, agrupamento e validações do fechamento centralizado."""
+    # Keep the legacy positional argument, but use only the liquidation date.
     categoria = normalize_operacao_financeira_category(categoria_operacao)
+    operation_date = parse_date(data_liquidacao)
+    if not operation_date:
+        raise ValueError("A Data de Liquida\u00e7\u00e3o \u00e9 obrigat\u00f3ria.")
     groups = central_closing_groups(
-        conn, raw_ids, data_fechamento, data_liquidacao, taxa_cambio,
+        conn, raw_ids, operation_date, operation_date, taxa_cambio,
         banco_liquidacao_id, amounts=amounts,
         categoria_cambio=CATEGORIA_CAMBIO_FINANCEIRO,
         previsao_embarque_dias=None,
     )
+    expenses = expenses or {}
     for group in groups:
         group["categoria_operacao"] = categoria
+        expense_raw = expenses.get((group["banco_credito_id"], group["moeda"]))
+        expense = validate_financial_operation_expense(
+            expense_raw if expense_raw is not None else "0",
+            group["valor_moeda"],
+            group["moeda"],
+        )
+        group["despesas_banco_intermediario_usd"] = expense
+        group["despesas_banco_intermediario_brl"] = closing_brl_value(
+            expense, group["taxa_cambio"], group["regra_conversao_brl"]
+        )
+        group["amortizacao_principal_brl"] = (
+            group["valor_brl"] - group["despesas_banco_intermediario_brl"]
+        )
+        group["amortizacao_principal_usd"] = (
+            group["valor_moeda"] - expense
+            if group["moeda"].upper() == "USD" else None
+        )
         group.pop("categoria_cambio", None)
         group.pop("previsao_embarque_dias", None)
     return groups
@@ -13307,7 +13405,7 @@ def central_closing_detail(conn, fechamento_id):
 
 
 def financial_operation_headers(conn):
-    return conn.execute("""
+    rows = conn.execute("""
         SELECT o.*, cl.nome AS cliente_nome,
                bc.nome AS banco_credito_nome, bl.nome AS banco_liquidacao_nome,
                MIN(e.prioridade) AS empresa_prioridade,
@@ -13325,6 +13423,27 @@ def financial_operation_headers(conn):
         GROUP BY o.id
         ORDER BY o.data_fechamento DESC, o.id DESC
     """).fetchall()
+    return [financial_operation_breakdown(row) for row in rows]
+
+
+def financial_operation_breakdown(operation, total_moeda=None):
+    """Expose the composition without changing the Invoice consumption total."""
+    data = dict(operation)
+    total = decimal_value(
+        total_moeda if total_moeda is not None else data.get("valor_moeda", 0)
+    )
+    expense_usd = decimal_value(data.get("despesas_banco_intermediario_usd", 0))
+    expense_brl = decimal_value(data.get("despesas_banco_intermediario_brl", 0))
+    total_brl = decimal_value(data.get("valor_brl", 0))
+    data["operacao_valor_moeda"] = total
+    data["despesas_banco_intermediario_usd"] = expense_usd
+    data["despesas_banco_intermediario_brl"] = expense_brl
+    currency = str(data.get("operacao_moeda") or data.get("moeda") or "").upper()
+    data["amortizacao_principal_usd"] = (
+        total - expense_usd if currency == "USD" else None
+    )
+    data["amortizacao_principal_brl"] = total_brl - expense_brl
+    return data
 
 
 def financial_operation_detail(conn, operacao_id):
@@ -13351,7 +13470,7 @@ def financial_operation_detail(conn, operacao_id):
     data = dict(header)
     data["items"] = items
     data["valor_moeda"] = sum((decimal_value(item["valor_moeda"]) for item in items), Decimal("0"))
-    return data
+    return financial_operation_breakdown(data)
 
 
 def create_central_closing_contract(conn, group, number):
@@ -14367,9 +14486,11 @@ def registrar_operacoes_financeiras():
         conn.execute("BEGIN IMMEDIATE")
         groups = financial_operation_groups(
             conn, request.form.getlist("selected_ids"),
-            request.form.get("data_fechamento"), request.form.get("data_liquidacao"),
-            request.form.get("taxa_cambio"), request.form.get("banco_liquidacao_id"),
+            data_liquidacao=request.form.get("data_liquidacao"),
+            taxa_cambio=request.form.get("taxa_cambio"),
+            banco_liquidacao_id=request.form.get("banco_liquidacao_id"),
             amounts=financial_operation_amounts_from_form(request.form),
+            expenses=financial_operation_expenses_from_form(request.form),
             categoria_operacao=request.form.get("categoria_operacao"),
         )
         for group in groups:
@@ -14389,13 +14510,16 @@ def registrar_operacoes_financeiras():
             cursor = conn.execute("""
                 INSERT INTO operacoes_financeiras
                     (numero_operacao,cliente_id,banco_credito_id,moeda,categoria_operacao,
-                     data_fechamento,data_liquidacao,banco_liquidacao_id,taxa_cambio,valor_brl)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                     data_fechamento,data_liquidacao,banco_liquidacao_id,taxa_cambio,valor_brl,
+                     despesas_banco_intermediario_usd,despesas_banco_intermediario_brl)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 number, group["cliente_id"], group["banco_credito_id"], group["moeda"],
                 group["categoria_operacao"], group["data_fechamento"],
                 group["data_liquidacao"], group["banco_liquidacao_id"],
                 float(group["taxa_cambio"]), float(group["valor_brl"]),
+                float(group["despesas_banco_intermediario_usd"]),
+                float(group["despesas_banco_intermediario_brl"]),
             ))
             operation_id = cursor.lastrowid
             for item in group["invoices"]:
@@ -14474,29 +14598,34 @@ def editar_operacao_financeira(operacao_id):
         category = normalize_operacao_financeira_category(
             request.form.get("categoria_operacao")
         )
-        data_fechamento = parse_date(request.form.get("data_fechamento"))
         data_liquidacao = parse_date(request.form.get("data_liquidacao"))
-        if not data_fechamento:
-            raise ValueError("A Data de Fechamento é obrigatória.")
         if not data_liquidacao:
-            raise ValueError("A Data de Liquidação é obrigatória.")
-        if data_liquidacao < data_fechamento:
-            raise ValueError("A Data de Liquidação não pode ser anterior à Data de Fechamento.")
+            raise ValueError("A Data de Liquida\u00e7\u00e3o \u00e9 obrigat\u00f3ria.")
+        data_fechamento = data_liquidacao
         rate = parse_exchange_rate(request.form.get("taxa_cambio"))
         bank = resolve_counterparty(
             conn, request.form.get("banco_liquidacao_id"), required=True
         )
         rule = normalize_conversion_rule(bank["regra_conversao_brl"])
+        expense = validate_financial_operation_expense(
+            request.form.get("despesas_banco_intermediario_usd") or "0",
+            detail["valor_moeda"],
+            detail["moeda"],
+        )
         value_brl = closing_brl_value(detail["valor_moeda"], rate, rule)
+        expense_brl = closing_brl_value(expense, rate, rule)
         conn.execute("""
             UPDATE operacoes_financeiras
             SET numero_operacao=?, categoria_operacao=?, data_fechamento=?,
                 data_liquidacao=?, banco_liquidacao_id=?, taxa_cambio=?, valor_brl=?,
+                despesas_banco_intermediario_usd=?,
+                despesas_banco_intermediario_brl=?,
                 updated_at=CURRENT_TIMESTAMP
             WHERE id=?
         """, (
             number, category, data_fechamento, data_liquidacao, bank["id"],
-            float(rate), float(value_brl), operacao_id,
+            float(rate), float(value_brl), float(expense), float(expense_brl),
+            operacao_id,
         ))
         invoice_ids = [item["invoice_id"] for item in detail["items"]]
         for invoice_id in invoice_ids:
@@ -14807,6 +14936,7 @@ def exportar_invoices():
     receipts = []
     changes = []
     due_links = []
+    financial_operations = []
     if invoice_ids:
         placeholders = ",".join("?" for _ in invoice_ids)
         receipts = conn.execute(f"""
@@ -14941,6 +15071,31 @@ def exportar_invoices():
             row["due_id"]: decimal_value(due_effect(conn, row["due_id"]))
             for row in due_links
         }
+        financial_operations = conn.execute(f"""
+            SELECT o.*, cl.nome AS cliente_nome,
+                   bc.nome AS banco_credito_nome,
+                   bl.nome AS banco_liquidacao_nome,
+                   COALESCE(SUM(oi.valor_moeda), 0) AS valor_moeda,
+                   GROUP_CONCAT(DISTINCT i.numero_invoice) AS invoices_numeros
+            FROM operacoes_financeiras o
+            JOIN clientes cl ON cl.id=o.cliente_id
+            JOIN contrapartes bc ON bc.id=o.banco_credito_id
+            JOIN contrapartes bl ON bl.id=o.banco_liquidacao_id
+            LEFT JOIN operacoes_financeiras_invoices oi
+                   ON oi.operacao_financeira_id=o.id
+            LEFT JOIN invoices i ON i.id=oi.invoice_id
+            WHERE EXISTS (
+                SELECT 1
+                FROM operacoes_financeiras_invoices oi_filter
+                WHERE oi_filter.operacao_financeira_id=o.id
+                  AND oi_filter.invoice_id IN ({placeholders})
+            )
+            GROUP BY o.id
+            ORDER BY o.data_fechamento DESC, o.id DESC
+        """, invoice_ids).fetchall()
+        financial_operations = [
+            financial_operation_breakdown(row) for row in financial_operations
+        ]
     else:
         due_usage = {}
     conn.close()
@@ -15109,10 +15264,28 @@ def exportar_invoices():
         item["due_saldo"] = due_balance(item["due_valor_original"], item["due_utilizado"])
         due_data.append(mapped_row(item, due_fields))
 
+    operation_fields = [
+        ("id", "Operacao ID"), ("numero_operacao", "Numero da Operacao"),
+        ("categoria_operacao", "Categoria"), ("cliente_nome", "Cliente"),
+        ("banco_credito_nome", "Banco de credito"),
+        ("banco_liquidacao_nome", "Banco de liquidacao"),
+        ("moeda", "Moeda"), ("operacao_valor_moeda", "Valor total"),
+        ("amortizacao_principal_usd", "Amortizacao principal USD"),
+        ("despesas_banco_intermediario_usd", "Despesas banco intermediario USD"),
+        ("amortizacao_principal_brl", "Amortizacao principal BRL"),
+        ("despesas_banco_intermediario_brl", "Despesas banco intermediario BRL"),
+        ("valor_brl", "Valor total BRL"), ("taxa_cambio", "Taxa liquidacao"),
+        ("data_fechamento", "Data de fechamento"),
+        ("data_liquidacao", "Data de liquidacao"),
+        ("invoices_numeros", "Invoices"), ("created_at", "Criado em"),
+    ]
+    operation_data = [mapped_row(row, operation_fields) for row in financial_operations]
+
     invoice_columns = [label for _, label in invoice_fields]
     receipt_columns = [label for _, label in receipt_fields]
     change_columns = [label for _, label in change_fields]
     due_columns = [label for _, label in due_fields]
+    operation_columns = [label for _, label in operation_fields]
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         sheets = [
@@ -15120,6 +15293,7 @@ def exportar_invoices():
             ("Recebimentos", receipt_data, receipt_columns),
             ("Cambios", change_data, change_columns),
             ("DU-Es", due_data, due_columns),
+            ("Operacoes Financeiras", operation_data, operation_columns),
         ]
         for sheet_name, data, columns in sheets:
             pd.DataFrame(data, columns=columns).to_excel(writer, index=False, sheet_name=sheet_name)

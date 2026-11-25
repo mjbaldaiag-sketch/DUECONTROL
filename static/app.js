@@ -825,6 +825,21 @@
         option.dataset.conversionRule = bankRules.get(option.value) || 'HALF_UP';
       });
     }
+    const decimalSubtract = (left, right) => {
+      const scale = Math.max(left.scale, right.scale);
+      return {
+        digits: left.digits * (10n ** BigInt(scale - left.scale))
+          - right.digits * (10n ** BigInt(scale - right.scale)),
+        scale,
+      };
+    };
+    const operationGroupAmounts = (groupKey) => {
+      const inputs = operationItems
+        ? [...operationItems.querySelectorAll('input[data-operation-group-key]')]
+          .filter((input) => input.dataset.operationGroupKey === groupKey)
+        : [];
+      return decimalSum(inputs.map((input) => input.value));
+    };
     const syncOperationTotals = () => {
       if (!operationSummary || !operationSelectedTotal || !operationBrlTotal
           || !operationBrlTotalValue) return;
@@ -844,6 +859,30 @@
       operationBrlTotalValue.innerHTML = `<span class="currency-badge currency-amount currency--brl">${conversionPreview(total, rate, selectedRule)}</span>`;
       operationBrlTotal.hidden = !operationRate || rate.digits <= 0n;
       operationSummary.hidden = selected().length === 0;
+      if (operationGroups) {
+        operationGroups.querySelectorAll('[data-operation-group]').forEach((groupElement) => {
+          const total = operationGroupAmounts(groupElement.dataset.operationGroup);
+          const expenseInput = groupElement.querySelector('[data-operation-expense]');
+          const expense = expenseInput ? decimalParts(expenseInput.value) : { digits: 0n, scale: 0 };
+          const principal = decimalSubtract(total, expense);
+          const currency = groupElement.dataset.operationCurrency || 'USD';
+          const totalBrlAmount = decimalParts(conversionPreview(total, rate, selectedRule));
+          const expenseBrlAmount = decimalParts(conversionPreview(expense, rate, selectedRule));
+          const principalBrlAmount = decimalSubtract(totalBrlAmount, expenseBrlAmount);
+          const totalBrl = formatDisplayedMoney(totalBrlAmount);
+          const expenseBrl = formatDisplayedMoney(expenseBrlAmount);
+          const principalBrl = formatDisplayedMoney(principalBrlAmount);
+          const preview = groupElement.querySelector('[data-operation-breakdown]');
+          if (preview) {
+            preview.innerHTML = `Total: <strong>${formatDisplayedMoney(total)} ${currency}</strong> · `
+              + `Principal: <strong>${formatDisplayedMoney(principal)} ${currency}</strong> · `
+              + `Despesas: <strong>${formatDisplayedMoney(expense)} USD</strong>`
+              + (rate.digits > 0n
+                ? ` · BRL: total <strong>${totalBrl}</strong>, principal <strong>${principalBrl}</strong>, despesas <strong>${expenseBrl}</strong>`
+                : '');
+          }
+        });
+      }
     };
     const closeOperationDialog = () => {
       if (!operationDialog) return;
@@ -878,6 +917,7 @@
         input.required = true;
         input.dataset.maxOperation = String(max);
         input.dataset.splittable = String(splittable);
+        input.dataset.operationGroupKey = `${checkbox.dataset.invoiceBankId || ''}|${currency}`;
         const validateOperationInput = () => {
           const normalized = input.value.includes(',')
             ? input.value.replace(/\./g, '').replace(',', '.') : input.value;
@@ -932,7 +972,62 @@
           input.required = true;
           input.placeholder = 'Obrigatório e único';
           label.appendChild(input);
-          operationGroups.appendChild(label);
+          const groupKey = `${group.bankId}|${group.currency}`;
+          const groupElement = document.createElement('div');
+          groupElement.dataset.operationGroup = groupKey;
+          groupElement.dataset.operationCurrency = group.currency;
+          groupElement.className = 'central-closing-contract-field';
+          groupElement.appendChild(label);
+
+          const expenseLabel = document.createElement('label');
+          expenseLabel.textContent = 'Despesas banco intermediário (USD)';
+          const expenseInput = document.createElement('input');
+          expenseInput.type = 'text';
+          expenseInput.name = `despesas_banco_intermediario_grupo_${group.bankId}_${group.currency}`;
+          expenseInput.value = '0,00';
+          expenseInput.inputMode = 'decimal';
+          expenseInput.dataset.operationExpense = '1';
+          expenseInput.dataset.operationGroup = groupKey;
+          expenseInput.dataset.operationCurrency = group.currency;
+          expenseInput.disabled = group.currency !== 'USD';
+          expenseInput.title = group.currency === 'USD'
+            ? 'Informe um valor entre zero e o total da operação.'
+            : 'Despesas intermediárias são informadas somente em operações USD.';
+          const validateExpenseInput = () => {
+            const raw = expenseInput.value.trim();
+            const normalized = raw.includes(',')
+              ? raw.replace(/\./g, '').replace(',', '.') : raw;
+            const amount = raw ? Number(normalized) : 0;
+            const fraction = normalized.includes('.') ? normalized.split('.').pop() : '';
+            const total = operationGroupAmounts(groupKey);
+            const maximum = Number(total.digits) / (10 ** total.scale);
+            const invalid = group.currency === 'USD'
+              && (!Number.isFinite(amount) || amount < 0 || fraction.length > 2
+                || amount > maximum + 0.005);
+            expenseInput.setCustomValidity(invalid
+              ? 'Informe despesas entre zero e o total da operação, com duas casas decimais.' : '');
+            expenseInput.classList.toggle('input-invalid', invalid);
+            expenseInput.setAttribute('aria-invalid', String(invalid));
+            return invalid;
+          };
+          expenseInput.addEventListener('input', () => {
+            validateExpenseInput();
+            syncOperationTotals();
+          });
+          expenseInput.addEventListener('blur', () => {
+            if (!validateExpenseInput()) formatMoney(expenseInput);
+            validateExpenseInput();
+            syncOperationTotals();
+          });
+          expenseLabel.appendChild(expenseInput);
+          groupElement.appendChild(expenseLabel);
+
+          const preview = document.createElement('small');
+          preview.className = 'muted';
+          preview.dataset.operationBreakdown = '';
+          groupElement.appendChild(preview);
+          operationGroups.appendChild(groupElement);
+          validateExpenseInput();
         });
       }
       if (operationBank) {
@@ -968,6 +1063,29 @@
       closeOperationDialog();
     });
     if (operationForm) operationForm.addEventListener('submit', (event) => {
+      const expenseInputs = [...operationForm.querySelectorAll('[data-operation-expense]')];
+      for (const input of expenseInputs) {
+        const raw = input.value.trim();
+        const normalized = raw.includes(',')
+          ? raw.replace(/\./g, '').replace(',', '.') : raw;
+        const amount = raw ? Number(normalized) : 0;
+        const fractionSeparator = raw.includes(',') ? ',' : '.';
+        const fraction = raw.includes(fractionSeparator)
+          ? raw.split(fractionSeparator).pop() : '';
+        const groupKey = input.dataset.operationGroup || '';
+        const currency = input.dataset.operationCurrency || 'USD';
+        const total = operationGroupAmounts(groupKey);
+        const maximum = Number(total.digits) / (10 ** total.scale);
+        const invalid = currency === 'USD'
+          && (!Number.isFinite(amount) || amount < 0 || fraction.length > 2
+            || amount > maximum + 0.005);
+        if (invalid) {
+          event.preventDefault();
+          window.alert('As despesas do banco intermediário devem ser não negativas, ter duas casas e não superar o total da operação.');
+          input.focus();
+          return;
+        }
+      }
       const amountInputs = [...operationForm.querySelectorAll('input[name^="valor_operacao_"]')];
       for (const input of amountInputs) {
         const normalized = input.value.includes(',')
