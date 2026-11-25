@@ -40,7 +40,7 @@
       </tbody>
     </table>
   </div>
-  <div class="central-closing-toolbar"><span class="muted">Informe os valores no modal para registrar o fechamento.</span><button type="button" data-central-open disabled>Registrar fechamento</button></div>
+  <div class="central-closing-toolbar"><span class="muted">Informe os valores no modal para registrar o fechamento ou a operação financeira.</span><span class="form-actions"><button type="button" data-central-open disabled>Registrar fechamento</button><button type="button" data-financial-operation-open disabled>Registrar Operação Financeira</button></span></div>
 </form>
 {{ render_pagination(eligible_pagination, 'Paginação de Invoices elegíveis') }}
 
@@ -64,6 +64,27 @@
       <label data-previsao-embarque-label hidden>PREVISÃO EMBARQUE<input name="previsao_embarque_dias" data-previsao-embarque type="number" min="1" max="360" step="1" inputmode="numeric" disabled><small class="muted">Informe de 1 a 360 dias.</small></label>
     </div>
     <div class="form-actions"><button type="submit">Confirmar e registrar</button><button type="button" class="btn secondary" data-central-cancel>Cancelar</button></div>
+  </form>
+</dialog>
+
+<dialog data-financial-operation-dialog aria-labelledby="financial-operation-dialog-title">
+  <form method="post" action="{{ url_for('registrar_operacoes_financeiras') }}" data-financial-operation-dialog-form>
+    <h2 id="financial-operation-dialog-title">Registrar Operação Financeira</h2>
+    <p class="muted">Confira o valor de cada Invoice. O limite é o saldo disponível. A operação não cria Fechamento nem Contrato.</p>
+    <div data-financial-operation-items class="central-closing-dialog-items"></div>
+    <div data-financial-operation-summary class="central-closing-dialog-summary" aria-live="polite" hidden>
+      <span>Total selecionado: <strong data-financial-operation-selected-total><span class="currency-badge currency-amount currency--usd">0,00</span></strong></span>
+      <span data-financial-operation-brl-total hidden>Total em <span class="currency-badge currency--brl">BRL</span>: <strong data-financial-operation-brl-total-value><span class="currency-badge currency-amount currency--brl">0,00</span></strong></span>
+    </div>
+    <div data-financial-operation-groups class="central-closing-dialog-contracts"></div>
+    <div class="central-closing-dialog-fields">
+      <label>Categoria da Operação<select name="categoria_operacao" required><option value="">Selecione</option><option value="ACC">ACC</option><option value="ACE">ACE</option><option value="PPE">PPE</option></select></label>
+      <label>Data de Fechamento<input type="date" name="data_fechamento" value="{{ today_iso() }}" required></label>
+      <label>Data de Liquidação<input type="date" name="data_liquidacao" required></label>
+      <label>Taxa<input name="taxa_cambio" data-rate inputmode="decimal" step="0.0001" placeholder="0,0000" required></label>
+      <label>Banco de Liquidação<select name="banco_liquidacao_id" required><option value="">Selecione</option>{% for banco in contrapartes %}<option value="{{ banco.id }}">{{ banco.nome }}</option>{% endfor %}</select></label>
+    </div>
+    <div class="form-actions"><button type="submit">Confirmar e registrar</button><button type="button" class="btn secondary" data-financial-operation-cancel>Cancelar</button></div>
   </form>
 </dialog>
 
@@ -92,4 +113,15 @@
   </tbody>
 </table></div>
 {{ render_pagination(closing_pagination, 'Paginação de Fechamentos registrados') }}
+<h2>Operações Financeiras registradas</h2>
+<div class="table-wrap"><table class="compact-table">
+  <thead><tr><th>ID</th><th>Número da Operação</th><th>Categoria</th><th>Empresa</th><th>Cliente</th><th>Banco de Crédito</th><th>Moeda</th><th>Valor</th><th>BRL</th><th>Taxa</th><th>Fechamento</th><th>Liquidação</th><th>Ações</th></tr></thead>
+  <tbody>
+  {% for operacao in operacoes_financeiras %}
+    <tr><td><a href="{{ url_for('detalhe_operacao_financeira', operacao_id=operacao.id) }}">{{ operacao.id }}</a></td><td>{{ operacao.numero_operacao }}</td><td>{{ operacao.categoria_operacao }}</td><td>{{ operacao.empresas_apelidos or '-' }}</td><td>{{ operacao.cliente_nome }}</td><td>{{ operacao.banco_credito_nome }}</td><td><span class="currency-badge {{ operacao.moeda|currency_class }}">{{ operacao.moeda }}</span></td><td>{{ operacao.valor_moeda|currency_amount(operacao.moeda) }}</td><td>{{ operacao.valor_brl|currency_amount('BRL') }}</td><td>{{ operacao.taxa_cambio|rate }}</td><td>{{ operacao.data_fechamento|date_br }}</td><td>{{ operacao.data_liquidacao|date_br }}</td><td><a href="{{ url_for('detalhe_operacao_financeira', operacao_id=operacao.id) }}">Ver / editar</a></td></tr>
+  {% else %}
+    <tr><td class="empty" colspan="13">Nenhuma Operação Financeira registrada.</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
 {% endblock %}

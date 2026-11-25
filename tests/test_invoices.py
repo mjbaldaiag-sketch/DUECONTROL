@@ -4159,6 +4159,201 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         )
         conn.close()
 
+    def _register_invoice_receipt(self, invoice_id, amount):
+        response = self.client.post(
+            f"/invoice/{invoice_id}/recebimentos",
+            data={
+                "banco_credito_id": "1",
+                "data_credito": "25/11/2026",
+                "valor_moeda": amount,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+
+    def _register_financial_operation(self, invoice_ids, amounts, number,
+                                      category="ACC", rate="5,0000"):
+        data = {
+            "selected_ids": [str(invoice_id) for invoice_id in invoice_ids],
+            "categoria_operacao": category,
+            "data_fechamento": "25/11/2026",
+            "data_liquidacao": "26/11/2026",
+            "taxa_cambio": rate,
+            "banco_liquidacao_id": "1",
+        }
+        for invoice_id, amount in zip(invoice_ids, amounts):
+            data[f"valor_operacao_{invoice_id}"] = amount
+        data["numero_operacao_grupo_1_USD"] = number
+        response = self.client.post("/invoices/operacoes-financeiras", data=data)
+        self.assertEqual(response.status_code, 302)
+        return response
+
+    def test_financial_operation_is_separate_and_consumes_invoice_balance(self):
+        invoice_id = self._create_invoice("INV-OPERATION", "100,00")
+        self._register_invoice_receipt(invoice_id, "100,00")
+        self._register_financial_operation([invoice_id], ["100,00"], "OP-001")
+
+        conn = app.db()
+        operation = conn.execute(
+            "SELECT * FROM operacoes_financeiras WHERE numero_operacao=?",
+            ("OP-001",),
+        ).fetchone()
+        self.assertIsNotNone(operation)
+        self.assertEqual(operation["categoria_operacao"], "ACC")
+        self.assertAlmostEqual(operation["valor_brl"], 500.0)
+        item = conn.execute(
+            "SELECT * FROM operacoes_financeiras_invoices WHERE operacao_financeira_id=?",
+            (operation["id"],),
+        ).fetchone()
+        self.assertEqual(item["invoice_id"], invoice_id)
+        self.assertEqual(item["valor_moeda"], 100)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM fechamentos_cambio").fetchone()[0], 0)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(operacoes_financeiras)")}
+        self.assertNotIn("previsao_embarque_dias", columns)
+        summary = app.invoice_summary(conn, invoice_id)
+        self.assertEqual(summary["total_fechamentos"], 0)
+        self.assertEqual(summary["total_operacoes_financeiras"], 100)
+        self.assertEqual(summary["total_cambio"], 100)
+        self.assertEqual(summary["saldo_fechamentos"], 0)
+        self.assertEqual(summary["status"], app.INVOICE_STATUS_LIQUIDADA)
+        conn.close()
+
+        listing = self.client.get("/invoices/fechamentos")
+        self.assertIn("OP-001", listing.get_data(as_text=True))
+        detail = self.client.get(f"/invoices/operacoes-financeiras/{operation['id']}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn("OP-001", detail.get_data(as_text=True))
+        invoice_detail = self.client.get(f"/invoice/{invoice_id}")
+        self.assertIn("Operações Financeiras", invoice_detail.get_data(as_text=True))
+        self.assertIn("OP-001", invoice_detail.get_data(as_text=True))
+        saldo = self.client.get(f"/invoices/{invoice_id}/saldo").get_json()
+        self.assertEqual(saldo["total_operacoes_financeiras"], 100.0)
+
+    def test_financial_operation_groups_invoices_and_rejects_invalid_or_overbalance(self):
+        first = self._create_invoice("INV-OP-GROUP-A", "100,00")
+        second = self._create_invoice("INV-OP-GROUP-B", "50,00")
+        self._register_invoice_receipt(first, "100,00")
+        self._register_invoice_receipt(second, "50,00")
+        self._register_financial_operation([first, second], ["100,00", "50,00"], "OP-GROUP", "ACE")
+
+        conn = app.db()
+        operation = conn.execute(
+            "SELECT * FROM operacoes_financeiras WHERE numero_operacao=?", ("OP-GROUP",)
+        ).fetchone()
+        self.assertIsNotNone(operation)
+        self.assertEqual(operation["categoria_operacao"], "ACE")
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM operacoes_financeiras_invoices WHERE operacao_financeira_id=?",
+                (operation["id"],),
+            ).fetchone()[0],
+            2,
+        )
+        conn.close()
+
+        invalid = self._create_invoice("INV-OP-INVALID", "100,00")
+        self._register_invoice_receipt(invalid, "100,00")
+        response = self.client.post(
+            "/invoices/operacoes-financeiras",
+            data={
+                "selected_ids": str(invalid),
+                f"valor_operacao_{invalid}": "100,00",
+                "numero_operacao_grupo_1_USD": "OP-INVALID-CATEGORY",
+                "categoria_operacao": "INVALID",
+                "data_fechamento": "25/11/2026",
+                "data_liquidacao": "26/11/2026",
+                "taxa_cambio": "5",
+                "banco_liquidacao_id": "1",
+            },
+            follow_redirects=True,
+        )
+        self.assertIn("Categoria de Operação Financeira válida", response.get_data(as_text=True))
+        response = self.client.post(
+            "/invoices/operacoes-financeiras",
+            data={
+                "selected_ids": str(invalid),
+                f"valor_operacao_{invalid}": "101,00",
+                "numero_operacao_grupo_1_USD": "OP-OVER",
+                "categoria_operacao": "PPE",
+                "data_fechamento": "25/11/2026",
+                "data_liquidacao": "26/11/2026",
+                "taxa_cambio": "5",
+                "banco_liquidacao_id": "1",
+            },
+            follow_redirects=True,
+        )
+        self.assertIn("não pode ultrapassar o saldo disponível", response.get_data(as_text=True))
+        conn = app.db()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM operacoes_financeiras WHERE numero_operacao IN (?,?)",
+                ("OP-INVALID-CATEGORY", "OP-OVER"),
+            ).fetchone()[0],
+            0,
+        )
+        conn.close()
+
+    def test_financial_operation_partial_split_edit_and_delete_preserve_items(self):
+        invoice_id = self._create_invoice("INV-OP-SPLIT", "100,00")
+        self._register_invoice_receipt(invoice_id, "100,00")
+        self._register_financial_operation([invoice_id], ["40,00"], "OP-SPLIT", "PPE")
+
+        conn = app.db()
+        operation = conn.execute(
+            "SELECT * FROM operacoes_financeiras WHERE numero_operacao=?", ("OP-SPLIT",)
+        ).fetchone()
+        item = conn.execute(
+            "SELECT * FROM operacoes_financeiras_invoices WHERE operacao_financeira_id=?",
+            (operation["id"],),
+        ).fetchone()
+        parcels = conn.execute(
+            "SELECT id, valor_moeda FROM invoices WHERE numero_invoice LIKE 'INV-OP-SPLIT%' ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(parcels), 2)
+        self.assertEqual(item["invoice_id"], parcels[0]["id"])
+        self.assertEqual(item["valor_moeda"], 40)
+        conn.close()
+
+        response = self.client.post(
+            f"/invoices/operacoes-financeiras/{operation['id']}/editar",
+            data={
+                "numero_operacao": "OP-SPLIT-EDIT",
+                "categoria_operacao": "ACE",
+                "data_fechamento": "26/11/2026",
+                "data_liquidacao": "27/11/2026",
+                "taxa_cambio": "6",
+                "banco_liquidacao_id": "1",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        updated = conn.execute(
+            "SELECT * FROM operacoes_financeiras WHERE id=?", (operation["id"],)
+        ).fetchone()
+        self.assertEqual(updated["numero_operacao"], "OP-SPLIT-EDIT")
+        self.assertEqual(updated["categoria_operacao"], "ACE")
+        self.assertEqual(updated["valor_brl"], 240)
+        self.assertEqual(
+            conn.execute(
+                "SELECT invoice_id, valor_moeda FROM operacoes_financeiras_invoices WHERE operacao_financeira_id=?",
+                (operation["id"],),
+            ).fetchone()[1],
+            40,
+        )
+        conn.close()
+
+        response = self.client.post(
+            f"/invoices/operacoes-financeiras/{operation['id']}/excluir"
+        )
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        self.assertIsNone(conn.execute("SELECT id FROM operacoes_financeiras WHERE id=?", (operation["id"],)).fetchone())
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM operacoes_financeiras_invoices").fetchone()[0], 0)
+        source_summary = app.invoice_summary(conn, invoice_id)
+        self.assertEqual(source_summary["total_operacoes_financeiras"], 0)
+        self.assertEqual(source_summary["status"], app.INVOICE_STATUS_RECEBIDA_AGUARDANDO_CAMBIO)
+        conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

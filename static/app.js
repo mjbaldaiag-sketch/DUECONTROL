@@ -473,6 +473,7 @@
     const selectAll = form.querySelector('[data-central-select-all]');
     const count = form.querySelector('[data-central-selected-count]');
     const submit = form.querySelector('[data-central-open]');
+    const operationSubmit = form.querySelector('[data-financial-operation-open]');
     const dialog = document.querySelector('[data-central-closing-dialog]');
     const dialogForm = dialog ? dialog.querySelector('[data-central-closing-dialog-form]') : null;
     const dialogItems = dialog ? dialog.querySelector('[data-central-closing-items]') : null;
@@ -727,6 +728,7 @@
       const checked = selected();
       if (count) count.textContent = checked.length;
       if (submit) submit.disabled = checked.length === 0;
+      if (operationSubmit) operationSubmit.disabled = checked.length === 0;
       if (selectAll) {
         selectAll.checked = checkboxes.length > 0 && checked.length === checkboxes.length;
         selectAll.indeterminate = checked.length > 0 && checked.length < checkboxes.length;
@@ -798,6 +800,188 @@
         event.preventDefault();
         window.alert('Informe a PREVISÃO EMBARQUE com um número inteiro entre 1 e 360 dias.');
         previsaoInput.focus();
+      }
+    });
+    const operationDialog = document.querySelector('[data-financial-operation-dialog]');
+    const operationForm = operationDialog
+      ? operationDialog.querySelector('[data-financial-operation-dialog-form]') : null;
+    const operationItems = operationDialog
+      ? operationDialog.querySelector('[data-financial-operation-items]') : null;
+    const operationSummary = operationDialog
+      ? operationDialog.querySelector('[data-financial-operation-summary]') : null;
+    const operationSelectedTotal = operationDialog
+      ? operationDialog.querySelector('[data-financial-operation-selected-total]') : null;
+    const operationBrlTotal = operationDialog
+      ? operationDialog.querySelector('[data-financial-operation-brl-total]') : null;
+    const operationBrlTotalValue = operationDialog
+      ? operationDialog.querySelector('[data-financial-operation-brl-total-value]') : null;
+    const operationGroups = operationDialog
+      ? operationDialog.querySelector('[data-financial-operation-groups]') : null;
+    const operationRate = operationForm ? operationForm.querySelector('[name="taxa_cambio"]') : null;
+    const operationBank = operationForm
+      ? operationForm.querySelector('[name="banco_liquidacao_id"]') : null;
+    if (operationBank) {
+      [...operationBank.options].forEach((option) => {
+        option.dataset.conversionRule = bankRules.get(option.value) || 'HALF_UP';
+      });
+    }
+    const syncOperationTotals = () => {
+      if (!operationSummary || !operationSelectedTotal || !operationBrlTotal
+          || !operationBrlTotalValue) return;
+      const selectedIds = new Set(selected().map((checkbox) => `valor_operacao_${checkbox.value}`));
+      const amountInputs = operationItems
+        ? [...operationItems.querySelectorAll('input[name^="valor_operacao_"]')]
+          .filter((input) => selectedIds.has(input.name)) : [];
+      const total = decimalSum(
+        amountInputs.length
+          ? amountInputs.map((input) => input.value)
+          : selected().map((checkbox) => checkbox.dataset.invoiceAvailable || '0'),
+      );
+      const rate = decimalParts(operationRate ? operationRate.value : '');
+      const selectedRule = operationBank && operationBank.selectedOptions.length
+        ? operationBank.selectedOptions[0].dataset.conversionRule || 'HALF_UP' : 'HALF_UP';
+      operationSelectedTotal.innerHTML = `<span class="currency-badge currency-amount currency--usd">${formatDisplayedMoney(total)}</span>`;
+      operationBrlTotalValue.innerHTML = `<span class="currency-badge currency-amount currency--brl">${conversionPreview(total, rate, selectedRule)}</span>`;
+      operationBrlTotal.hidden = !operationRate || rate.digits <= 0n;
+      operationSummary.hidden = selected().length === 0;
+    };
+    const closeOperationDialog = () => {
+      if (!operationDialog) return;
+      if (typeof operationDialog.close === 'function') operationDialog.close();
+      else operationDialog.removeAttribute('open');
+    };
+    const renderOperationDialog = () => {
+      if (!operationItems || !operationForm) return;
+      operationItems.replaceChildren();
+      if (operationGroups) operationGroups.replaceChildren();
+      operationForm.querySelectorAll('[data-financial-operation-selected-id]').forEach((input) => input.remove());
+      selected().forEach((checkbox) => {
+        const item = document.createElement('div');
+        item.className = 'central-closing-dialog-item';
+        const label = document.createElement('label');
+        const title = document.createElement('strong');
+        title.textContent = checkbox.dataset.invoiceNumber || `Invoice ${checkbox.value}`;
+        const currency = checkbox.dataset.invoiceCurrency || 'USD';
+        const max = Number(checkbox.dataset.invoiceAvailable || 0);
+        const splittable = checkbox.dataset.invoiceSplittable === '1';
+        const limit = document.createElement('small');
+        limit.textContent = `Saldo disponível: ${new Intl.NumberFormat('pt-BR', {
+          minimumFractionDigits: 2, maximumFractionDigits: 2,
+        }).format(max)} ${currency}${splittable ? '' : ' · Invoice legada: somente integral'}`;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.name = `valor_operacao_${checkbox.value}`;
+        input.value = new Intl.NumberFormat('pt-BR', {
+          minimumFractionDigits: 2, maximumFractionDigits: 2,
+        }).format(max);
+        input.inputMode = 'decimal';
+        input.required = true;
+        input.dataset.maxOperation = String(max);
+        input.dataset.splittable = String(splittable);
+        const validateOperationInput = () => {
+          const normalized = input.value.includes(',')
+            ? input.value.replace(/\./g, '').replace(',', '.') : input.value;
+          const amount = Number(normalized);
+          const invalid = !Number.isFinite(amount) || amount <= 0 || amount > max + 0.005
+            || (!splittable && amount < max - 0.005);
+          input.setCustomValidity(invalid
+            ? 'Informe um valor maior que zero dentro do saldo disponível.' : '');
+          input.classList.toggle('input-invalid', invalid);
+          input.setAttribute('aria-invalid', String(invalid));
+        };
+        input.addEventListener('input', () => {
+          validateOperationInput();
+          syncOperationTotals();
+        });
+        input.addEventListener('blur', () => {
+          formatMoney(input);
+          validateOperationInput();
+          syncOperationTotals();
+        });
+        validateOperationInput();
+        label.append(title, limit, input);
+        item.appendChild(label);
+        operationItems.appendChild(item);
+        const hidden = document.createElement('input');
+        hidden.type = 'hidden';
+        hidden.name = 'selected_ids';
+        hidden.value = checkbox.value;
+        hidden.setAttribute('data-financial-operation-selected-id', '');
+        operationForm.appendChild(hidden);
+      });
+      if (operationGroups) {
+        const groups = [...new Map(selected().map((checkbox) => {
+          const key = `${checkbox.dataset.invoiceBankId || ''}|${checkbox.dataset.invoiceCurrency || ''}`;
+          return [key, {
+            bankId: checkbox.dataset.invoiceBankId || '',
+            bank: checkbox.dataset.invoiceBankName || 'Banco de Crédito',
+            currency: checkbox.dataset.invoiceCurrency || 'USD',
+          }];
+        })).values()].sort((left, right) => {
+          const bankOrder = left.bank.localeCompare(right.bank, 'pt-BR');
+          return bankOrder || left.currency.localeCompare(right.currency, 'pt-BR');
+        });
+        groups.forEach((group, index) => {
+          const label = document.createElement('label');
+          label.className = 'central-closing-contract-field';
+          label.textContent = `Número da Operação Financeira — Grupo ${index + 1} (${group.bank} · ${group.currency})`;
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.name = `numero_operacao_grupo_${group.bankId}_${group.currency}`;
+          input.maxLength = 120;
+          input.required = true;
+          input.placeholder = 'Obrigatório e único';
+          label.appendChild(input);
+          operationGroups.appendChild(label);
+        });
+      }
+      if (operationBank) {
+        const selectedDefaults = selected().map((checkbox) => (
+          checkbox.dataset.invoiceLiquidationBankId || ''
+        ));
+        const defaultBank = selectedDefaults.length > 0
+          && selectedDefaults.every((bankId) => bankId && bankId === selectedDefaults[0])
+          ? selectedDefaults[0] : '';
+        operationBank.value = defaultBank;
+      }
+      syncOperationTotals();
+    };
+    if (operationRate) operationRate.addEventListener('input', syncOperationTotals);
+    if (operationBank) operationBank.addEventListener('change', syncOperationTotals);
+    if (operationSubmit && operationDialog) operationSubmit.addEventListener('click', () => {
+      if (!selected().length || !sameClient(selected())) {
+        window.alert('Selecione uma ou mais Invoices do mesmo Cliente.');
+        return;
+      }
+      renderOperationDialog();
+      if (typeof operationDialog.showModal === 'function') operationDialog.showModal();
+      else operationDialog.setAttribute('open', '');
+      const firstAmount = operationItems
+        ? operationItems.querySelector('input[name^="valor_operacao_"]') : null;
+      if (firstAmount) firstAmount.focus();
+    });
+    const operationCancel = operationDialog
+      ? operationDialog.querySelector('[data-financial-operation-cancel]') : null;
+    if (operationCancel) operationCancel.addEventListener('click', closeOperationDialog);
+    if (operationDialog) operationDialog.addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeOperationDialog();
+    });
+    if (operationForm) operationForm.addEventListener('submit', (event) => {
+      const amountInputs = [...operationForm.querySelectorAll('input[name^="valor_operacao_"]')];
+      for (const input of amountInputs) {
+        const normalized = input.value.includes(',')
+          ? input.value.replace(/\./g, '').replace(',', '.') : input.value;
+        const amount = Number(normalized);
+        const maximum = Number(input.dataset.maxOperation || 0);
+        const splittable = input.dataset.splittable === 'true';
+        if (!Number.isFinite(amount) || amount <= 0 || amount > maximum + 0.005
+            || (!splittable && amount < maximum - 0.005)) {
+          event.preventDefault();
+          window.alert('Cada valor deve ser maior que zero, não pode ultrapassar o saldo disponível e Invoices legadas só permitem consumo integral.');
+          input.focus();
+          return;
+        }
       }
     });
     form.addEventListener('submit', (event) => {
