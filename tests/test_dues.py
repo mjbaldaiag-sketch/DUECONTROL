@@ -42,6 +42,7 @@ class DueNumberTests(unittest.TestCase):
             "competencia_id": "1",
             "moeda": "USD",
             "valor_original": "100,00",
+            "status_averbacao": "SIM",
             "observacao": "",
         }
 
@@ -70,11 +71,72 @@ class DueNumberTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 302)
         conn = app.db()
-        row = conn.execute("SELECT numero_due, created_at, data_due FROM dues").fetchone()
+        row = conn.execute(
+            "SELECT numero_due, created_at, data_due, status_averbacao FROM dues"
+        ).fetchone()
         conn.close()
         self.assertEqual(row["numero_due"], "26BR000951958-9")
         self.assertRegex(row["created_at"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
         self.assertEqual(row["data_due"], row["created_at"][:10])
+        self.assertEqual(row["status_averbacao"], "SIM")
+
+    def test_status_averbacao_is_required_and_rejects_other_values(self):
+        for value in (None, "TALVEZ"):
+            data = self._due_form("26BR0009519589")
+            if value is None:
+                data.pop("status_averbacao")
+            else:
+                data["status_averbacao"] = value
+            with self.subTest(value=value):
+                response = self.client.post("/due/nova", data=data)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("STATUS AVERBAÇÃO", response.get_data(as_text=True))
+                conn = app.db()
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM dues").fetchone()[0], 0)
+                conn.close()
+
+    def test_status_averbacao_can_be_changed_on_edit(self):
+        self.client.post("/due/nova", data=self._due_form("26BR0009519589"))
+        conn = app.db()
+        due_id = conn.execute("SELECT id FROM dues").fetchone()[0]
+        conn.close()
+
+        data = self._due_form("26BR0009519590")
+        data["status_averbacao"] = "NÃO"
+        response = self.client.post(f"/due/{due_id}/editar", data=data)
+
+        self.assertEqual(response.status_code, 302)
+        conn = app.db()
+        self.assertEqual(
+            conn.execute(
+                "SELECT status_averbacao FROM dues WHERE id=?", (due_id,)
+            ).fetchone()[0],
+            "NÃO",
+        )
+        conn.close()
+
+    def test_status_averbacao_is_visible_in_due_views_and_card(self):
+        data = self._due_form("26BR0009519589")
+        data["status_averbacao"] = "NÃO"
+        self.client.post("/due/nova", data=data)
+        conn = app.db()
+        due_id = conn.execute("SELECT id FROM dues").fetchone()[0]
+        conn.close()
+
+        detail = self.client.get(f"/due/{due_id}").get_data(as_text=True)
+        self.assertIn("STATUS AVERBAÇÃO", detail)
+        self.assertIn("due-averbacao-card--nao", detail)
+        self.assertIn("status-averbacao--nao", detail)
+        css = Path("static/style.css").read_text(encoding="utf-8")
+        self.assertIn(".status-averbacao--sim .status-averbacao__dot{background:#2f9e54}", css)
+        self.assertIn(".status-averbacao--nao .status-averbacao__dot{background:#c92a2a}", css)
+
+        report = self.client.get(f"/due/{due_id}/relatorio").get_data(as_text=True)
+        self.assertIn("STATUS AVERBAÇÃO", report)
+        listing = self.client.get("/dues").get_data(as_text=True)
+        self.assertIn("STATUS AVERBAÇÃO", listing)
+        dashboard = self.client.get("/").get_data(as_text=True)
+        self.assertIn("STATUS AVERBAÇÃO", dashboard)
 
     def test_new_due_form_does_not_show_receipt_date(self):
         response = self.client.get("/due/nova")
@@ -178,6 +240,76 @@ class DueNumberTests(unittest.TestCase):
         self.assertIn("Nenhuma DU-E encontrada", html)
         self.assertNotIn("26BR000951958-9", html)
 
+    def test_status_averbacao_filter_is_shared_with_excel_export(self):
+        conn = app.db()
+        conn.executemany(
+            "INSERT INTO dues (numero_due, moeda, valor_original, status_averbacao) VALUES (?,?,?,?)",
+            [
+                ("DUE-SIM", "USD", 100, "SIM"),
+                ("DUE-NAO", "USD", 100, "NÃO"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/dues", query_string={"status_averbacao": "NÃO"})
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn("DUE-NAO", html)
+        self.assertNotIn("DUE-SIM", html)
+
+        export = self.client.get(
+            "/dues/exportar", query_string={"status_averbacao": "NÃO"}
+        )
+        self.assertEqual(export.status_code, 200)
+        exported = pd.read_excel(io.BytesIO(export.data), sheet_name="DU-Es")
+        self.assertIn("STATUS AVERBAÇÃO", exported.columns)
+        self.assertEqual(exported["Número da DU-E"].tolist(), ["DUE-NAO"])
+
+    def test_due_model_requires_and_documents_status_averbacao(self):
+        response = self.client.get("/dues/modelo")
+        self.assertEqual(response.status_code, 200)
+        workbook = pd.ExcelFile(io.BytesIO(response.data))
+        model = pd.read_excel(io.BytesIO(response.data), sheet_name="DU-Es")
+        orientations = pd.read_excel(io.BytesIO(response.data), sheet_name="Orientações")
+        self.assertIn("status_averbacao", model.columns)
+        self.assertIn("STATUS_AVERBACAO", orientations.columns)
+        self.assertEqual(
+            set(orientations["STATUS_AVERBACAO"].dropna()), {"SIM", "NÃO"}
+        )
+        self.assertIn("DU-Es", workbook.sheet_names)
+
+    def test_excel_import_requires_valid_status_averbacao(self):
+        def upload(row):
+            workbook = io.BytesIO()
+            pd.DataFrame([row]).to_excel(workbook, index=False)
+            workbook.seek(0)
+            return self.client.post(
+                "/dues/importar",
+                data={"arquivo": (workbook, "due-status.xlsx")},
+                content_type="multipart/form-data",
+            )
+
+        missing = upload({
+            "numero_due": "26BR0011495403",
+            "chave_acesso": "62345678901234",
+            "cnpj": "45.765.914/0001-81",
+            "valor_original": 100,
+        })
+        self.assertEqual(missing.status_code, 302)
+
+        invalid = upload({
+            "numero_due": "26BR0011495414",
+            "chave_acesso": "72345678901234",
+            "cnpj": "45.765.914/0001-81",
+            "valor_original": 100,
+            "status_averbacao": "TALVEZ",
+        })
+        self.assertEqual(invalid.status_code, 200)
+        conn = app.db()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM dues").fetchone()[0], 0)
+        conn.close()
+
     def test_excel_import_normalizes_and_rejects_invalid_or_duplicate_numbers(self):
         frame = pd.DataFrame([
             {
@@ -185,18 +317,21 @@ class DueNumberTests(unittest.TestCase):
                 "chave_acesso": "12345678901234",
                 "cnpj": "45.765.914/0001-81",
                 "valor_original": 100,
+                "status_averbacao": "SIM",
             },
             {
                 "numero_due": "26BR000951958-9",
                 "chave_acesso": "22345678901234",
                 "cnpj": "45.765.914/0001-81",
                 "valor_original": 100,
+                "status_averbacao": "SIM",
             },
             {
                 "numero_due": "26BR000951958@0",
                 "chave_acesso": "32345678901234",
                 "cnpj": "45.765.914/0001-81",
                 "valor_original": 100,
+                "status_averbacao": "NÃO",
             },
         ])
         workbook = io.BytesIO()
@@ -236,6 +371,7 @@ class DueNumberTests(unittest.TestCase):
             "cnpj": "45.765.914/0001-81",
             "cliente": "  ETG   COMMODITIES  ",
             "valor_original": 100,
+            "status_averbacao": "NÃO",
         }])
         workbook = io.BytesIO()
         frame.to_excel(workbook, index=False)
@@ -263,6 +399,7 @@ class DueNumberTests(unittest.TestCase):
             "chave_acesso": "52345678901234",
             "cnpj": "45.765.914/0001-81",
             "valor_original": 100,
+            "status_averbacao": "SIM",
         }])
         workbook = io.BytesIO()
         frame.to_excel(workbook, index=False)
@@ -309,6 +446,47 @@ class DueNumberTests(unittest.TestCase):
         ).fetchone()
         conn.close()
         self.assertEqual(tuple(due), ("LOUIS DREYFUS COMPANY SUISSE SA", client_id))
+
+    def test_init_migrates_legacy_dues_to_sim_status_averbacao(self):
+        previous_db = app.DB
+        legacy_path = Path(tempfile.mktemp(prefix="duecontrol_legacy_status_", suffix=".db"))
+        try:
+            app.DB = legacy_path
+            conn = app.db()
+            conn.execute("""
+                CREATE TABLE dues (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    numero_due TEXT NOT NULL UNIQUE,
+                    data_due TEXT,
+                    cnpj TEXT,
+                    cliente TEXT,
+                    cliente_id INTEGER,
+                    moeda TEXT NOT NULL DEFAULT 'USD',
+                    valor_original REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'PENDENTE',
+                    observacao TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    competencia_id INTEGER
+                )
+            """)
+            conn.executemany(
+                "INSERT INTO dues (numero_due, moeda, valor_original) VALUES (?,?,?)",
+                [("LEGACY-DUE-1", "USD", 10), ("LEGACY-DUE-2", "USD", 20)],
+            )
+            conn.commit()
+            conn.close()
+
+            app.init_db()
+
+            conn = app.db()
+            rows = conn.execute(
+                "SELECT status_averbacao FROM dues ORDER BY id"
+            ).fetchall()
+            conn.close()
+            self.assertEqual([row[0] for row in rows], ["SIM", "SIM"])
+        finally:
+            app.DB = previous_db
+            legacy_path.unlink(missing_ok=True)
 
     def test_init_migrates_missing_due_competence_by_company_and_operation_date(self):
         conn = app.db()

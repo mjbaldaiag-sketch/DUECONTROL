@@ -18,6 +18,7 @@
       <div><span>Número da DU-E</span><strong>{{ due.numero_due or '-' }}</strong></div>
       <div><span>Chave de acesso</span><strong>{{ due.chave_acesso or '-' }}</strong></div>
       <div><span>Status</span><strong><span class="status {{ due.status|status_class }}">{{ due.status or '-' }}</span></strong></div>
+      <div><span>STATUS AVERBAÇÃO</span><strong><span class="status-averbacao {{ 'status-averbacao--sim' if due.status_averbacao == 'SIM' else 'status-averbacao--nao' }}"><span class="status-averbacao__dot" aria-hidden="true"></span>{{ due.status_averbacao or '-' }}</span></strong></div>
       <div><span>Cliente</span><strong>{{ due.cliente or '-' }}</strong></div>
       <div><span>Moeda</span><strong><span class="currency-badge {{ due.moeda|currency_class }}">{{ due.moeda or '-' }}</span></strong></div>
       <div><span>Data de lançamento</span><strong>{{ due.created_at|date_br or '-' }}</strong></div>

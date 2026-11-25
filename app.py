@@ -38,6 +38,9 @@ CONVERSION_RULES = (CONVERSION_RULE_HALF_DOWN, CONVERSION_RULE_HALF_UP)
 STATUS_PENDENTE = "PENDENTE"
 STATUS_CONCLUIDO = "CONCLUÍDO"
 STATUS_PARCIAL = "PARCIAL"
+STATUS_AVERBACAO_SIM = "SIM"
+STATUS_AVERBACAO_NAO = "NÃO"
+STATUS_AVERBACAO_OPTIONS = (STATUS_AVERBACAO_SIM, STATUS_AVERBACAO_NAO)
 CATEGORIA_CAMBIO_EXPORTACAO = "Câmbio Exportação"
 CATEGORIA_CAMBIO_FINANCEIRO = "Câmbio Financeiro"
 CURRENCY_PALETTE = {
@@ -762,6 +765,8 @@ def init_db():
         moeda TEXT NOT NULL DEFAULT 'USD',
         valor_original REAL NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'PENDENTE',
+        status_averbacao TEXT NOT NULL DEFAULT 'SIM'
+            CHECK(status_averbacao IN ('SIM', 'NÃO')),
         observacao TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         ,competencia_id INTEGER
@@ -1423,6 +1428,15 @@ def init_db():
             conn.execute("ALTER TABLE dues ADD COLUMN competencia_id INTEGER")
         if "cliente_id" not in due_columns:
             conn.execute("ALTER TABLE dues ADD COLUMN cliente_id INTEGER")
+        if "status_averbacao" not in due_columns:
+            conn.execute(
+                "ALTER TABLE dues ADD COLUMN status_averbacao TEXT NOT NULL "
+                "DEFAULT 'SIM' CHECK(status_averbacao IN ('SIM', 'NÃO'))"
+            )
+        conn.execute(
+            "UPDATE dues SET status_averbacao='SIM' "
+            "WHERE status_averbacao IS NULL OR TRIM(status_averbacao) NOT IN ('SIM', 'NÃO')"
+        )
         normalizar_clientes_dues(conn)
         normalizar_competencias_dues(conn)
         ndf_columns = {row[1] for row in conn.execute("PRAGMA table_info(ndfs)")}
@@ -1440,6 +1454,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ndfs_cliente ON ndfs(cliente_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_cliente ON dues(cliente_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_competencia ON dues(competencia_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dues_status_averbacao ON dues(status_averbacao)")
         movimentacao_columns = {row[1] for row in conn.execute("PRAGMA table_info(due_movimentacoes)")}
         if "contrato_id" not in movimentacao_columns:
             conn.execute("ALTER TABLE due_movimentacoes ADD COLUMN contrato_id INTEGER")
@@ -1744,6 +1759,17 @@ def normalize_numero_due(value, allow_partial=False):
             return compact
         raise ValueError("O número da DU-E deve conter exatamente 14 caracteres alfanuméricos.")
     return f"{compact[:13]}-{compact[13]}"
+
+def normalize_status_averbacao(value, required=True):
+    """Valida o status de averbação, aceitando somente SIM ou NÃO."""
+    status = "" if value is None else str(value).strip().upper()
+    if not status:
+        if required:
+            raise ValueError("O STATUS AVERBAÇÃO é obrigatório.")
+        return None
+    if status not in STATUS_AVERBACAO_OPTIONS:
+        raise ValueError("O STATUS AVERBAÇÃO deve ser SIM ou NÃO.")
+    return status
 
 def normalize_cnpj(value):
     """Valida e armazena o CNPJ somente com seus 14 dígitos."""
@@ -5044,6 +5070,7 @@ def dashboard_due_sorting(args):
             "number",
         ),
         "status": ("d.status", "text"),
+        "status_averbacao": ("d.status_averbacao", "text"),
     }
     return fields, *build_sorting(
         args, fields,
@@ -9364,6 +9391,15 @@ def dues_filter_parts(args):
     if args.get("status"):
         where.append("d.status = ?")
         params.append(args["status"].strip().upper())
+    if args.get("status_averbacao"):
+        try:
+            status_averbacao = normalize_status_averbacao(args["status_averbacao"])
+        except ValueError as exc:
+            flash(str(exc), "danger")
+            where.append("1=0")
+        else:
+            where.append("d.status_averbacao = ?")
+            params.append(status_averbacao)
     for key, operator in (("data_de", ">="), ("data_ate", "<=")):
         if args.get(key):
             try:
@@ -9391,6 +9427,7 @@ def dues_sorting(args):
         "moeda": ("d.moeda", "text"),
         "valor_original": ("d.valor_original", "number"),
         "status": ("d.status", "text"),
+        "status_averbacao": ("d.status_averbacao", "text"),
     }
     sort, direction, sort_links = build_sorting(
         args, sort_fields, default_sort="data_due", default_direction="DESC"
@@ -9423,7 +9460,8 @@ def consulta_dues():
     return render_template("due_consulta.html", dues=dues, total=total,
                            filters=filters, moedas=moedas, sort=sort, direction=direction,
                            sort_links=sort_links, pagination=pagination,
-                           status_concluido=STATUS_CONCLUIDO, status_parcial=STATUS_PARCIAL)
+                           status_concluido=STATUS_CONCLUIDO, status_parcial=STATUS_PARCIAL,
+                           status_averbacao_options=STATUS_AVERBACAO_OPTIONS)
 
 
 @app.route("/dues/exportar")
@@ -9531,6 +9569,7 @@ def exportar_dues():
         ("cliente", "Cliente"), ("moeda", "Moeda"),
         ("valor_original", "Valor original"), ("utilizado", "Total utilizado"),
         ("saldo", "Saldo disponível"), ("status", "Status"),
+        ("status_averbacao", "STATUS AVERBAÇÃO"),
         ("observacao", "Observação"),
     ]
     due_data = []
@@ -9648,7 +9687,10 @@ def excluir_dues_lote():
         conn.close()
     return redirect_batch_result("consulta_dues")
 
-def write_excel_model_orientations(writer, conn, pandas, include_invoice_contracts=False):
+def write_excel_model_orientations(
+    writer, conn, pandas, include_invoice_contracts=False,
+    include_due_status_averbacao=False,
+):
     """Adiciona ao modelo uma lista de referência para preenchimento do Excel."""
     banks = [row["nome"] for row in conn.execute(
         "SELECT nome FROM contrapartes ORDER BY nome, id"
@@ -9680,6 +9722,8 @@ def write_excel_model_orientations(writer, conn, pandas, include_invoice_contrac
         "CNPJ": pandas.Series(company_cnpjs),
         "COMPETENCIAS": pandas.Series(competencies),
     }
+    if include_due_status_averbacao:
+        orientation_data["STATUS_AVERBACAO"] = pandas.Series(STATUS_AVERBACAO_OPTIONS)
     if include_invoice_contracts:
         orientation_data["CONTRATOS_COMERCIAIS"] = pandas.Series(invoice_contracts)
     orientations = pandas.DataFrame(orientation_data)
@@ -9703,13 +9747,15 @@ def write_excel_model_orientations(writer, conn, pandas, include_invoice_contrac
 @app.route("/dues/modelo")
 def modelo_dues():
     import pandas as pd
-    df = pd.DataFrame(columns=["numero_due", "chave_acesso", "cnpj", "cliente", "moeda", "valor_original"])
+    df = pd.DataFrame(columns=["numero_due", "chave_acesso", "cnpj", "cliente", "moeda", "valor_original", "status_averbacao"])
     out = io.BytesIO()
     conn = db()
     try:
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="DU-Es")
-            write_excel_model_orientations(writer, conn, pd)
+            write_excel_model_orientations(
+                writer, conn, pd, include_due_status_averbacao=True
+            )
     finally:
         conn.close()
     out.seek(0)
@@ -9727,7 +9773,7 @@ def importar_dues():
     try:
         df = pd.read_excel(arquivo)
         df.columns = [str(c).strip().lower() for c in df.columns]
-        obrigatorias = {"chave_acesso", "numero_due", "cnpj", "valor_original"}
+        obrigatorias = {"chave_acesso", "numero_due", "cnpj", "valor_original", "status_averbacao"}
         faltantes = sorted(obrigatorias - set(df.columns))
         if faltantes:
             flash("O Excel precisa conter as colunas obrigatórias: " + ", ".join(sorted(obrigatorias)) + ".", "danger")
@@ -9760,6 +9806,9 @@ def importar_dues():
         try:
             numero = normalize_numero_due(numero_input)
             chave = parse_chave_acesso(chave)
+            status_averbacao = normalize_status_averbacao(
+                valor_linha(row, "status_averbacao")
+            )
             if numero in existentes:
                 raise ValueError("a DU-E já está cadastrada no banco")
             if numero in vistos_numeros:
@@ -9818,8 +9867,8 @@ def importar_dues():
             competencias_atribuidas += 1
             created_at = launch_timestamp()
             registros.append((chave, numero, cnpj, cliente, cliente_id,
-                              moeda, valor_original, status_from_balance(valor_original), created_at,
-                              data_importacao, competencia_id))
+                              moeda, valor_original, status_from_balance(valor_original),
+                              status_averbacao, created_at, data_importacao, competencia_id))
             vistos_numeros.add(numero)
             vistos_chaves.add(chave)
         except (TypeError, ValueError, InvalidOperation) as exc:
@@ -9833,8 +9882,8 @@ def importar_dues():
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     conn.executemany("""INSERT INTO dues
-                        (chave_acesso,numero_due,cnpj,cliente,cliente_id,moeda,valor_original,status,created_at,data_due,competencia_id)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""", registros)
+                        (chave_acesso,numero_due,cnpj,cliente,cliente_id,moeda,valor_original,status,status_averbacao,created_at,data_due,competencia_id)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", registros)
                     conn.commit()
                     break
                 except sqlite3.OperationalError as exc:
@@ -9865,6 +9914,7 @@ def nova_due():
         try:
             numero_due = normalize_numero_due(f.get("numero_due"))
             chave = parse_chave_acesso(f.get("chave_acesso"))
+            status_averbacao = normalize_status_averbacao(f.get("status_averbacao"))
             valor_original = parse_number(f.get("valor_original"))
             ensure_non_negative_balance(valor_original, "O valor original da DU-E não pode ser negativo.")
             conn = db()
@@ -9877,10 +9927,11 @@ def nova_due():
             if conn.execute("SELECT 1 FROM dues WHERE chave_acesso=?", (chave,)).fetchone():
                 raise ValueError("A Chave de Acesso já está cadastrada.")
             conn.execute("""INSERT INTO dues
-                (chave_acesso,numero_due,cnpj,cliente,cliente_id,moeda,valor_original,status,created_at,observacao,data_due,competencia_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (chave_acesso,numero_due,cnpj,cliente,cliente_id,moeda,valor_original,status,status_averbacao,created_at,observacao,data_due,competencia_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (chave,numero_due,cnpj,cliente["nome"],cliente["id"],
                  f.get("moeda") or "USD",valor_original, status_from_balance(valor_original),
+                 status_averbacao,
                  created_at,
                  f.get("observacao"), data_due, competencia_id))
             conn.commit()
@@ -9904,10 +9955,13 @@ def nova_due():
     if not competencia_id and empresa_id:
         sugerida = sugerir_competencia(conn, empresa_id, date.today().isoformat())
         competencia_id = sugerida["id"] if sugerida else None
+    status_averbacao = request.form.get("status_averbacao") if request.method == "POST" else None
     conn.close()
     return render_template("due_form.html", due=None, empresas=empresas, empresa_id=empresa_id,
                            clientes=clientes, cliente_id=cliente_id,
-                           competencias=competencias, competencia_id=competencia_id)
+                           competencias=competencias, competencia_id=competencia_id,
+                           status_averbacao=status_averbacao,
+                           status_averbacao_options=STATUS_AVERBACAO_OPTIONS)
 
 @app.route("/due/<int:due_id>/editar", methods=["GET", "POST"])
 def editar_due(due_id):
@@ -9920,6 +9974,7 @@ def editar_due(due_id):
         try:
             numero_due = normalize_numero_due(f.get("numero_due"))
             chave = parse_chave_acesso(f.get("chave_acesso"))
+            status_averbacao = normalize_status_averbacao(f.get("status_averbacao"))
             valor_original = parse_number(f.get("valor_original"))
             ensure_non_negative_balance(valor_original, "O valor original da DU-E não pode ser negativo.")
             utilizado_atual = due_effect(conn, due_id)
@@ -9946,11 +10001,11 @@ def editar_due(due_id):
             )
             if conn.execute("SELECT 1 FROM dues WHERE chave_acesso=? AND id<>?", (chave, due_id)).fetchone():
                 raise ValueError("A Chave de Acesso já está cadastrada.")
-            conn.execute("""UPDATE dues SET chave_acesso=?,numero_due=?,cnpj=?,cliente=?,cliente_id=?,moeda=?,valor_original=?,observacao=?,competencia_id=?
+            conn.execute("""UPDATE dues SET chave_acesso=?,numero_due=?,cnpj=?,cliente=?,cliente_id=?,moeda=?,valor_original=?,status_averbacao=?,observacao=?,competencia_id=?
                             WHERE id=?""",
                          (chave, numero_due, cnpj,
                           cliente, cliente_id, f.get("moeda") or "USD", valor_original,
-                          f.get("observacao"), competencia_id, due_id))
+                          status_averbacao, f.get("observacao"), competencia_id, due_id))
             update_due_status(conn, due_id)
             conn.commit(); conn.close()
             flash("DU-E atualizada com sucesso.", "success")
@@ -9970,10 +10025,17 @@ def editar_due(due_id):
         selected_id=request.form.get("cliente_id") if request.method == "POST" else None,
     )
     competencia_id = form_record_id(request.form.get("competencia_id"), due["competencia_id"] if "competencia_id" in due.keys() else None)
+    status_averbacao = (
+        request.form.get("status_averbacao")
+        if request.method == "POST"
+        else due["status_averbacao"]
+    )
     conn.close()
     return render_template("due_form.html", due=due, empresas=empresas, empresa_id=empresa_id,
                            clientes=clientes, cliente_id=cliente_id,
-                           competencias=competencias, competencia_id=competencia_id)
+                           competencias=competencias, competencia_id=competencia_id,
+                           status_averbacao=status_averbacao,
+                           status_averbacao_options=STATUS_AVERBACAO_OPTIONS)
 
 def carregar_detalhe_due(conn, due_id):
     due_cnpj_sql = _global_normalized_cnpj_sql("d.cnpj")
