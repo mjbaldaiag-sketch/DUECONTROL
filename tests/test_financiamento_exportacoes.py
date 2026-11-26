@@ -40,20 +40,25 @@ class FinanciamentoExportacaoTests(unittest.TestCase):
         app.DB = self.previous_db
         self.db_path.unlink(missing_ok=True)
 
-    def _operation(self, amount="1000,00", modality="ACC", number=""):
+    def _operation(self, amount="1000,00", modality="ACC", number="",
+                   release_currency=None, rate="5,20"):
+        data = {
+            "categoria_operacao": modality,
+            "empresa_id": "1",
+            "banco_credito_id": "1",
+            "numero_contrato_cambio": number,
+            "data_contratacao": "25/11/2026",
+            "data_limite_liquidacao": "30/11/2026",
+            "moeda": "USD",
+            "valor_contratado_moeda": amount,
+        }
+        if modality == "PPE":
+            data["moeda_liberacao_recurso"] = release_currency or "BRL"
+        if rate is not None:
+            data["taxa_contratada"] = rate
         response = self.client.post(
             "/financiamento-exportacoes/nova",
-            data={
-                "categoria_operacao": modality,
-                "empresa_id": "1",
-                "banco_credito_id": "1",
-                "numero_contrato_cambio": number,
-                "data_contratacao": "25/11/2026",
-                "data_limite_liquidacao": "30/11/2026",
-                "moeda": "USD",
-                "valor_contratado_moeda": amount,
-                "taxa_contratada": "5,20",
-            },
+            data=data,
         )
         self.assertEqual(response.status_code, 302)
         return int(response.location.rsplit("/", 1)[1])
@@ -135,6 +140,85 @@ class FinanciamentoExportacaoTests(unittest.TestCase):
                   "valor_liquidado_moeda": "0,01"}, follow_redirects=True,
         )
         self.assertIn("ultrapassar o valor contratado", response.get_data(as_text=True))
+
+    def test_ppe_non_brl_does_not_require_contracted_rate(self):
+        operation_id = self._operation(
+            "1000,00", modality="PPE", number="PPE-USD-001",
+            release_currency="USD", rate=None,
+        )
+        conn = app.db()
+        operation = conn.execute(
+            "SELECT * FROM operacoes_financeiras WHERE id=?", (operation_id,)
+        ).fetchone()
+        self.assertEqual(operation["moeda_liberacao_recurso"], "USD")
+        self.assertIsNone(operation["taxa_contratada"])
+        self.assertEqual(operation["valor_contratado_brl"], 0)
+        self.assertIsNone(operation["taxa_cambio"])
+        self.assertIsNone(operation["valor_brl"])
+        conn.close()
+
+        detail = self.client.get(
+            f"/financiamento-exportacoes/{operation_id}"
+        )
+        html = detail.get_data(as_text=True)
+        self.assertIn("Moeda de libera&ccedil;&atilde;o de recurso", html)
+        self.assertIn("<strong>-</strong>", html)
+
+    def test_ppe_requires_release_currency(self):
+        response = self.client.post(
+            "/financiamento-exportacoes/nova",
+            data={
+                "categoria_operacao": "PPE",
+                "empresa_id": "1",
+                "banco_credito_id": "1",
+                "data_contratacao": "25/11/2026",
+                "moeda": "USD",
+                "valor_contratado_moeda": "10,00",
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        conn = app.db()
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM operacoes_financeiras"
+        ).fetchone()[0], 0)
+        conn.close()
+
+    def test_acc_still_requires_contracted_rate(self):
+        response = self.client.post(
+            "/financiamento-exportacoes/nova",
+            data={
+                "categoria_operacao": "ACC",
+                "empresa_id": "1",
+                "banco_credito_id": "1",
+                "data_contratacao": "25/11/2026",
+                "moeda": "USD",
+                "valor_contratado_moeda": "10,00",
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_existing_ppe_without_release_currency_is_backfilled_as_brl(self):
+        conn = app.db()
+        conn.execute(
+            """
+            INSERT INTO operacoes_financeiras
+                (empresa_id,banco_credito_id,moeda,categoria_operacao,
+                 taxa_contratada,valor_contratado_brl)
+            VALUES (?,?,?,?,?,?)
+            """,
+            (1, 1, "USD", "PPE", 5, 500),
+        )
+        conn.commit()
+        conn.close()
+
+        app.init_db()
+        conn = app.db()
+        release_currency = conn.execute(
+            "SELECT moeda_liberacao_recurso FROM operacoes_financeiras "
+            "WHERE categoria_operacao='PPE' ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        self.assertEqual(release_currency, "BRL")
+        conn.close()
 
     def test_rejects_unsupported_modality_and_accepts_textual_contract_number(self):
         response = self.client.post(
@@ -268,9 +352,9 @@ class FinanciamentoExportacaoTests(unittest.TestCase):
         financing_html = financing_page.get_data(as_text=True)
         self.assertEqual(financing_page.status_code, 200)
         self.assertIn("INV-LINK-001", financing_html)
-        self.assertIn("Saldo para Operações Financeiras", financing_html)
+        self.assertIn("Saldo para Opera&ccedil;&otilde;es Financeiras", financing_html)
         self.assertIn("750,00", financing_html)
-        self.assertIn("Operações Financeiras vinculadas", financing_html)
+        self.assertIn("Opera&ccedil;&otilde;es Financeiras vinculadas", financing_html)
 
         detail = self.client.get(
             f"/invoices/operacoes-financeiras/{operation['id']}"

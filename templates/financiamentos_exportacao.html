@@ -3,8 +3,8 @@
 {% from "_sorting.html" import sortable_header %}
 {% block content %}
 <div class="page-heading">
-  <div><h1>Financiamento de Exportações</h1><p class="muted">{{ total }} operação(ões) encontrada(s)</p></div>
-  <div class="actions"><a class="btn" href="{{ url_for('novo_financiamento_exportacao') }}">+ Novo financiamento</a><a class="btn secondary" href="{{ url_for('index') }}">Dashboard</a></div>
+  <div><h1>Operações Financeiras</h1><p class="muted">{{ total }} operação(ões) encontrada(s)</p></div>
+  <div class="actions"><a class="btn" href="{{ url_for('novo_financiamento_exportacao') }}">+ Nova operação financeira</a><a class="btn secondary" href="{{ url_for('index') }}">Dashboard</a></div>
 </div>
 
 <form method="get" class="filters">
@@ -35,12 +35,12 @@
   <td>{{ operacao.empresa_apelido or operacao.empresa_razao_social or '-' }}{% if operacao.empresa_cnpj %}<small class="status-note">{{ operacao.empresa_cnpj|cnpj }}</small>{% endif %}</td>
   <td>{{ operacao.banco_credito_nome or '-' }}</td>
   <td>{{ operacao.numero_contrato_cambio or '-' }}</td>
-  <td><span class="currency-badge {{ operacao.moeda|currency_class }}">{{ operacao.moeda }}</span> {{ operacao.valor_contratado_moeda|currency_amount(operacao.moeda) }}<small class="status-note">{{ operacao.valor_contratado_brl|currency_amount('BRL') }}</small></td>
+  <td><span class="currency-badge {{ operacao.moeda|currency_class }}">{{ operacao.moeda }}</span> {{ operacao.valor_contratado_moeda|currency_amount(operacao.moeda) }}<small class="status-note">{{ operacao.valor_contratado_brl|currency_amount('BRL') if operacao.possui_conversao_contratada_brl else '-' }}</small></td>
   <td><span class="currency-badge {{ operacao.moeda|currency_class }}">{{ operacao.moeda }}</span> {{ operacao.valor_liquidado_moeda|currency_amount(operacao.moeda) }}<small class="status-note">{{ operacao.valor_liquidado_brl|currency_amount('BRL') }}</small></td>
   <td><span class="status {{ operacao.status|financiamento_status_class }}">{{ operacao.status }}</span></td>
   <td class="row-actions"><a href="{{ url_for('detalhe_financiamento_exportacao', operacao_id=operacao.id) }}">Ver</a> <a href="{{ url_for('editar_financiamento_exportacao', operacao_id=operacao.id) }}">Editar</a></td>
 </tr>
-{% else %}<tr><td colspan="8" class="empty">Nenhum financiamento de exportação encontrado.</td></tr>{% endfor %}
+{% else %}<tr><td colspan="8" class="empty">Nenhuma operação financeira encontrada.</td></tr>{% endfor %}
 </tbody></table></div>
-{{ render_pagination(pagination, 'Paginação de financiamentos de exportação') }}
+{{ render_pagination(pagination, 'Paginação de operações financeiras') }}
 {% endblock %}

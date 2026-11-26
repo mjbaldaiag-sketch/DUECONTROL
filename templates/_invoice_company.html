@@ -1,0 +1,13 @@
+{% macro display(invoice, link_transfer=true) -%}
+  {% set is_transferred = invoice.transferida|default(false) %}
+  <span class="invoice-company-display{% if is_transferred %} invoice-company-display--transferred{% endif %}">
+    {% if is_transferred %}
+      <span class="invoice-transfer-icon" title="Invoice transferida; empresa de origem: {{ invoice.empresa_origem_transferencia }}" aria-label="Invoice transferida">⇄</span>
+    {% endif %}
+    <span>{{ invoice.empresa_nome_original or invoice.empresa_apelido or invoice.empresa_razao_social or invoice.destino_empresa_nome or '-' }}</span>
+    {% if is_transferred %}
+      <span class="invoice-transfer-badge" title="Origem: {{ invoice.empresa_origem_transferencia }}{% if invoice.transferencia_data %}; data: {{ invoice.transferencia_data|date_br }}{% endif %}">TRANSFERIDA</span>
+      {% if link_transfer and invoice.transferencia_id %}<a class="invoice-transfer-history" href="{{ url_for('transferencias_empresas') }}#transferencia-{{ invoice.transferencia_id }}" title="Ver histórico da transferência">histórico</a>{% endif %}
+    {% endif %}
+  </span>
+{%- endmacro %}

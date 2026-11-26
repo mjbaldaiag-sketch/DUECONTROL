@@ -1,21 +1,24 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="page-heading"><div><h1>{{ 'Editar' if operacao else 'Novo' }} financiamento de exporta&#231;&#227;o</h1><p class="muted">Cadastro independente de ACC, ACE ou PPE. Liquida&#231;&#245;es e v&#237;nculos s&#227;o registrados no detalhe.</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('lista_financiamento_exportacoes') }}">Voltar</a></div></div>
+<div class="page-heading"><div><h1>{{ 'Editar' if operacao else 'Nova' }} opera&ccedil;&atilde;o financeira</h1><p class="muted">Cadastro independente de ACC, ACE ou PPE. Liquida&ccedil;&otilde;es e v&iacute;nculos s&atilde;o registrados no detalhe.</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('lista_financiamento_exportacoes') }}">Voltar</a></div></div>
 {% if error %}<div class="flash danger">{{ error }}</div>{% endif %}
-<form method="post" class="form">
+{% set selected_bank = ('banco:' ~ operacao.banco_credito_id) if operacao and operacao.banco_credito_id else '' %}
+{% set selected_client = ('cliente:' ~ operacao.cliente_id) if operacao and operacao.cliente_id else '' %}
+<form method="post" class="form" data-ppe-financing-form>
   <div class="form-grid">
-    <label>Modalidade*<select name="categoria_operacao" required>{% for categoria in categorias %}<option value="{{ categoria }}" {{ 'selected' if operacao and operacao.categoria_operacao == categoria else '' }}>{{ categoria }}</option>{% endfor %}</select></label>
+    <label>Modalidade*<select name="categoria_operacao" data-ppe-category required>{% for categoria in categorias %}<option value="{{ categoria }}" {{ 'selected' if operacao and operacao.categoria_operacao == categoria else '' }}>{{ categoria }}</option>{% endfor %}</select></label>
     <label>Empresa / CNPJ*<select name="empresa_id" required><option value="">Selecione</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if operacao and operacao.empresa_id == empresa.id else '' }}>{{ empresa.apelido or empresa.razao_social }}{% if empresa.cnpj %} &#8212; {{ empresa.cnpj|cnpj }}{% endif %}</option>{% endfor %}</select></label>
-    <label>Banco / contraparte*<select name="banco_credito_id" required><option value="">Selecione</option>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if operacao and operacao.banco_credito_id == banco.id else '' }}>{{ banco.nome }}</option>{% endfor %}</select></label>
-    <label>N&#186; contrato de c&#226;mbio<input name="numero_contrato_cambio" maxlength="120" value="{{ operacao.numero_contrato_cambio if operacao else '' }}" placeholder="Opcional"></label>
-    <label>Data de contrata&#231;&#227;o*<input name="data_contratacao" data-date-br value="{{ operacao.data_contratacao|date_br if operacao else today_iso()|date_br }}" placeholder="dd/mm/aaaa" required></label>
-    <label>Data limite liquidação<input name="data_limite_liquidacao" data-date-br value="{{ operacao.data_limite_liquidacao|date_br if operacao and operacao.data_limite_liquidacao else '' }}" placeholder="dd/mm/aaaa"></label>
+    <label>Banco / contraparte*<select name="banco_credito_id" data-ppe-counterparty required><option value="">Selecione</option><optgroup label="Bancos / Contrapartes">{% for banco in contrapartes %}<option value="banco:{{ banco.id }}" {{ 'selected' if selected_bank == ('banco:' ~ banco.id) else '' }}>{{ banco.nome }}</option>{% endfor %}</optgroup><optgroup label="Clientes / Trading" data-ppe-client-group hidden>{% for cliente in clientes %}<option value="cliente:{{ cliente.id }}" data-ppe-client-option disabled {{ 'selected' if selected_client == ('cliente:' ~ cliente.id) else '' }}>{{ cliente.nome }}{% if cliente.pais %} &mdash; {{ cliente.pais|pais_nome }}{% endif %}</option>{% endfor %}</optgroup></select></label>
+    <label>N&ordm; contrato de c&acirc;mbio<input name="numero_contrato_cambio" maxlength="120" value="{{ operacao.numero_contrato_cambio if operacao else '' }}" placeholder="Opcional"></label>
+    <label>Data de contrata&ccedil;&atilde;o*<input name="data_contratacao" data-date-br value="{{ operacao.data_contratacao|date_br if operacao else today_iso()|date_br }}" placeholder="dd/mm/aaaa" required></label>
+    <label>Data limite liquida&ccedil;&atilde;o<input name="data_limite_liquidacao" data-date-br value="{{ operacao.data_limite_liquidacao|date_br if operacao and operacao.data_limite_liquidacao else '' }}" placeholder="dd/mm/aaaa"></label>
     <label>Moeda*<select name="moeda" required>{% for moeda in moedas %}<option value="{{ moeda }}" {{ 'selected' if (operacao and operacao.moeda == moeda) or (not operacao and moeda == 'USD') else '' }}>{{ moeda }}</option>{% endfor %}</select></label>
+    <label data-ppe-release-field hidden>Moeda de libera&ccedil;&atilde;o de recurso*<select name="moeda_liberacao_recurso" data-ppe-release-select>{% for moeda in moedas %}<option value="{{ moeda }}" {{ 'selected' if (operacao and operacao.moeda_liberacao_recurso == moeda) or (operacao and operacao.categoria_operacao == 'PPE' and not operacao.moeda_liberacao_recurso and moeda == 'BRL') or (not operacao and moeda == 'BRL') else '' }}>{{ moeda }}</option>{% endfor %}</select></label>
     <label>Valor contratado na moeda estrangeira*<input name="valor_contratado_moeda" data-money inputmode="decimal" value="{{ operacao.valor_contratado_moeda|money if operacao else '' }}" required></label>
-    <label>Taxa contratada*<input name="taxa_contratada" data-rate inputmode="decimal" value="{{ operacao.taxa_contratada|rate if operacao and operacao.taxa_contratada is not none else '' }}" required></label>
-    <label class="form-wide">Observa&#231;&#227;o<textarea name="observacao" rows="3">{{ operacao.observacao if operacao else '' }}</textarea></label>
+    <label data-ppe-rate-field>Taxa contratada*<input name="taxa_contratada" data-rate inputmode="decimal" value="{{ operacao.taxa_contratada|rate if operacao and operacao.taxa_contratada is not none else '' }}"></label>
+    <label class="form-wide">Observa&ccedil;&atilde;o<textarea name="observacao" rows="3">{{ operacao.observacao if operacao else '' }}</textarea></label>
   </div>
-  <p class="muted">O valor contratado em BRL ser&#225; calculado automaticamente pelo backend conforme a taxa e a regra de convers&#227;o do banco. Status, liquida&#231;&#245;es e saldos n&#227;o s&#227;o editados manualmente.</p>
-  <div class="form-actions"><button type="submit">{{ 'Salvar altera&#231;&#245;es' if operacao else 'Cadastrar financiamento' }}</button><a class="btn secondary" href="{{ url_for('lista_financiamento_exportacoes') }}">Cancelar</a></div>
+  <p class="muted">O valor contratado em BRL ser&aacute; calculado automaticamente pelo backend quando houver taxa contratada. Status, liquida&ccedil;&otilde;es e saldos n&atilde;o s&atilde;o editados manualmente.</p>
+  <div class="form-actions"><button type="submit">{{ 'Salvar alterações' if operacao else 'Cadastrar operação financeira' }}</button><a class="btn secondary" href="{{ url_for('lista_financiamento_exportacoes') }}">Cancelar</a></div>
 </form>
 {% endblock %}

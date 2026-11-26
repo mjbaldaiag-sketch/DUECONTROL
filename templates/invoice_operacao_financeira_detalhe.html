@@ -1,15 +1,15 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="page-heading">
-  <div><h1>Operação Financeira {{ operacao.id }}</h1><p class="muted">Registro separado de consumo financeiro da Invoice</p></div>
+  <div><h1>Liquidação financeira {{ operacao.id }}</h1><p class="muted">Registro separado de liquidação financeira e consumo da Invoice</p></div>
   <div class="actions"><a class="btn secondary" href="{{ url_for('gestao_fechamentos_invoices') }}">Voltar</a></div>
 </div>
 <div class="detail-grid">
   {% if operacao.financiamento_exportacao_id %}
-  <div><span>Financiamento de Exportação</span><strong><a href="{{ url_for('detalhe_financiamento_exportacao', operacao_id=operacao.financiamento_exportacao_id) }}">{{ operacao.financiamento_numero_contrato or operacao.financiamento_exportacao_id }}</a></strong></div>
+  <div><span>Opera&ccedil;&atilde;o Financeira de origem</span><strong><a href="{{ url_for('detalhe_financiamento_exportacao', operacao_id=operacao.financiamento_exportacao_id) }}">{{ operacao.financiamento_numero_contrato or operacao.financiamento_exportacao_id }}</a></strong></div>
   {% endif %}
-  <div><span>ID da Operação Financeira</span><strong>{{ operacao.id }}</strong></div>
-  <div><span>Número da Operação Financeira</span><strong>{{ operacao.numero_operacao }}</strong></div>
+  <div><span>ID da liquidação financeira</span><strong>{{ operacao.id }}</strong></div>
+  <div><span>Número da liquidação financeira</span><strong>{{ operacao.numero_operacao }}</strong></div>
   <div><span>Categoria</span><strong>{{ operacao.categoria_operacao }}</strong></div>
   <div><span>Cliente</span><strong>{{ operacao.cliente_nome }}</strong></div>
   <div><span>Banco de Crédito</span><strong>{{ operacao.banco_credito_nome }}</strong></div>
@@ -33,13 +33,13 @@
 {% else %}<tr><td class="empty" colspan="4">Nenhuma Invoice vinculada.</td></tr>{% endfor %}
 </tbody></table></div>
 
-<h2>Editar metadados</h2>
-<p class="muted">As Invoices e os valores consumidos são imutáveis. Para corrigir a alocação, exclua esta operação e registre outra.</p>
+<h2>Editar liquidação financeira</h2>
+<p class="muted">As Invoices e os valores consumidos são imutáveis. Para corrigir a alocação, exclua esta liquidação financeira e registre outra.</p>
 <form method="post" action="{{ url_for('editar_operacao_financeira', operacao_id=operacao.id) }}" class="form inline-form" data-financing-linked="{{ operacao.financiamento_exportacao_id or '' }}">
   {% if operacao.financiamento_exportacao_id %}
-  <label>Número da Operação Financeira (derivado do financiamento)<input name="numero_operacao" value="{{ operacao.numero_operacao }}" readonly required></label>
+  <label>Número da liquidação financeira (derivado da operação de origem)<input name="numero_operacao" value="{{ operacao.numero_operacao }}" readonly required></label>
   {% else %}
-  <label>Número da Operação Financeira<input name="numero_operacao" maxlength="120" value="{{ operacao.numero_operacao }}" required></label>
+  <label>Número da liquidação financeira<input name="numero_operacao" maxlength="120" value="{{ operacao.numero_operacao }}" required></label>
   {% endif %}
   {% if operacao.financiamento_exportacao_id %}
   <label>Categoria<select name="categoria_operacao" required disabled>{% for categoria in categorias %}<option value="{{ categoria }}" {{ 'selected' if categoria == operacao.categoria_operacao }}>{{ categoria }}</option>{% endfor %}</select><input type="hidden" name="categoria_operacao" value="{{ operacao.categoria_operacao }}"></label>
@@ -52,5 +52,5 @@
   <label>Banco de Liquidação<select name="banco_liquidacao_id" required>{% for banco in contrapartes %}<option value="{{ banco.id }}" {{ 'selected' if banco.id == operacao.banco_liquidacao_id }}>{{ banco.nome }}</option>{% endfor %}</select></label>
   <div class="form-actions"><button type="submit">Salvar alterações</button></div>
 </form>
-<form method="post" action="{{ url_for('excluir_operacao_financeira', operacao_id=operacao.id) }}" data-confirm-delete="Excluir esta Operação Financeira?" class="central-closing-delete-form"><button class="batch-delete" type="submit">Excluir operação</button></form>
+<form method="post" action="{{ url_for('excluir_operacao_financeira', operacao_id=operacao.id) }}" data-confirm-delete="Excluir esta liquidação financeira?" class="central-closing-delete-form"><button class="batch-delete" type="submit">Excluir liquidação financeira</button></form>
 {% endblock %}

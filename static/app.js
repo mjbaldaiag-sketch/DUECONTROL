@@ -325,6 +325,42 @@
     if (!input.value) input.value = todayBr;
   });
   document.querySelectorAll('[data-date-br]').forEach((input) => input.addEventListener('input', () => formatDate(input)));
+  document.querySelectorAll('form[data-ppe-financing-form]').forEach((form) => {
+    const category = form.querySelector('[data-ppe-category]');
+    const releaseField = form.querySelector('[data-ppe-release-field]');
+    const releaseCurrency = form.querySelector('[data-ppe-release-select]');
+    const rateField = form.querySelector('[data-ppe-rate-field]');
+    const rate = form.querySelector('[name="taxa_contratada"]');
+    const counterparty = form.querySelector('[data-ppe-counterparty]');
+    const clientGroup = form.querySelector('[data-ppe-client-group]');
+    const clientOptions = [...form.querySelectorAll('[data-ppe-client-option]')];
+    if (!category || !releaseField || !releaseCurrency || !rateField || !rate
+      || !counterparty || !clientGroup) return;
+
+    const syncPpeFields = () => {
+      const isPpe = category.value === 'PPE';
+      const requiresRate = !isPpe || releaseCurrency.value === 'BRL';
+      if (!isPpe && clientOptions.some((option) => option.selected)) {
+        counterparty.value = '';
+      }
+      clientOptions.forEach((option) => { option.disabled = !isPpe; });
+      clientGroup.hidden = !isPpe;
+      releaseField.hidden = !isPpe;
+      releaseCurrency.disabled = !isPpe;
+      releaseCurrency.required = isPpe;
+      rateField.hidden = !requiresRate;
+      rate.disabled = !requiresRate;
+      rate.required = requiresRate;
+      if (!requiresRate) {
+        rate.value = '';
+        rate.setCustomValidity('');
+      }
+    };
+
+    category.addEventListener('change', syncPpeFields);
+    releaseCurrency.addEventListener('change', syncPpeFields);
+    syncPpeFields();
+  });
   document.querySelectorAll('[data-due-number]').forEach((input) => {
     const update = () => formatDueNumber(input);
     input.addEventListener('input', update);
@@ -990,14 +1026,14 @@
         groups.forEach((group, index) => {
           const label = document.createElement('label');
           label.className = 'central-closing-contract-field';
-          label.textContent = `Número da Operação Financeira — Grupo ${index + 1} (${group.bank} · ${group.currency})`;
+          label.textContent = `Número da liquidação financeira — Grupo ${index + 1} (${group.bank} · ${group.currency})`;
           const input = document.createElement('input');
           input.type = 'text';
           input.readOnly = true;
           input.dataset.financingNumberDisplay = '1';
           input.maxLength = 120;
           input.required = false;
-          input.placeholder = 'Preenchido pelo financiamento selecionado';
+          input.placeholder = 'Preenchido pela liquidação financeira selecionada';
           label.appendChild(input);
           const groupKey = `${group.bankId}|${group.currency}`;
           const groupElement = document.createElement('div');
@@ -1011,7 +1047,7 @@
             ))
             .map((checkbox) => checkbox.dataset.invoiceCompanyId || ''));
           const financingLabel = document.createElement('label');
-          financingLabel.textContent = `Financiamento de Exportação — Grupo ${index + 1} (${group.bank} · ${group.currency})`;
+          financingLabel.textContent = `Financiamento de origem — Grupo ${index + 1} (${group.bank} · ${group.currency})`;
           const financingSelect = document.createElement('select');
           financingSelect.name = `financiamento_id_grupo_${group.bankId}_${group.currency}`;
           financingSelect.required = true;
@@ -1130,7 +1166,7 @@
       const missingFinancing = financingSelects.find((select) => !select.value);
       if (missingFinancing) {
         event.preventDefault();
-        window.alert('Selecione um Financiamento de Exportação compatível para cada grupo.');
+        window.alert('Selecione um financiamento compatível para cada grupo.');
         missingFinancing.focus();
         return;
       }
@@ -1152,7 +1188,7 @@
             || amount > maximum + 0.005);
         if (invalid) {
           event.preventDefault();
-          window.alert('As despesas do banco intermediário devem ser não negativas, ter duas casas e não superar o total da operação.');
+          window.alert('As despesas do banco intermediário devem ser não negativas, ter duas casas e não superar o total da liquidação financeira.');
           input.focus();
           return;
         }

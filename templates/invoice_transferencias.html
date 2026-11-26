@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% from "_invoice_company.html" import display as display_company %}
+{% block content %}
+<div class="page-heading">
+  <div>
+    <h1>Transferências entre empresas</h1>
+    <p class="muted">Mova o saldo disponível de Invoices entre empresas mantendo a linhagem, os recebimentos e os vínculos financeiros.</p>
+  </div>
+  <div class="actions"><a class="btn secondary" href="{{ url_for('lista_invoices') }}">Voltar para Invoices</a></div>
+</div>
+
+<form method="get" class="filters">
+  <label>Invoice<input name="numero_invoice" value="{{ filters.get('numero_invoice', '') }}" placeholder="Número da Invoice"></label>
+  <label>Empresa de origem<select name="empresa_origem_id"><option value="">Todas</option>{% for empresa in empresas %}<option value="{{ empresa.id }}" {{ 'selected' if filters.get('empresa_origem_id') == empresa.id|string else '' }}>{{ empresa.apelido or empresa.razao_social }}</option>{% endfor %}</select></label>
+  <label>Moeda<select name="moeda"><option value="">Todas</option>{% for moeda in moedas %}<option value="{{ moeda }}" {{ 'selected' if filters.get('moeda') == moeda else '' }}>{{ moeda }}</option>{% endfor %}</select></label>
+  <div class="filter-actions"><button type="submit">Filtrar</button><a class="btn secondary" href="{{ url_for('transferencias_empresas') }}">Limpar</a></div>
+</form>
+
+<form method="post" class="form transfer-form" action="{{ url_for('transferencias_empresas') }}">
+  <div class="transfer-form-fields">
+    <label>Empresa de destino<select name="empresa_destino_id" data-transfer-destination required><option value="">Selecione uma empresa</option>{% for empresa in empresas %}<option value="{{ empresa.id }}">{{ empresa.apelido or empresa.razao_social }} — {{ empresa.cnpj }}</option>{% endfor %}</select></label>
+    <label>Data da transferência<input type="date" name="data_transferencia" value="{{ today_iso() }}" required></label>
+    <label>Observação<textarea name="observacao" rows="2" placeholder="Opcional"></textarea></label>
+  </div>
+  <div class="table-wrap">
+    <table class="compact-table transfer-table">
+      <thead><tr><th></th><th>Invoice</th><th>Empresa</th><th>Status</th><th>Moeda</th><th>Valor nominal</th><th>Saldo disponível</th><th>Valor a transferir</th><th>Competência destino</th></tr></thead>
+      <tbody>
+      {% for invoice in eligible_invoices %}
+        <tr>
+          <td><input type="checkbox" name="selected_ids" value="{{ invoice.id }}" aria-label="Selecionar Invoice {{ invoice.numero_invoice }}"></td>
+          <td><a href="{{ url_for('detalhe_invoice', invoice_id=invoice.id) }}">{{ invoice.numero_invoice }}</a><small class="muted">{{ invoice.tipo_documento|invoice_type_label }}</small></td>
+          <td>{{ display_company(invoice) }}</td>
+          <td><span class="status {{ invoice.status|invoice_status_class }}">{{ invoice.status|invoice_status_label }}</span></td>
+          <td><span class="currency-badge {{ invoice.moeda|currency_class }}">{{ invoice.moeda }}</span></td>
+          <td>{{ invoice.valor_moeda|currency_amount(invoice.moeda) }}</td>
+          <td><strong>{{ invoice.transfer_available|currency_amount(invoice.moeda) }}</strong></td>
+          <td><input class="transfer-amount" name="valor_transferencia_{{ invoice.id }}" value="{{ '%.2f'|format(invoice.transfer_available|float) }}" inputmode="decimal" aria-label="Valor a transferir para {{ invoice.numero_invoice }}"></td>
+          <td><select name="competencia_destino_{{ invoice.id }}" data-transfer-competence data-invoice-date="{{ invoice.data_emissao or '' }}" required><option value="">Selecione após escolher a empresa</option>{% for competencia in competencias_destino %}<option value="{{ competencia.id }}" data-company-id="{{ competencia.empresa_id }}" data-start="{{ competencia.data_inicial }}" data-end="{{ competencia.data_final }}">{{ competencia.descricao }} — {{ competencia.empresa_apelido or competencia.empresa_razao_social }}</option>{% endfor %}</select></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="9" class="empty">Nenhuma Invoice elegível com saldo disponível.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">A seleção deve usar uma única empresa de origem. Transferências parciais criam uma parcela na empresa de destino e preservam o recebimento físico original.</p>
+  <div class="form-actions"><button type="submit"{% if not eligible_invoices %} disabled{% endif %}>Transferir selecionadas</button></div>
+</form>
+
+<h2>Histórico de transferências</h2>
+{% for transferencia in transferencias %}
+  <section class="transfer-history-card" id="transferencia-{{ transferencia.id }}">
+    <div class="transfer-history-heading">
+      <div><strong>Transferência #{{ transferencia.id }}</strong> · {{ transferencia.data_transferencia|date_br }} · {{ transferencia.origem_apelido or transferencia.origem_razao_social }} → {{ transferencia.destino_apelido or transferencia.destino_razao_social }}</div>
+      <span class="status{% if transferencia.status == 'ESTORNADA' %} status-pendente{% else %} status-concluido{% endif %}">{{ transferencia.status }}</span>
+    </div>
+    <div class="table-wrap"><table class="compact-table">
+      <thead><tr><th>Invoice</th><th>Tipo</th><th>Valor movimentado</th><th>Competência origem</th><th>Competência destino</th><th>Rastreabilidade</th></tr></thead>
+      <tbody>{% for item in transferencia['items'] %}<tr><td>{% if item.invoice_destino_id %}<a href="{{ url_for('detalhe_invoice', invoice_id=item.invoice_destino_id) }}">{{ item.numero_invoice }}</a>{% else %}{{ item.numero_invoice }}{% endif %}</td><td>{{ item.tipo_transferencia }}</td><td>{{ item.valor_moeda|currency_amount(item.moeda) }}</td><td>{{ item.competencia_origem_descricao or '-' }}</td><td>{{ item.competencia_destino_descricao }}</td><td>{{ item.origem_empresa_nome }} → {{ item.destino_empresa_nome }}</td></tr>{% endfor %}</tbody>
+    </table></div>
+    {% if transferencia.observacao %}<p class="muted">Observação: {{ transferencia.observacao }}</p>{% endif %}
+    {% if transferencia.status == 'ATIVA' %}
+      <form method="post" action="{{ url_for('estornar_transferencia', transferencia_id=transferencia.id) }}" class="inline transfer-reversal-form">
+        <input name="motivo_estorno" placeholder="Motivo do estorno (opcional)">
+        <button type="submit" class="btn secondary" onclick="return confirm('Estornar a transferência #{{ transferencia.id }}?');">Estornar transferência</button>
+      </form>
+    {% else %}<p class="muted">Estornada em {{ transferencia.estornada_em|date_br }}{% if transferencia.motivo_estorno %}: {{ transferencia.motivo_estorno }}{% endif %}.</p>{% endif %}
+  </section>
+{% else %}<p class="empty">Nenhuma transferência registrada.</p>{% endfor %}
+
+<script>
+(function () {
+  const destination = document.querySelector('[data-transfer-destination]');
+  const competenceSelects = document.querySelectorAll('[data-transfer-competence]');
+  function updateCompetences() {
+    const companyId = destination ? destination.value : '';
+    competenceSelects.forEach(function (select) {
+      let selectedVisible = false;
+      Array.from(select.options).forEach(function (option, index) {
+        if (index === 0) { option.hidden = false; return; }
+        const visible = companyId !== '' && option.dataset.companyId === companyId;
+        option.hidden = !visible;
+        if (visible && option.selected) selectedVisible = true;
+      });
+      if (!selectedVisible) {
+        const invoiceDate = select.dataset.invoiceDate || '';
+        const suggested = Array.from(select.options).find(function (option, index) {
+          return index > 0 && !option.hidden && invoiceDate >= (option.dataset.start || '') && invoiceDate <= (option.dataset.end || '');
+        });
+        select.value = suggested ? suggested.value : '';
+      }
+    });
+  }
+  if (destination) destination.addEventListener('change', updateCompetences);
+  updateCompetences();
+})();
+</script>
+{% endblock %}

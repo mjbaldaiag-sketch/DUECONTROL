@@ -1,0 +1,17 @@
+warning: in the working copy of 'app.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'static/style.css', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'templates/due_consulta.html', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'templates/due_detalhe.html', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'templates/due_form.html', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'templates/due_relatorio.html', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'templates/index.html', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_dues.py', LF will be replaced by CRLF the next time Git touches it
+M	app.py
+M	due.db
+M	static/style.css
+M	templates/due_consulta.html
+M	templates/due_detalhe.html
+M	templates/due_form.html
+M	templates/due_relatorio.html
+M	templates/index.html
+M	tests/test_dues.py

@@ -4416,12 +4416,24 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
         self.assertIn("OP-001", listing.get_data(as_text=True))
         detail = self.client.get(f"/invoices/operacoes-financeiras/{operation['id']}")
         self.assertEqual(detail.status_code, 200)
-        self.assertIn("OP-001", detail.get_data(as_text=True))
+        detail_html = detail.get_data(as_text=True)
+        self.assertIn("Liquidação financeira", detail_html)
+        self.assertIn("OP-001", detail_html)
+        self.assertNotIn("<h1>Operação Financeira", detail_html)
         invoice_detail = self.client.get(f"/invoice/{invoice_id}")
         self.assertIn("Operações Financeiras", invoice_detail.get_data(as_text=True))
         self.assertIn("OP-001", invoice_detail.get_data(as_text=True))
         saldo = self.client.get(f"/invoices/{invoice_id}/saldo").get_json()
         self.assertEqual(saldo["total_operacoes_financeiras"], 100.0)
+
+    def test_financial_settlement_labels_on_closings_screen(self):
+        response = self.client.get("/invoices/fechamentos")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn("Liquidações financeiras", html)
+        self.assertIn("Registrar liquidação financeira", html)
+        self.assertNotIn("Operações Financeiras registradas", html)
+        self.assertNotIn("Registrar Operação Financeira", html)
 
     def test_financial_operation_number_can_be_reused_without_merging_launches(self):
         first_invoice = self._create_invoice("INV-OP-DUPLICATE-A", "100,00")
@@ -4528,7 +4540,7 @@ class InvoiceFlowTests(InvoiceRecompositionTestsMixin, unittest.TestCase):
             },
             follow_redirects=True,
         )
-        self.assertIn("Categoria de Operação Financeira válida", response.get_data(as_text=True))
+        self.assertIn("Categoria de liquidação financeira válida", response.get_data(as_text=True))
         response = self.client.post(
             "/invoices/operacoes-financeiras",
             data={
