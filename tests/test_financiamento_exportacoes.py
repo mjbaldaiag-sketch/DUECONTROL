@@ -286,19 +286,23 @@ class FinanciamentoExportacaoTests(unittest.TestCase):
         conn.close()
 
     def _register_invoice_operation(self, financing_id, invoice_id, amount,
-                                    category="ACC", manual_number="MANUAL-IGNORED"):
+                                    category="ACC", manual_number="MANUAL-IGNORED",
+                                    expense=None):
+        data = {
+            "selected_ids": str(invoice_id),
+            f"valor_operacao_{invoice_id}": amount,
+            "categoria_operacao": category,
+            "data_liquidacao": "27/11/2026",
+            "taxa_cambio": "5,2000",
+            "banco_liquidacao_id": "1",
+            "financiamento_id_grupo_1_USD": str(financing_id),
+            "numero_operacao_grupo_1_USD": manual_number,
+        }
+        if expense is not None:
+            data["despesas_banco_intermediario_grupo_1_USD"] = expense
         return self.client.post(
             "/invoices/operacoes-financeiras",
-            data={
-                "selected_ids": str(invoice_id),
-                f"valor_operacao_{invoice_id}": amount,
-                "categoria_operacao": category,
-                "data_liquidacao": "27/11/2026",
-                "taxa_cambio": "5,2000",
-                "banco_liquidacao_id": "1",
-                "financiamento_id_grupo_1_USD": str(financing_id),
-                "numero_operacao_grupo_1_USD": manual_number,
-            },
+            data=data,
             follow_redirects=True,
         )
 
@@ -429,6 +433,131 @@ class FinanciamentoExportacaoTests(unittest.TestCase):
             "WHERE financiamento_exportacao_id=?", (financing_id,)
         ).fetchone()
         self.assertEqual(operation["numero_operacao"], str(financing_id))
+        conn.close()
+
+    def test_invoice_operation_consumes_only_principal_and_preserves_invoice_gross(self):
+        financing_id = self._operation("100,00", number="ACC-PRINCIPAL-001")
+        invoice_id = self._invoice_with_receipt("INV-PRINCIPAL-001", 100)
+        response = self._register_invoice_operation(
+            financing_id, invoice_id, "100,00", expense="2,00"
+        )
+        self.assertEqual(response.status_code, 200)
+
+        conn = app.db()
+        operation = conn.execute(
+            "SELECT * FROM operacoes_financeiras WHERE financiamento_exportacao_id=?",
+            (financing_id,),
+        ).fetchone()
+        self.assertEqual(app.Decimal(str(operation["valor_contratado_moeda"])), app.Decimal("100"))
+        self.assertEqual(
+            app.Decimal(str(operation["despesas_banco_intermediario_usd"])),
+            app.Decimal("2"),
+        )
+        self.assertEqual(
+            app.financiamento_registro_consumido(conn, financing_id),
+            app.Decimal("98"),
+        )
+        self.assertEqual(
+            app.financiamento_registro_available(conn, financing_id),
+            app.Decimal("2"),
+        )
+        summary = app.invoice_summary(conn, invoice_id)
+        self.assertEqual(summary["total_operacoes_financeiras"], app.Decimal("100"))
+        self.assertEqual(summary["status"], app.INVOICE_STATUS_LIQUIDADA)
+        detail = app.financiamento_operation_detail(conn, financing_id)
+        self.assertEqual(detail["valor_reservado_operacoes_moeda"], app.Decimal("98"))
+        self.assertEqual(detail["saldo_operacoes_moeda"], app.Decimal("2"))
+        conn.close()
+
+    def test_multiple_expense_operations_consume_only_their_combined_principal(self):
+        financing_id = self._operation("204.700,50", number="603252265", rate="5,7324")
+        first_invoice = self._invoice_with_receipt("INV-785", 102465)
+        second_invoice = self._invoice_with_receipt("INV-786", 102235.5)
+        self.assertEqual(
+            self._register_invoice_operation(
+                financing_id, first_invoice, "102.465,00", expense="30,00"
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self._register_invoice_operation(
+                financing_id, second_invoice, "102.235,50", expense="30,00"
+            ).status_code,
+            200,
+        )
+
+        conn = app.db()
+        self.assertEqual(
+            app.financiamento_registro_consumido(conn, financing_id),
+            app.Decimal("204640.5"),
+        )
+        self.assertEqual(
+            app.financiamento_registro_available(conn, financing_id),
+            app.Decimal("60"),
+        )
+        detail = app.financiamento_operation_detail(conn, financing_id)
+        self.assertEqual(detail["valor_reservado_operacoes_moeda"], app.Decimal("204640.5"))
+        self.assertEqual(detail["saldo_operacoes_moeda"], app.Decimal("60"))
+        self.assertEqual(
+            [row["valor_principal_moeda"] for row in detail["operacoes_financeiras_vinculadas"]],
+            [app.Decimal("102435"), app.Decimal("102205.5")],
+        )
+        conn.close()
+
+    def test_inconsistent_link_suspends_balance_and_blocks_new_operation(self):
+        financing_id = self._operation("100,00", number="ACC-INCONSISTENT-001")
+        invoice_id = self._invoice_with_receipt("INV-INCONSISTENT-001", 100)
+        conn = app.db()
+        cursor = conn.execute(
+            """
+            INSERT INTO operacoes_financeiras
+                (numero_operacao,empresa_id,banco_credito_id,moeda,categoria_operacao,
+                 valor_contratado_moeda,valor_brl,status,origem,financiamento_exportacao_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "ACC-INCONSISTENT-CHILD", 1, 1, "USD", "ACC", 100, 500,
+                app.FINANCIAMENTO_STATUS_LIQUIDADA,
+                app.FINANCIAMENTO_ORIGEM_LEGADO, financing_id,
+            ),
+        )
+        child_id = cursor.lastrowid
+        conn.execute(
+            """
+            INSERT INTO operacoes_financeiras_invoices
+                (operacao_financeira_id,invoice_id,moeda,valor_moeda)
+            VALUES (?,?,?,?)
+            """,
+            (child_id, invoice_id, "USD", 90),
+        )
+        conn.commit()
+
+        self.assertTrue(app.financiamento_registro_inconsistencias(conn, financing_id))
+        self.assertIsNone(app.financiamento_registro_consumido(conn, financing_id))
+        self.assertIsNone(app.financiamento_registro_available(conn, financing_id))
+        detail = app.financiamento_operation_detail(conn, financing_id)
+        self.assertIsNone(detail["saldo_operacoes_moeda"])
+        conn.close()
+
+        page = self.client.get(f"/financiamento-exportacoes/{financing_id}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Saldo de Opera&ccedil;&otilde;es Financeiras suspenso", page.get_data(as_text=True))
+
+        new_invoice_id = self._invoice_with_receipt("INV-INCONSISTENT-002", 10)
+        response = self._register_invoice_operation(
+            financing_id, new_invoice_id, "10,00"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("corrija primeiro os v", response.get_data(as_text=True))
+        conn = app.db()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM operacoes_financeiras "
+                "WHERE financiamento_exportacao_id=?",
+                (financing_id,),
+            ).fetchone()[0],
+            1,
+        )
         conn.close()
 
     def test_invoice_operation_rejects_incompatible_financing_atomically(self):

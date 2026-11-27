@@ -2359,6 +2359,15 @@ def financial_operation_principal_brl(total_moeda, despesas_usd, taxa_cambio,
     return closing_brl_value(principal_moeda, taxa_cambio, regra)
 
 
+def financial_operation_principal_moeda(total_moeda, despesas_usd=0, moeda="USD"):
+    """Retorna a parcela da liquidaÃ§Ã£o que amortiza o principal."""
+    total = decimal_value(total_moeda)
+    expense = decimal_value(despesas_usd)
+    if str(moeda or "").upper() == "USD":
+        return total - expense
+    return total
+
+
 def selected_record_ids(form, operation="excluir"):
     """Validate and deduplicate IDs sent by a batch form."""
     raw_ids = form.getlist("selected_ids")
@@ -13975,8 +13984,11 @@ def financial_operation_groups(conn, raw_ids, data_fechamento=None, data_liquida
             group["valor_moeda"], expense, group["taxa_cambio"],
             group["regra_conversao_brl"]
         )
+        group["amortizacao_principal_moeda"] = financial_operation_principal_moeda(
+            group["valor_moeda"], expense, group["moeda"]
+        )
         group["amortizacao_principal_usd"] = (
-            group["valor_moeda"] - expense
+            group["amortizacao_principal_moeda"]
             if group["moeda"].upper() == "USD" else None
         )
         group.pop("categoria_cambio", None)
@@ -14593,8 +14605,11 @@ def financial_operation_breakdown(operation, total_moeda=None):
     data["despesas_banco_intermediario_usd"] = expense_usd
     data["despesas_banco_intermediario_brl"] = expense_brl
     currency = str(data.get("operacao_moeda") or data.get("moeda") or "").upper()
+    data["amortizacao_principal_moeda"] = financial_operation_principal_moeda(
+        total, expense_usd, currency
+    )
     data["amortizacao_principal_usd"] = (
-        total - expense_usd if currency == "USD" else None
+        data["amortizacao_principal_moeda"] if currency == "USD" else None
     )
     if data.get("taxa_cambio") is not None:
         data["amortizacao_principal_brl"] = financial_operation_principal_brl(
@@ -14878,6 +14893,9 @@ def financiamento_operation_detail(conn, operacao_id):
     data["valor_contratado_moeda"] = decimal_value(data.get("valor_contratado_moeda"))
     data["valor_contratado_brl"] = decimal_value(data.get("valor_contratado_brl"))
     data["possui_conversao_contratada_brl"] = data.get("taxa_contratada") is not None
+    data["inconsistencias_vinculo"] = financiamento_registro_inconsistencias(
+        conn, operacao_id
+    )
     data["liquidacoes"] = conn.execute("""
         SELECT * FROM operacoes_financeiras_liquidacoes
          WHERE operacao_financeira_id=? ORDER BY data_liquidacao, id
@@ -14892,11 +14910,13 @@ def financiamento_operation_detail(conn, operacao_id):
          WHERE oi.operacao_financeira_id=?
          ORDER BY i.numero_invoice, i.id
     """, (operacao_id,)).fetchall()
-    data["operacoes_financeiras_vinculadas"] = conn.execute("""
+    linked_operations = conn.execute("""
         SELECT child.id AS operacao_id, child.numero_operacao,
                child.categoria_operacao, child.data_liquidacao,
+               child.moeda AS operacao_moeda,
                child.valor_contratado_moeda AS valor_operacao_moeda,
                child.valor_brl AS valor_operacao_brl,
+               child.despesas_banco_intermediario_usd,
                COUNT(oi.id) AS quantidade_invoices,
                COALESCE(SUM(oi.valor_moeda), 0) AS valor_invoices_moeda
           FROM operacoes_financeiras child
@@ -14906,6 +14926,15 @@ def financiamento_operation_detail(conn, operacao_id):
          GROUP BY child.id
          ORDER BY child.data_liquidacao, child.id
     """, (operacao_id,)).fetchall()
+    data["operacoes_financeiras_vinculadas"] = []
+    for row in linked_operations:
+        linked = dict(row)
+        linked["valor_principal_moeda"] = financial_operation_principal_moeda(
+            linked["valor_invoices_moeda"],
+            linked["despesas_banco_intermediario_usd"],
+            linked["operacao_moeda"],
+        )
+        data["operacoes_financeiras_vinculadas"].append(linked)
     data["invoices_operacoes_financeiras"] = conn.execute("""
         SELECT oi.*, linked.id AS operacao_id, linked.numero_operacao,
                linked.categoria_operacao, i.numero_invoice,
@@ -14958,12 +14987,16 @@ def financiamento_operation_detail(conn, operacao_id):
         normalize_balance(data["valor_contratado_brl"] - data["valor_liquidado_brl"])
         if data["possui_conversao_contratada_brl"] else None
     )
-    data["valor_reservado_operacoes_moeda"] = financiamento_registro_consumido(
-        conn, operacao_id
-    )
-    data["saldo_operacoes_moeda"] = financiamento_registro_available(
-        conn, operacao_id
-    )
+    if data["inconsistencias_vinculo"]:
+        data["valor_reservado_operacoes_moeda"] = None
+        data["saldo_operacoes_moeda"] = None
+    else:
+        data["valor_reservado_operacoes_moeda"] = financiamento_registro_consumido(
+            conn, operacao_id
+        )
+        data["saldo_operacoes_moeda"] = financiamento_registro_available(
+            conn, operacao_id
+        )
     data["status"] = data.get("status") or financiamento_recalcular_status(conn, operacao_id)
     return data
 
@@ -15028,8 +15061,73 @@ def financiamento_invoice_available(conn, invoice_id, operacao_id=None, link_id=
     return normalize_balance(decimal_value(summary["saldo_fechamentos"]) + current_value)
 
 
+def financiamento_registro_inconsistencias(
+    conn, financiamento_id, exclude_operation_id=None
+):
+    """Identifica vinculos filhos que nao permitem calcular um saldo seguro."""
+    query = """
+        SELECT linked.id AS operacao_id,
+               linked.numero_operacao,
+               linked.moeda AS operacao_moeda,
+               linked.valor_contratado_moeda AS valor_operacao_moeda,
+               linked.despesas_banco_intermediario_usd AS despesas_usd,
+               COUNT(oi.id) AS quantidade_invoices,
+               COALESCE(SUM(oi.valor_moeda), 0) AS valor_invoices_moeda,
+               MIN(oi.moeda) AS invoice_moeda,
+               COUNT(DISTINCT oi.moeda) AS quantidade_moedas_invoice
+          FROM operacoes_financeiras linked
+          LEFT JOIN operacoes_financeiras_invoices oi
+                 ON oi.operacao_financeira_id=linked.id
+         WHERE linked.financiamento_exportacao_id=?
+    """
+    params = [financiamento_id]
+    if exclude_operation_id is not None:
+        query += " AND linked.id<>?"
+        params.append(exclude_operation_id)
+    query += " GROUP BY linked.id ORDER BY linked.id"
+
+    inconsistencies = []
+    for row in conn.execute(query, params).fetchall():
+        operation_id = row["operacao_id"]
+        label = row["numero_operacao"] or str(operation_id)
+        operation_currency = normalized_currency_code(row["operacao_moeda"])
+        invoice_currency = normalized_currency_code(row["invoice_moeda"])
+        operation_total = decimal_value(row["valor_operacao_moeda"])
+        invoice_total = decimal_value(row["valor_invoices_moeda"])
+        expense = decimal_value(row["despesas_usd"])
+
+        def add(reason):
+            inconsistencies.append(
+                f"OperaÃ§Ã£o vinculada {label} (ID {operation_id}): {reason}."
+            )
+
+        if row["quantidade_invoices"] == 0:
+            add("nÃ£o possui Invoice vinculada")
+            continue
+        if abs(operation_total - invoice_total) > SALDO_TOLERANCE:
+            add(
+                "o total da operaÃ§Ã£o diverge da soma das Invoices "
+                f"({operation_total} contra {invoice_total})"
+            )
+        if row["quantidade_moedas_invoice"] > 1 or (
+            invoice_currency and invoice_currency != operation_currency
+        ):
+            add("a moeda da operaÃ§Ã£o diverge da moeda das Invoices")
+        if expense < 0:
+            add("a despesa bancÃ¡ria Ã© negativa")
+        if expense > invoice_total + SALDO_TOLERANCE:
+            add("a despesa bancÃ¡ria supera o valor alocado nas Invoices")
+        if operation_currency != "USD" and expense > SALDO_TOLERANCE:
+            add("hÃ¡ despesa bancÃ¡ria em uma moeda diferente de USD")
+    return inconsistencies
+
+
 def financiamento_registro_consumido(conn, financiamento_id, exclude_operation_id=None):
-    """Retorna o saldo de financiamento já reservado por operações/Invoices."""
+    """Retorna o saldo de financiamento ja reservado por operacoes/Invoices."""
+    if financiamento_registro_inconsistencias(
+        conn, financiamento_id, exclude_operation_id
+    ):
+        return None
     direct = conn.execute(
         """
         SELECT COALESCE(SUM(valor_moeda), 0)
@@ -15039,17 +15137,28 @@ def financiamento_registro_consumido(conn, financiamento_id, exclude_operation_i
         (financiamento_id,),
     ).fetchone()[0]
     query = """
-        SELECT COALESCE(SUM(oi.valor_moeda), 0)
-          FROM operacoes_financeiras_invoices oi
-          JOIN operacoes_financeiras linked ON linked.id=oi.operacao_financeira_id
+        SELECT linked.id,
+               linked.moeda,
+               linked.despesas_banco_intermediario_usd,
+               COALESCE(SUM(oi.valor_moeda), 0) AS valor_invoices_moeda
+          FROM operacoes_financeiras linked
+          JOIN operacoes_financeiras_invoices oi
+            ON oi.operacao_financeira_id=linked.id
          WHERE linked.financiamento_exportacao_id=?
     """
     params = [financiamento_id]
     if exclude_operation_id is not None:
         query += " AND linked.id<>?"
         params.append(exclude_operation_id)
-    linked_operations = conn.execute(query, params).fetchone()[0]
-    return decimal_value(direct) + decimal_value(linked_operations)
+    query += " GROUP BY linked.id"
+    linked_operations = Decimal("0")
+    for row in conn.execute(query, params).fetchall():
+        linked_operations += financial_operation_principal_moeda(
+            row["valor_invoices_moeda"],
+            row["despesas_banco_intermediario_usd"],
+            row["moeda"],
+        )
+    return decimal_value(direct) + linked_operations
 
 
 def financiamento_registro_available(conn, financiamento_id, exclude_operation_id=None):
@@ -15063,11 +15172,14 @@ def financiamento_registro_available(conn, financiamento_id, exclude_operation_i
     ).fetchone()
     if not financing:
         return Decimal("0")
+    consumed = financiamento_registro_consumido(
+        conn, financiamento_id, exclude_operation_id
+    )
+    if consumed is None:
+        return None
     return normalize_balance(
         decimal_value(financing["valor_contratado_moeda"])
-        - financiamento_registro_consumido(
-            conn, financiamento_id, exclude_operation_id
-        )
+        - consumed
     )
 
 
@@ -15099,7 +15211,10 @@ def financiamento_opcoes_registro(conn):
         data["saldo_financiamento"] = financiamento_registro_available(
             conn, data["id"]
         )
-        if data["saldo_financiamento"] > SALDO_TOLERANCE:
+        if (
+            data["saldo_financiamento"] is not None
+            and data["saldo_financiamento"] > SALDO_TOLERANCE
+        ):
             rows.append(data)
     return rows
 
@@ -15143,7 +15258,18 @@ def financiamento_validar_registro(conn, financiamento_id, group, categoria, amo
         raise ValueError(
             "A modalidade do financiamento de origem deve ser igual à da liquidação financeira."
         )
+    inconsistencies = financiamento_registro_inconsistencias(conn, financiamento_id)
+    if inconsistencies:
+        raise ValueError(
+            "Nao e possivel criar uma liquidacao financeira: "
+            "corrija primeiro os vinculos inconsistentes do financiamento. "
+            + inconsistencies[0]
+        )
     available = financiamento_registro_available(conn, financiamento_id)
+    if available is None:
+        raise ValueError(
+            "Nao e possivel calcular o saldo disponivel do financiamento."
+        )
     if amount > available + SALDO_TOLERANCE:
         raise ValueError(
             "O valor da liquidação financeira ultrapassa o saldo disponível do financiamento de origem."
@@ -16344,7 +16470,7 @@ def registrar_operacoes_financeiras():
                 request.form.get(financing_key),
                 group,
                 group["categoria_operacao"],
-                group["valor_moeda"],
+                group["amortizacao_principal_moeda"],
             )
             number = financing["numero_identificador"]
             empresa_id = next(
